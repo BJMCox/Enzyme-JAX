@@ -119,6 +119,12 @@ py_test(
 )
 
 py_test(
+    name = "hlo_linearize",
+    srcs = ["hlo_linearize.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "llama",
     timeout = "eternal",
     srcs = [

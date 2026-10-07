@@ -29,6 +29,20 @@ primals, f_vjp = jax.vjp(something, ones)
 (grads,) = f_vjp((x,))
 ```
 
+## Imported StableHLO value and gradient
+
+`hlo_call` can share forward work between the value and its reverse-mode gradient.
+For pure, static tensor programs, Enzyme generates a joint value/VJP and the JAX
+bridge saves tensor residuals for the pullback. This avoids repeating the forward
+scan when evaluating `jax.jit(jax.value_and_grad(f))`.
+
+This optimization requires MLIR memory-effect queries in JAX's Python bindings
+(tested with JAX/jaxlib 0.11.2). Older bindings, effectful programs, retained module
+symbols and unsupported joint derivatives keep the existing differentiation path.
+Symbolically inactive output cotangents also keep the activity-specific path.
+The optimization currently applies to raw StableHLO calls, not callable sources
+passed to `enzyme_jax_ir`.
+
 # Installation
 
 The easiest way to install is using pip.
