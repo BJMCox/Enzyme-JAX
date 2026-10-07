@@ -34747,6 +34747,13 @@ LogicalResult DUSDSSimplifyWithSomeUpdateOverlapHelper(
     return success();
   }
 
+  // A slice that ends before the update starts, or starts past its end,
+  // reads none of it: the slice stays as it is.
+  for (size_t i = 0; i < dusOp.getStartIndices().size(); ++i)
+    if (sliceStarts[i] + dsSliceSizes[i] <= 0 ||
+        sliceStarts[i] >= updateShape[i])
+      return failure();
+
   bool allOffsetsZero =
       llvm::all_of(sliceStarts, [](int64_t offset) { return offset == 0; });
 
