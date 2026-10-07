@@ -498,6 +498,24 @@ public:
   }
 };
 
+// trunci(index_cast(x) : iN) : iM is index_cast(x) : iM for M < N: both are
+// the low M bits of x, whatever its width. The narrower cast is one op where
+// the index analyses read through casts but not through a truncation.
+class TruncIOfIndexCast final : public OpRewritePattern<arith::TruncIOp> {
+public:
+  using OpRewritePattern<arith::TruncIOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::TruncIOp trunc,
+                                PatternRewriter &rewriter) const override {
+    auto cast = trunc.getIn().getDefiningOp<arith::IndexCastOp>();
+    if (!cast || !cast.getIn().getType().isIndex())
+      return failure();
+    rewriter.replaceOpWithNewOp<arith::IndexCastOp>(trunc, trunc.getType(),
+                                                    cast.getIn());
+    return success();
+  }
+};
+
 class ShrUIOfIndexUI final : public OpRewritePattern<arith::ShRUIOp> {
 public:
   using OpRewritePattern<arith::ShRUIOp>::OpRewritePattern;
@@ -1392,7 +1410,7 @@ struct CanonicalizeLoopsPass
 void mlir::enzyme::addSingleIter(RewritePatternSet &patterns,
                                  MLIRContext *ctx) {
   patterns.add<RemoveAffineParallelSingleIter, ExtUIOfIndexUI, TruncIOfIndexUI,
-               ShrUIOfIndexUI, ShrUIOfPackedHigh, DivUIOfIndexUI, DivMul,
-               AddIOfIndexUI, SubIOfIndexUI, MulIOfIndexUI, ShLIOfIndexUI,
-               AddIOfDoubleIndex, ToRem>(ctx);
+               TruncIOfIndexCast, ShrUIOfIndexUI, ShrUIOfPackedHigh,
+               DivUIOfIndexUI, DivMul, AddIOfIndexUI, SubIOfIndexUI,
+               MulIOfIndexUI, ShLIOfIndexUI, AddIOfDoubleIndex, ToRem>(ctx);
 }
