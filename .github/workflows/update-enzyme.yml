@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   pr-latest-enzyme:
+    if: github.repository == 'EnzymeAD/Enzyme-JAX'
     name: "Update Enzyme"
     uses: ./.github/workflows/update-dependency.yml
     with:

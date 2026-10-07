@@ -7,6 +7,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'EnzymeAD/Enzyme-JAX'
     name: Build wheel - ${{ matrix.os }} - Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
     container:
@@ -137,6 +138,7 @@ jobs:
           path: dist/
 
   publish:
+    if: github.repository == 'EnzymeAD/Enzyme-JAX'
     name: Publish to PyPI
     # The `pypa/gh-action-pypi-publish` workflow needs to run in a non-Docker
     # environment, so we use a distinct job which runs on `ubuntu-latest`.

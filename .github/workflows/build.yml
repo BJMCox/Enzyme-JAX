@@ -29,6 +29,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.repository == 'EnzymeAD/Enzyme-JAX'
     name: Build - ${{ matrix.os }} - python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
 
@@ -237,7 +238,7 @@ jobs:
     name: Benchmark Summary
     runs-on: ubuntu-latest
     needs: build
-    if: ${{ !cancelled() }}
+    if: ${{ github.repository == 'EnzymeAD/Enzyme-JAX' && !cancelled() }}
     permissions:
       contents: write # contents permission to update benchmark contents in gh-pages branch
       statuses: read
