@@ -4941,8 +4941,8 @@ struct SplitParallelInductions
             break;
           }
         } else {
-          if (pval == iv)
-            continue;
+          // a use the split does not rewrite, as a loop bound reading the
+          // variable: the variable would then stand for its quotient there
           legal = false;
           break;
         }
