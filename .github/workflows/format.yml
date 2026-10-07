@@ -27,6 +27,7 @@ on:
 
 jobs:
   build:
+    if: github.repository == 'EnzymeAD/Enzyme-JAX'
     name: Format
     runs-on: ubuntu-latest
 

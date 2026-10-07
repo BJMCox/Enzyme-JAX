@@ -31,6 +31,7 @@ concurrency:
 
 jobs:
   integration:
+    if: github.repository == 'EnzymeAD/Enzyme-JAX'
     strategy:
       fail-fast: false
       matrix:

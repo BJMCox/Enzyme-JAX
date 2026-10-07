@@ -32,6 +32,7 @@ concurrency:
 
 jobs:
   get-reactant-commit:
+    if: github.repository == 'EnzymeAD/Enzyme-JAX'
     name: 'Get Reactant commit'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -49,7 +50,7 @@ jobs:
 
   build-jll:
     name: Build Reactant_jll
-    if: github.event.pull_request.draft == false
+    if: github.repository == 'EnzymeAD/Enzyme-JAX' && github.event.pull_request.draft == false
     uses: EnzymeAD/ReactantBuilder/.github/workflows/build-reactant-reusable.yml@main
     needs: get-reactant-commit
     secrets: inherit

@@ -29,6 +29,7 @@ env:
 
 jobs:
   test-breeze:
+    if: github.repository == 'EnzymeAD/Enzyme-JAX'
     name: 'Test Breeze - ${{ matrix.os }} - julia ${{ matrix.julia_version }} - XLA ${{ matrix.xla_commit }} - Breeze ${{ matrix.breeze_commit }} - Reactant ${{ matrix.reactant_commit }}'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
