@@ -21,16 +21,16 @@ llvm.func @f(%arg0: !llvm.ptr, %n: i64, %c: i1) {
   llvm.return
 }
 
-// CHECK:    llvm.func @use(!llvm.ptr)
-// CHECK-NEXT:  llvm.func @f(%arg0: !llvm.ptr, %arg1: i64, %arg2: i1) {
-// CHECK-NEXT:    %c-1 = arith.constant -1 : index
-// CHECK-NEXT:    %0 = arith.index_cast %arg1 : i64 to index
-// CHECK-NEXT:    %1 = arith.subi %c-1, %0 : index
-// CHECK-NEXT:    %2 = arith.select %arg2, %1, %0 : index
-// CHECK-NEXT:    scf.if %arg2 {
-// CHECK-NEXT:      %3 = "enzymexla.pointer2memref"(%arg0) : (!llvm.ptr) -> memref<?x!llvm.ptr>
-// CHECK-NEXT:      %4 = affine.load %3[symbol(%2)] : memref<?x!llvm.ptr>
-// CHECK-NEXT:      llvm.call @use(%4) : (!llvm.ptr) -> ()
-// CHECK-NEXT:    }
-// CHECK-NEXT:    llvm.return
-// CHECK-NEXT:  }
+// CHECK:  llvm.func @use(!llvm.ptr)
+// CHECK-NEXT: llvm.func @f(%arg0: !llvm.ptr, %arg1: i64, %arg2: i1) {
+// CHECK-NEXT:   %c-1 = arith.constant -1 : index
+// CHECK-NEXT:   %0 = "enzymexla.pointer2memref"(%arg0) : (!llvm.ptr) -> memref<?x!llvm.ptr>
+// CHECK-NEXT:   %1 = arith.index_cast %arg1 : i64 to index
+// CHECK-NEXT:   %2 = arith.subi %c-1, %1 : index
+// CHECK-NEXT:   %3 = arith.select %arg2, %2, %1 : index
+// CHECK-NEXT:   scf.if %arg2 {
+// CHECK-NEXT:     %4 = affine.load %0[symbol(%3)] : memref<?x!llvm.ptr>
+// CHECK-NEXT:     llvm.call @use(%4) : (!llvm.ptr) -> ()
+// CHECK-NEXT:   }
+// CHECK-NEXT:   llvm.return
+// CHECK-NEXT: }

@@ -6335,6 +6335,48 @@ static bool guaranteedAtLeastOneIteration(Operation *op) {
   return true;
 }
 
+// A view of a pointer defined above its block is taken where the pointer
+// is, once: the same view in two arms of a branch is two memref values of
+// one buffer to the dependence analysis, which then cannot tell a loop
+// writing through one of them apart from a loop aliasing two buffers.
+struct HoistPointer2Memref
+    : public OpRewritePattern<enzymexla::Pointer2MemrefOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(enzymexla::Pointer2MemrefOp view,
+                                PatternRewriter &rewriter) const override {
+    Value source = view.getSource();
+    Block *target;
+    Block::iterator at;
+    if (auto arg = dyn_cast<BlockArgument>(source)) {
+      target = arg.getOwner();
+      at = target->begin();
+    } else {
+      Operation *def = source.getDefiningOp();
+      target = def->getBlock();
+      at = std::next(def->getIterator());
+    }
+    if (target == view->getBlock())
+      return failure();
+    // the same view already taken there, before the op of the target block
+    // the view is under
+    Operation *under = target->findAncestorOpInBlock(*view);
+    if (!under)
+      return failure();
+    for (Operation &op : llvm::make_range(at, under->getIterator())) {
+      auto other = dyn_cast<enzymexla::Pointer2MemrefOp>(&op);
+      if (!other)
+        continue;
+      if (other.getSource() == source && other.getType() == view.getType()) {
+        rewriter.replaceOp(view, other.getResult());
+        return success();
+      }
+    }
+    rewriter.moveOpBefore(view, target, at);
+    return success();
+  }
+};
+
 class LiftMemrefRead : public OpRewritePattern<memref::LoadOp> {
 public:
   using OpRewritePattern<memref::LoadOp>::OpRewritePattern;
@@ -7767,8 +7809,8 @@ void mlir::enzyme::populateAffineCFGPatterns(
           ExtremumUnderAffineIf, CarriedInduction,
           ExtremumInAffineLoop<AffineForOp>,
           ExtremumInAffineLoop<AffineParallelOp>, HoistBranchOutOfRunsCheck,
-          AddAddCstEnd, LiftMemrefRead, CompareVs1, AffineForReductionIter,
-          AffineForReductionSink>(context, 2);
+          AddAddCstEnd, LiftMemrefRead, HoistPointer2Memref, CompareVs1,
+          AffineForReductionIter, AffineForReductionSink>(context, 2);
   if (enable_split_on_affine_if_constants) {
     rpl.add<SplitOnAffineIfConstants<scf::ForOp>,
             SplitOnAffineIfConstants<scf::IfOp>>(context, 2);

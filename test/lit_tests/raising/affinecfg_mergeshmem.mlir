@@ -223,126 +223,126 @@ module attributes {dlti.dl_spec = #dlti.dl_spec<!llvm.ptr<270> = dense<32> : vec
 }
 
 // CHECK:  llvm.func local_unnamed_addr @main() -> (i32 {llvm.noundef, llvm.range = #llvm.constant_range<i32, -1, 1>}) attributes {dso_local, passthrough = ["mustprogress", "norecurse", ["min-legal-vector-width", "0"], ["no-trapping-math", "true"], ["stack-protector-buffer-size", "8"], ["target-cpu", "x86-64"]], target_cpu = "x86-64", target_features = #llvm.target_features<["+cmov", "+cx8", "+fxsr", "+mmx", "+sse", "+sse2", "+x87"]>, tune_cpu = "generic", uwtable_kind = #llvm.uwtableKind<async>} {
-// CHECK-NEXT:    %c1_i32 = arith.constant 1 : i32
-// CHECK-NEXT:    %c0_i32 = arith.constant 0 : i32
-// CHECK-NEXT:    %c256_i32 = arith.constant 256 : i32
-// CHECK-NEXT:    %c4_i32 = arith.constant 4 : i32
-// CHECK-NEXT:    %c0 = arith.constant 0 : index
-// CHECK-NEXT:    %c256 = arith.constant 256 : index
-// CHECK-NEXT:    %c1 = arith.constant 1 : index
-// CHECK-NEXT:    %c4096 = arith.constant 4096 : index
-// CHECK-NEXT:    %c8 = arith.constant 8 : index
-// CHECK-NEXT:    %c8388608 = arith.constant 8388608 : index
-// CHECK-NEXT:    %c8388608_i64 = arith.constant 8388608 : i64
-// CHECK-NEXT:    %cst = arith.constant 0.000000e+00 : f64
-// CHECK-NEXT:    %cst_0 = arith.constant 1.000000e+00 : f64
-// CHECK-NEXT:    %cst_1 = arith.constant 2.000000e+00 : f64
-// CHECK-NEXT:    %c8_i64 = arith.constant 8 : i64
-// CHECK-NEXT:    %0 = llvm.mlir.addressof @".str" : !llvm.ptr
-// CHECK-NEXT:    %c-1_i32 = arith.constant -1 : i32
-// CHECK-NEXT:    %1 = llvm.mlir.addressof @".str.1" : !llvm.ptr
-// CHECK-NEXT:    %2 = llvm.mlir.addressof @".str.2" : !llvm.ptr
-// CHECK-NEXT:    %cst_2 = arith.constant 0x4140000000000000 : f64
-// CHECK-NEXT:    %cst_3 = arith.constant 0xC140000000000000 : f64
-// CHECK-NEXT:    %3 = llvm.mlir.addressof @".str.3" : !llvm.ptr
-// CHECK-NEXT:    %4 = llvm.alloca %c1_i32 x f64 {alignment = 8 : i64} : (i32) -> !llvm.ptr
-// CHECK-NEXT:    %5 = llvm.alloca %c1_i32 x !llvm.ptr {alignment = 8 : i64} : (i32) -> !llvm.ptr
-// CHECK-NEXT:    %6 = llvm.alloca %c1_i32 x !llvm.ptr {alignment = 8 : i64} : (i32) -> !llvm.ptr
-// CHECK-NEXT:    %7 = llvm.alloca %c1_i32 x !llvm.ptr {alignment = 8 : i64} : (i32) -> !llvm.ptr
-// CHECK-NEXT:    %8 = llvm.call tail @_Znam(%c8388608_i64) : (i64 {llvm.noundef}) -> (!llvm.ptr {llvm.dereferenceable = 8388608 : i64, llvm.noalias, llvm.nonnull, llvm.noundef})
-// CHECK-NEXT:    %9 = llvm.call tail @_Znam(%c8388608_i64) : (i64 {llvm.noundef}) -> (!llvm.ptr {llvm.dereferenceable = 8388608 : i64, llvm.noalias, llvm.nonnull, llvm.noundef})
-// CHECK-NEXT:    llvm.store %cst, %4 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
-// CHECK-NEXT:    affine.for %arg0 = 0 to 1048576 {
-// CHECK-NEXT:      %20 = arith.index_cast %arg0 : index to i64
-// CHECK-NEXT:      %21 = llvm.getelementptr inbounds|nuw %8[%20] : (!llvm.ptr, i64) -> !llvm.ptr, f64
-// CHECK-NEXT:      llvm.store %cst_0, %21 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
-// CHECK-NEXT:      %22 = llvm.getelementptr inbounds|nuw %9[%20] : (!llvm.ptr, i64) -> !llvm.ptr, f64
-// CHECK-NEXT:      llvm.store %cst_1, %22 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
-// CHECK-NEXT:    }
-// CHECK-NEXT:    %memref = gpu.alloc  (%c8388608) : memref<?xi8, 1>
-// CHECK-NEXT:    %10 = "enzymexla.memref2pointer"(%memref) : (memref<?xi8, 1>) -> !llvm.ptr
-// CHECK-NEXT:    llvm.store %10, %5 : !llvm.ptr, !llvm.ptr
-// CHECK-NEXT:    %memref_4 = gpu.alloc  (%c8388608) : memref<?xi8, 1>
-// CHECK-NEXT:    %11 = "enzymexla.memref2pointer"(%memref_4) : (memref<?xi8, 1>) -> !llvm.ptr
-// CHECK-NEXT:    llvm.store %11, %6 : !llvm.ptr, !llvm.ptr
-// CHECK-NEXT:    %memref_5 = gpu.alloc  (%c8) : memref<?xi8, 1>
-// CHECK-NEXT:    %12 = "enzymexla.memref2pointer"(%memref_5) : (memref<?xi8, 1>) -> !llvm.ptr
-// CHECK-NEXT:    llvm.store %12, %7 : !llvm.ptr, !llvm.ptr
-// CHECK-NEXT:    %13 = "enzymexla.pointer2memref"(%8) : (!llvm.ptr) -> memref<?xi8>
-// CHECK-NEXT:    enzymexla.memcpy  %memref, %13, %c8388608 : memref<?xi8, 1>, memref<?xi8>
-// CHECK-NEXT:    %14 = "enzymexla.pointer2memref"(%9) : (!llvm.ptr) -> memref<?xi8>
-// CHECK-NEXT:    enzymexla.memcpy  %memref_4, %14, %c8388608 : memref<?xi8, 1>, memref<?xi8>
-// CHECK-NEXT:    %15 = llvm.call @cudaMemset(%12, %c0_i32, %c8_i64) : (!llvm.ptr {llvm.noundef}, i32 {llvm.noundef}, i64 {llvm.noundef}) -> i32
-// CHECK-NEXT:    %16 = "enzymexla.gpu_wrapper"(%c4096, %c1, %c1, %c256, %c1, %c1) ({
-// CHECK-NEXT:      affine.parallel (%arg0) = (0) to (4096) {
-// CHECK-NEXT:        %alloca = memref.alloca() : memref<1024xf64>
-// CHECK-NEXT:        %20 = "enzymexla.memref2pointer"(%alloca) : (memref<1024xf64>) -> !llvm.ptr<3>
-// CHECK-NEXT:        affine.parallel (%arg1) = (0) to (256) {
-// CHECK-NEXT:          %21 = llvm.addrspacecast %20 : !llvm.ptr<3> to !llvm.ptr
-// CHECK-NEXT:          %22 = arith.muli %arg0, %c256 : index
-// CHECK-NEXT:          %23 = arith.index_castui %22 : index to i32
-// CHECK-NEXT:          %24 = arith.index_castui %arg1 : index to i64
-// CHECK-NEXT:          %25 = arith.index_castui %arg1 : index to i32
-// CHECK-NEXT:          %26 = arith.addi %23, %25 : i32
-// CHECK-NEXT:          %27 = llvm.getelementptr inbounds|nuw %21[0, %24] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.array<1024 x f64>
-// CHECK-NEXT:          llvm.store %cst, %27 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
-// CHECK-NEXT:          %28 = arith.extsi %26 : i32 to i64
-// CHECK-NEXT:          %29 = llvm.getelementptr inbounds %11[%28] : (!llvm.ptr, i64) -> !llvm.ptr, f64
-// CHECK-NEXT:          %30 = llvm.getelementptr inbounds %10[%28] : (!llvm.ptr, i64) -> !llvm.ptr, f64
-// CHECK-NEXT:          %31 = llvm.load %30 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
-// CHECK-NEXT:          %32 = llvm.load %29 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
-// CHECK-NEXT:          %33 = arith.mulf %31, %32 fastmath<contract> : f64
-// CHECK-NEXT:          llvm.store %33, %27 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
-// CHECK-NEXT:          "enzymexla.barrier"(%arg1, %c0, %c0) : (index, index, index) -> ()
-// CHECK-NEXT:          %34 = scf.while (%arg2 = %c256_i32) : (i32) -> i32 {
-// CHECK-NEXT:            %35 = arith.shrui %arg2, %c1_i32 : i32
-// CHECK-NEXT:            %36 = arith.cmpi ult, %25, %35 : i32
-// CHECK-NEXT:            scf.if %36 {
-// CHECK-NEXT:              %38 = arith.addi %35, %25 : i32
-// CHECK-NEXT:              %39 = arith.extui %38 nneg : i32 to i64 
-// CHECK-NEXT:              %40 = llvm.getelementptr inbounds|nuw %21[0, %39] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.array<1024 x f64>
-// CHECK-NEXT:              %41 = llvm.load %40 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
-// CHECK-NEXT:              %42 = llvm.load %27 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
-// CHECK-NEXT:              %43 = arith.addf %41, %42 fastmath<contract> : f64
-// CHECK-NEXT:              llvm.store %43, %27 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
-// CHECK-NEXT:            }
-// CHECK-NEXT:            %37 = arith.cmpi uge, %arg2, %c4_i32 : i32
-// CHECK-NEXT:            scf.condition(%37) %35 : i32
-// CHECK-NEXT:          } do {
-// CHECK-NEXT:          ^bb0(%arg2: i32):
-// CHECK-NEXT:            "enzymexla.barrier"(%arg1, %c0, %c0) : (index, index, index) -> ()
-// CHECK-NEXT:            scf.yield %arg2 : i32
-// CHECK-NEXT:          }
-// CHECK-NEXT:          "enzymexla.barrier"(%arg1, %c0, %c0) : (index, index, index) -> ()
-// CHECK-NEXT:          affine.if #set(%arg1) {
-// CHECK-NEXT:            %35 = llvm.load %21 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
-// CHECK-NEXT:            %36 = llvm.atomicrmw fadd %12, %35 seq_cst <alignment = 8> : !llvm.ptr, f64
-// CHECK-NEXT:          }
-// CHECK-NEXT:        }
-// CHECK-NEXT:      }
-// CHECK-NEXT:      "enzymexla.polygeist_yield"() : () -> ()
-// CHECK-NEXT:    }) : (index, index, index, index, index, index) -> index
-// CHECK-NEXT:    %17 = llvm.call @cudaGetLastError() : () -> i32
-// CHECK-NEXT:    %18 = arith.cmpi eq, %17, %c0_i32 : i32
-// CHECK-NEXT:    %19 = arith.select %18, %c0_i32, %c-1_i32 : i32
-// CHECK-NEXT:    scf.if %18 {
-// CHECK-NEXT:      %20 = "enzymexla.pointer2memref"(%4) : (!llvm.ptr) -> memref<?xi8>
-// CHECK-NEXT:      enzymexla.memcpy  %20, %memref_5, %c8 : memref<?xi8>, memref<?xi8, 1>
-// CHECK-NEXT:      %21 = llvm.load %4 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
-// CHECK-NEXT:      %22 = llvm.call @printf(%1, %21) vararg(!llvm.func<i32 (ptr, ...)>) {no_unwind} : (!llvm.ptr {llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, f64 {llvm.noundef}) -> i32
-// CHECK-NEXT:      %23 = llvm.call @printf(%2, %cst_2) vararg(!llvm.func<i32 (ptr, ...)>) {no_unwind} : (!llvm.ptr {llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, f64 {llvm.noundef}) -> i32
-// CHECK-NEXT:      %24 = llvm.load %4 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
-// CHECK-NEXT:      %25 = arith.addf %24, %cst_3 : f64
-// CHECK-NEXT:      %26 = math.absf %25 : f64
-// CHECK-NEXT:      %27 = llvm.call @printf(%3, %26) vararg(!llvm.func<i32 (ptr, ...)>) {no_unwind} : (!llvm.ptr {llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, f64 {llvm.noundef}) -> i32
-// CHECK-NEXT:      %28 = llvm.call @cudaFree(%10) : (!llvm.ptr {llvm.noundef}) -> i32
-// CHECK-NEXT:      %29 = llvm.call @cudaFree(%11) : (!llvm.ptr {llvm.noundef}) -> i32
-// CHECK-NEXT:      %30 = llvm.call @cudaFree(%12) : (!llvm.ptr {llvm.noundef}) -> i32
-// CHECK-NEXT:      llvm.call @_ZdaPv(%8) {no_unwind} : (!llvm.ptr {llvm.nonnull, llvm.noundef}) -> ()
-// CHECK-NEXT:      llvm.call @_ZdaPv(%9) {no_unwind} : (!llvm.ptr {llvm.nonnull, llvm.noundef}) -> ()
-// CHECK-NEXT:    } else {
-// CHECK-NEXT:      %20 = llvm.call @cudaGetErrorString(%17) : (i32 {llvm.noundef}) -> !llvm.ptr
-// CHECK-NEXT:      %21 = llvm.call @printf(%0, %20) vararg(!llvm.func<i32 (ptr, ...)>) {no_unwind} : (!llvm.ptr {llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, !llvm.ptr {llvm.noundef}) -> i32
-// CHECK-NEXT:    }
-// CHECK-NEXT:    llvm.return %19 : i32
-// CHECK-NEXT:  }
+// CHECK-NEXT:   %c1_i32 = arith.constant 1 : i32
+// CHECK-NEXT:   %c0_i32 = arith.constant 0 : i32
+// CHECK-NEXT:   %c256_i32 = arith.constant 256 : i32
+// CHECK-NEXT:   %c4_i32 = arith.constant 4 : i32
+// CHECK-NEXT:   %c0 = arith.constant 0 : index
+// CHECK-NEXT:   %c256 = arith.constant 256 : index
+// CHECK-NEXT:   %c1 = arith.constant 1 : index
+// CHECK-NEXT:   %c4096 = arith.constant 4096 : index
+// CHECK-NEXT:   %c8 = arith.constant 8 : index
+// CHECK-NEXT:   %c8388608 = arith.constant 8388608 : index
+// CHECK-NEXT:   %c8388608_i64 = arith.constant 8388608 : i64
+// CHECK-NEXT:   %cst = arith.constant 0.000000e+00 : f64
+// CHECK-NEXT:   %cst_0 = arith.constant 1.000000e+00 : f64
+// CHECK-NEXT:   %cst_1 = arith.constant 2.000000e+00 : f64
+// CHECK-NEXT:   %c8_i64 = arith.constant 8 : i64
+// CHECK-NEXT:   %0 = llvm.mlir.addressof @".str" : !llvm.ptr
+// CHECK-NEXT:   %c-1_i32 = arith.constant -1 : i32
+// CHECK-NEXT:   %1 = llvm.mlir.addressof @".str.1" : !llvm.ptr
+// CHECK-NEXT:   %2 = llvm.mlir.addressof @".str.2" : !llvm.ptr
+// CHECK-NEXT:   %cst_2 = arith.constant 0x4140000000000000 : f64
+// CHECK-NEXT:   %cst_3 = arith.constant 0xC140000000000000 : f64
+// CHECK-NEXT:   %3 = llvm.mlir.addressof @".str.3" : !llvm.ptr
+// CHECK-NEXT:   %4 = llvm.alloca %c1_i32 x f64 {alignment = 8 : i64} : (i32) -> !llvm.ptr
+// CHECK-NEXT:   %5 = "enzymexla.pointer2memref"(%4) : (!llvm.ptr) -> memref<?xi8>
+// CHECK-NEXT:   %6 = llvm.alloca %c1_i32 x !llvm.ptr {alignment = 8 : i64} : (i32) -> !llvm.ptr
+// CHECK-NEXT:   %7 = llvm.alloca %c1_i32 x !llvm.ptr {alignment = 8 : i64} : (i32) -> !llvm.ptr
+// CHECK-NEXT:   %8 = llvm.alloca %c1_i32 x !llvm.ptr {alignment = 8 : i64} : (i32) -> !llvm.ptr
+// CHECK-NEXT:   %9 = llvm.call tail @_Znam(%c8388608_i64) : (i64 {llvm.noundef}) -> (!llvm.ptr {llvm.dereferenceable = 8388608 : i64, llvm.noalias, llvm.nonnull, llvm.noundef})
+// CHECK-NEXT:   %10 = llvm.call tail @_Znam(%c8388608_i64) : (i64 {llvm.noundef}) -> (!llvm.ptr {llvm.dereferenceable = 8388608 : i64, llvm.noalias, llvm.nonnull, llvm.noundef})
+// CHECK-NEXT:   llvm.store %cst, %4 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
+// CHECK-NEXT:   affine.for %arg0 = 0 to 1048576 {
+// CHECK-NEXT:     %21 = arith.index_cast %arg0 : index to i64
+// CHECK-NEXT:     %22 = llvm.getelementptr inbounds|nuw %9[%21] : (!llvm.ptr, i64) -> !llvm.ptr, f64
+// CHECK-NEXT:     llvm.store %cst_0, %22 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
+// CHECK-NEXT:     %23 = llvm.getelementptr inbounds|nuw %10[%21] : (!llvm.ptr, i64) -> !llvm.ptr, f64
+// CHECK-NEXT:     llvm.store %cst_1, %23 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
+// CHECK-NEXT:   }
+// CHECK-NEXT:   %memref = gpu.alloc  (%c8388608) : memref<?xi8, 1>
+// CHECK-NEXT:   %11 = "enzymexla.memref2pointer"(%memref) : (memref<?xi8, 1>) -> !llvm.ptr
+// CHECK-NEXT:   llvm.store %11, %6 : !llvm.ptr, !llvm.ptr
+// CHECK-NEXT:   %memref_4 = gpu.alloc  (%c8388608) : memref<?xi8, 1>
+// CHECK-NEXT:   %12 = "enzymexla.memref2pointer"(%memref_4) : (memref<?xi8, 1>) -> !llvm.ptr
+// CHECK-NEXT:   llvm.store %12, %7 : !llvm.ptr, !llvm.ptr
+// CHECK-NEXT:   %memref_5 = gpu.alloc  (%c8) : memref<?xi8, 1>
+// CHECK-NEXT:   %13 = "enzymexla.memref2pointer"(%memref_5) : (memref<?xi8, 1>) -> !llvm.ptr
+// CHECK-NEXT:   llvm.store %13, %8 : !llvm.ptr, !llvm.ptr
+// CHECK-NEXT:   %14 = "enzymexla.pointer2memref"(%9) : (!llvm.ptr) -> memref<?xi8>
+// CHECK-NEXT:   enzymexla.memcpy  %memref, %14, %c8388608 : memref<?xi8, 1>, memref<?xi8>
+// CHECK-NEXT:   %15 = "enzymexla.pointer2memref"(%10) : (!llvm.ptr) -> memref<?xi8>
+// CHECK-NEXT:   enzymexla.memcpy  %memref_4, %15, %c8388608 : memref<?xi8, 1>, memref<?xi8>
+// CHECK-NEXT:   %16 = llvm.call @cudaMemset(%13, %c0_i32, %c8_i64) : (!llvm.ptr {llvm.noundef}, i32 {llvm.noundef}, i64 {llvm.noundef}) -> i32
+// CHECK-NEXT:   %17 = "enzymexla.gpu_wrapper"(%c4096, %c1, %c1, %c256, %c1, %c1) ({
+// CHECK-NEXT:     affine.parallel (%arg0) = (0) to (4096) {
+// CHECK-NEXT:       %alloca = memref.alloca() : memref<1024xf64>
+// CHECK-NEXT:       %21 = "enzymexla.memref2pointer"(%alloca) : (memref<1024xf64>) -> !llvm.ptr<3>
+// CHECK-NEXT:       affine.parallel (%arg1) = (0) to (256) {
+// CHECK-NEXT:         %22 = llvm.addrspacecast %21 : !llvm.ptr<3> to !llvm.ptr
+// CHECK-NEXT:         %23 = arith.muli %arg0, %c256 : index
+// CHECK-NEXT:         %24 = arith.index_castui %23 : index to i32
+// CHECK-NEXT:         %25 = arith.index_castui %arg1 : index to i64
+// CHECK-NEXT:         %26 = arith.index_castui %arg1 : index to i32
+// CHECK-NEXT:         %27 = arith.addi %24, %26 : i32
+// CHECK-NEXT:         %28 = llvm.getelementptr inbounds|nuw %22[0, %25] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.array<1024 x f64>
+// CHECK-NEXT:         llvm.store %cst, %28 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
+// CHECK-NEXT:         %29 = arith.extsi %27 : i32 to i64
+// CHECK-NEXT:         %30 = llvm.getelementptr inbounds %12[%29] : (!llvm.ptr, i64) -> !llvm.ptr, f64
+// CHECK-NEXT:         %31 = llvm.getelementptr inbounds %11[%29] : (!llvm.ptr, i64) -> !llvm.ptr, f64
+// CHECK-NEXT:         %32 = llvm.load %31 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
+// CHECK-NEXT:         %33 = llvm.load %30 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
+// CHECK-NEXT:         %34 = arith.mulf %32, %33 fastmath<contract> : f64
+// CHECK-NEXT:         llvm.store %34, %28 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
+// CHECK-NEXT:         "enzymexla.barrier"(%arg1, %c0, %c0) : (index, index, index) -> ()
+// CHECK-NEXT:         %35 = scf.while (%arg2 = %c256_i32) : (i32) -> i32 {
+// CHECK-NEXT:           %36 = arith.shrui %arg2, %c1_i32 : i32
+// CHECK-NEXT:           %37 = arith.cmpi ult, %26, %36 : i32
+// CHECK-NEXT:           scf.if %37 {
+// CHECK-NEXT:             %39 = arith.addi %36, %26 : i32
+// CHECK-NEXT:             %40 = arith.extui %39 nneg : i32 to i64
+// CHECK-NEXT:             %41 = llvm.getelementptr inbounds|nuw %22[0, %40] : (!llvm.ptr, i64) -> !llvm.ptr, !llvm.array<1024 x f64>
+// CHECK-NEXT:             %42 = llvm.load %41 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
+// CHECK-NEXT:             %43 = llvm.load %28 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
+// CHECK-NEXT:             %44 = arith.addf %42, %43 fastmath<contract> : f64
+// CHECK-NEXT:             llvm.store %44, %28 <alignment = 8, tbaa = [#tbaa_tag]> : f64, !llvm.ptr
+// CHECK-NEXT:           }
+// CHECK-NEXT:           %38 = arith.cmpi uge, %arg2, %c4_i32 : i32
+// CHECK-NEXT:           scf.condition(%38) %36 : i32
+// CHECK-NEXT:         } do {
+// CHECK-NEXT:         ^bb0(%arg2: i32):
+// CHECK-NEXT:           "enzymexla.barrier"(%arg1, %c0, %c0) : (index, index, index) -> ()
+// CHECK-NEXT:           scf.yield %arg2 : i32
+// CHECK-NEXT:         }
+// CHECK-NEXT:         "enzymexla.barrier"(%arg1, %c0, %c0) : (index, index, index) -> ()
+// CHECK-NEXT:         affine.if #set(%arg1) {
+// CHECK-NEXT:           %36 = llvm.load %22 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
+// CHECK-NEXT:           %37 = llvm.atomicrmw fadd %13, %36 seq_cst <alignment = 8> : !llvm.ptr, f64
+// CHECK-NEXT:         }
+// CHECK-NEXT:       }
+// CHECK-NEXT:     }
+// CHECK-NEXT:     "enzymexla.polygeist_yield"() : () -> ()
+// CHECK-NEXT:   }) : (index, index, index, index, index, index) -> index
+// CHECK-NEXT:   %18 = llvm.call @cudaGetLastError() : () -> i32
+// CHECK-NEXT:   %19 = arith.cmpi eq, %18, %c0_i32 : i32
+// CHECK-NEXT:   %20 = arith.select %19, %c0_i32, %c-1_i32 : i32
+// CHECK-NEXT:   scf.if %19 {
+// CHECK-NEXT:     enzymexla.memcpy  %5, %memref_5, %c8 : memref<?xi8>, memref<?xi8, 1>
+// CHECK-NEXT:     %21 = llvm.load %4 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
+// CHECK-NEXT:     %22 = llvm.call @printf(%1, %21) vararg(!llvm.func<i32 (ptr, ...)>) {no_unwind} : (!llvm.ptr {llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, f64 {llvm.noundef}) -> i32
+// CHECK-NEXT:     %23 = llvm.call @printf(%2, %cst_2) vararg(!llvm.func<i32 (ptr, ...)>) {no_unwind} : (!llvm.ptr {llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, f64 {llvm.noundef}) -> i32
+// CHECK-NEXT:     %24 = llvm.load %4 <alignment = 8, tbaa = [#tbaa_tag]> : !llvm.ptr -> f64
+// CHECK-NEXT:     %25 = arith.addf %24, %cst_3 : f64
+// CHECK-NEXT:     %26 = math.absf %25 : f64
+// CHECK-NEXT:     %27 = llvm.call @printf(%3, %26) vararg(!llvm.func<i32 (ptr, ...)>) {no_unwind} : (!llvm.ptr {llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, f64 {llvm.noundef}) -> i32
+// CHECK-NEXT:     %28 = llvm.call @cudaFree(%11) : (!llvm.ptr {llvm.noundef}) -> i32
+// CHECK-NEXT:     %29 = llvm.call @cudaFree(%12) : (!llvm.ptr {llvm.noundef}) -> i32
+// CHECK-NEXT:     %30 = llvm.call @cudaFree(%13) : (!llvm.ptr {llvm.noundef}) -> i32
+// CHECK-NEXT:     llvm.call @_ZdaPv(%9) {no_unwind} : (!llvm.ptr {llvm.nonnull, llvm.noundef}) -> ()
+// CHECK-NEXT:     llvm.call @_ZdaPv(%10) {no_unwind} : (!llvm.ptr {llvm.nonnull, llvm.noundef}) -> ()
+// CHECK-NEXT:   } else {
+// CHECK-NEXT:     %21 = llvm.call @cudaGetErrorString(%18) : (i32 {llvm.noundef}) -> !llvm.ptr
+// CHECK-NEXT:     %22 = llvm.call @printf(%0, %21) vararg(!llvm.func<i32 (ptr, ...)>) {no_unwind} : (!llvm.ptr {llvm.dereferenceable = 1 : i64, llvm.nonnull, llvm.noundef}, !llvm.ptr {llvm.noundef}) -> i32
+// CHECK-NEXT:   }
+// CHECK-NEXT:   llvm.return %20 : i32
+// CHECK-NEXT: }
