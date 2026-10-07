@@ -55,14 +55,42 @@ pip install enzyme-ad
 
 ## Building from source
 
-Requirements: `bazel-6.5`, `clang++`, `python`, `python-virtualenv`,
-`python3-dev`.
+Use Bazel 7.7.0 (see `.bazelversion`) and a C++ compiler.
+Set `HERMETIC_PYTHON_VERSION` to select Python 3.12, 3.13, or 3.14.
 
 Build our extension with:
 ```sh
 # Will create a whl in bazel-bin/enzyme_ad-VERSION-SYSTEM.whl
 bazel build :wheel
 ```
+
+### FlatPPL alpha wheels
+
+This fork packages `enzyme-ad==0.0.15+flatppl.1` for macOS ARM64 and
+Linux x86-64. Wheels include the native library and use CPython ABI tags.
+Build each Python minor version separately. Linux ARM64 is not packaged.
+
+On macOS, build with the wheel's macOS 14 deployment target:
+
+```sh
+MACOSX_DEPLOYMENT_TARGET=14.0 HERMETIC_PYTHON_VERSION=3.14 \
+  bazel build --config=public_cache --macos_minimum_os=14.0 \
+  --host_cxxopt=-mmacosx-version-min=14.0 \
+  --host_linkopt=-mmacosx-version-min=14.0 :wheel
+```
+
+On Linux, select a recent compiler with `CC` and `CXX`, then run:
+
+```sh
+HERMETIC_PYTHON_VERSION=3.14 bazel build --config=public_cache :wheel
+```
+
+The Linux build initially uses a `linux_x86_64` tag. Inspect its shared-library
+requirements with `auditwheel show`, then use `auditwheel repair` for a supported
+manylinux tag. Do not assign an older glibc baseline than the binary requires.
+
+Download the alpha wheels from this fork's
+[releases](https://github.com/BJMCox/Enzyme-JAX/releases).
 
 Finally, install the built library with:
 ```sh
