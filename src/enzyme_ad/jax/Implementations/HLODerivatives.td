@@ -1282,8 +1282,16 @@ def : HLOInactiveOp<"RngBitGeneratorOp">;
 
 def : HLODerivative<"RsqrtOp", (Op $x),
                     [
-                      // (Select (FCmpUEQ $x, (ConstantFP<"0"> $x)), (ConstantFP<"0"> $x), (FDiv (DiffeRet), (FMul (ConstantFP<"-2"> $x), (Call<(SameFunc), [ReadNone,NoUnwind]> $x))))
-                      (CheckedDiv (DiffeRet), (Mul (HLOConstantFP<"-2"> $x), (Mul $x, (Sqrt $x))))
+                      // Avoid forming x*sqrt(x) at extreme scales. Near unity,
+                      // retain the single division: splitting it can overflow
+                      // or flush an intermediate even when the result is normal.
+                      (SelectIfComplex $x,
+                        (CheckedDiv (DiffeRet), (Mul (HLOConstantFP<"-2"> $x), (Mul $x, (Sqrt $x)))),
+                        (Select
+                          (And (Compare $x, (HLOConstantFP<"0.25"> $x), (GE)),
+                               (Compare $x, (HLOConstantFP<"1"> $x), (LT))),
+                          (CheckedDiv (DiffeRet), (Mul (HLOConstantFP<"-2"> $x), (Mul $x, (Sqrt $x)))),
+                          (CheckedDiv (CheckedMul (DiffeRet), (Mul (HLOConstantFP<"-0.5"> $x), (Rsqrt $x))), $x)))
                     ]
                   >;
 
