@@ -20,6 +20,7 @@ import jax.extend
 from jax._src.interpreters import partial_eval as pe
 
 from . import enzyme_call
+from ._hlo_linearize import linearize_hlo
 
 from .utils import default_nowheel_resource, default_linux_cflags
 
@@ -331,6 +332,7 @@ def _enzyme_shadow_aug_impl(
     out_shapes: Sequence[jax.core.ShapedArray],
     lang: enzyme_call.Language,
     pipeline_options,
+    linearization=None,
 ) -> Sequence[jax.Array]:
     del args_flat, source, out_shapes
     raise RuntimeError("must be JIT'ed")
@@ -447,6 +449,7 @@ def _enzyme_shadow_aug_abstract_eval(
     out_shapes: Sequence[jax.core.ShapedArray],
     lang: enzyme_call.Language,
     pipeline_options,
+    linearization=None,
 ) -> Sequence[jax.core.ShapedArray]:
     return out_shapes
 
@@ -1043,6 +1046,10 @@ def to_jax_type(mlir_type):
 
     et = mlir_type.element_type
     for jtype, mcall in jax._src.interpreters.mlir._dtype_to_ir_type.items():
+        # float0 uses i1 only as a placeholder for absent tangents. Actual i1
+        # tensors, including predicates saved for reverse AD, are boolean.
+        if jtype == jax.float0:
+            continue
         mtype = mcall()  # mlir_type.context)
         if mtype == et:
             return jax.core.ShapedArray(mlir_type.shape, jtype)
@@ -1334,6 +1341,53 @@ def primal_partial_eval(trace, *args, **kwargs):
     if not (all_primals_known and some_tangents_unknown):
         return trace.default_process_primitive(_enzyme_primal_p, args, kwargs)
 
+    if pipeline_options.ad_level() == 1 and isinstance(mfunc, str):
+        passes = pipeline_options.pass_pipeline()
+        start = passes.rindex("enzyme-wrap{")
+        end = passes.index("}", start)
+        split = linearize_hlo(
+            mfunc,
+            tuple(act == "enzyme_dup" for act in acts),
+            passes[:start].rstrip(","),
+            passes[end + 1 :].lstrip(","),
+        )
+        if split is not None:
+            forward, reverse = split
+            with jax_mlir.make_ir_context():
+                module = ir.Module.parse(forward)
+                shapes = tuple(
+                    to_jax_type(ty) for ty in module.body.operations[0].type.results
+                )
+            source = (
+                in_tree,
+                tuple(avals.items()),
+                tuple((i, -1) for i in range(len(shapes))),
+                forward,
+                (),
+            )
+            values = trace.default_process_primitive(
+                _enzyme_primal_p,
+                primals,
+                kwargs
+                | {
+                    "source": source,
+                    "out_shapes": shapes,
+                    "pipeline_options": JaXPipeline(),
+                },
+            )
+            count = len(kwargs["out_shapes"]) // 2
+            residuals = [trace.full_raise(v) for v in values[count:]]
+            shadows = trace.default_process_primitive(
+                _enzyme_shadow_aug_p,
+                residuals + primals + tangents,
+                kwargs
+                | {
+                    "out_shapes": kwargs["out_shapes"][::2],
+                    "linearization": (reverse, len(residuals)),
+                },
+            )
+            return tuple(v for pair in zip(values[:count], shadows) for v in pair)
+
     shadow_aug_args = primals + tangents
 
     out_shapes = kwargs["out_shapes"]
@@ -1379,6 +1433,17 @@ pe.custom_partial_eval_rules[_enzyme_primal_p] = primal_partial_eval
 
 
 def enzyme_vjp(shadow_rets, *prim_args, **kwargs):
+    linearization = kwargs.pop("linearization", None)
+    if linearization is not None:
+        reverse, count = linearization
+        residuals, original_args = prim_args[:count], prim_args[count:]
+        if any(type(value) is ad.Zero for value in shadow_rets):
+            # Preserve activity semantics: a numerical zero can still produce
+            # NaN when multiplied by an inactive, nonfinite derivative.
+            return (None,) * count + enzyme_vjp(shadow_rets, *original_args, **kwargs)
+        gradients = hlo_call(*residuals, *shadow_rets, source=reverse)
+        return (None,) * (len(prim_args) - len(gradients)) + tuple(gradients)
+
     pipeline_options = kwargs["pipeline_options"]
     if pipeline_options.mlir_ad() and kwargs["lang"] == LANG_MHLO:
         passes = pipeline_options.pass_pipeline()
@@ -1393,9 +1458,6 @@ def enzyme_vjp(shadow_rets, *prim_args, **kwargs):
         ad_pass = ad_pass.replace("enzyme_dup", "enzyme_active")
         ad_pass = ad_pass.replace("ForwardMode", "ReverseModeCombined")
 
-        shadow_rets2 = tuple(
-            sret for (i, sret) in enumerate(shadow_rets) if acts[i] == "enzyme_dup"
-        )
         preret, _, postret = ret_activity_from_pipeline(ad_pass)
 
         shadow_rets2 = []

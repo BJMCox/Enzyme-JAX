@@ -209,6 +209,7 @@ py_library(
     name = "enzyme_jax_internal",
     srcs = [
         "__init__.py",
+        "_hlo_linearize.py",
         "primitives.py",
         "utils.py",
     ],
