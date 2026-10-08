@@ -20,7 +20,7 @@ _ELEMENTWISE = frozenset(
 )
 _SHAPED = frozenset(
     "broadcast_in_dim concatenate constant dot_general dynamic_slice "
-    "dynamic_update_slice gather get_dimension_size iota reshape reverse "
+    "dynamic_update_slice gather get_dimension_size iota pad reshape reverse "
     "slice transpose".split()
 )
 
@@ -35,14 +35,15 @@ def _batchable(op):
         return False
     if name in _ELEMENTWISE or name in _SHAPED:
         return not op.regions
-    if name in ("reduce", "reduce_window"):
-        count = len(op.results)
-        if not all(
-            isinstance(v, ir.OpResult)
-            and v.owner.operation.name == "stablehlo.constant"
-            for v in list(op.operands)[count:]
-        ):
-            return False
+    if name in ("reduce", "reduce_window", "scatter"):
+        if name != "scatter":
+            count = len(op.results)
+            if not all(
+                isinstance(v, ir.OpResult)
+                and v.owner.operation.name == "stablehlo.constant"
+                for v in list(op.operands)[count:]
+            ):
+                return False
         for region in op.regions:
             for block in region.blocks:
                 local = set(block.arguments)
