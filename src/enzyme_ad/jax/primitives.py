@@ -718,6 +718,7 @@ def _enzyme_primal_lowering(
                 if "top_k_gt" in f.sym_name.value:
                     pushtop.append(f)
                 mod.regions[0].blocks[0].append(f)
+                ctx.module_context.symbol_table.insert(f)
                 if f.sym_name.value == name:
                     fn = f
             if fn is None:
@@ -743,7 +744,7 @@ def _enzyme_primal_lowering(
                     ba.replace_all_uses_with(arg)
                 results = list(fn.regions[0].blocks[0].operations[0].operands)
                 fn.regions[0].blocks[0].operations[0].erase()
-                fn.erase()
+                ctx.module_context.symbol_table.erase(fn)
                 placeholderop.erase()
             else:
                 callop = func.CallOp(fn, list(in_args))
