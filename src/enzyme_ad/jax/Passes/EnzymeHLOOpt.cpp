@@ -7790,6 +7790,155 @@ std::optional<Value> is_same_in_axis(OpBuilder &rewriter, ShapedType outTy,
   return {};
 }
 
+// A unique static table can update a compact span without serial scatter
+// kernels. Keep holes from the original input, including their NaN payloads.
+struct CompactStaticScatter final
+    : CheckedOpRewritePattern<stablehlo::ScatterOp, CompactStaticScatter> {
+  using CheckedOpRewritePattern::CheckedOpRewritePattern;
+
+  LogicalResult matchAndRewriteImpl(stablehlo::ScatterOp op,
+                                    PatternRewriter &rewriter) const {
+    if (op.getInputs().size() != 1)
+      return failure();
+    CheckCommonScatterOp check(op);
+    bool add = check.kind == ScatterOpKind::Add;
+    if (!add && check.kind != ScatterOpKind::Setindex)
+      return failure();
+    Value input = op.getInputs()[0], updates = op.getUpdates()[0];
+    auto inputTy = cast<RankedTensorType>(input.getType());
+    auto updatesTy = cast<RankedTensorType>(updates.getType());
+    auto indicesTy = cast<RankedTensorType>(op.getScatterIndices().getType());
+    auto elem = inputTy.getElementType();
+    int64_t rank = inputTy.getRank(), axis = rank - 1;
+    if (!rank || !inputTy.hasStaticShape() || !updatesTy.hasStaticShape() ||
+        !indicesTy.hasStaticShape() || updatesTy.getRank() != rank ||
+        !(elem.isF32() || elem.isF64()) ||
+        inputTy.getShape().drop_back() != updatesTy.getShape().drop_back())
+      return failure();
+    // Zero-based additive scatters need a separate reduction lowering.
+    Attribute initial;
+    if (add && matchPattern(input, m_Constant(&initial)) &&
+        matchPattern(initial, m_AnyZeroFloat()))
+      return failure();
+    auto dims = op.getScatterDimensionNumbers();
+    if (dims.getInsertedWindowDims() != ArrayRef<int64_t>{axis} ||
+        dims.getScatterDimsToOperandDims() != ArrayRef<int64_t>{axis})
+      return failure();
+    auto prefix = [](ArrayRef<int64_t> values, int64_t size) {
+      return values.size() == size &&
+             llvm::all_of(llvm::enumerate(values),
+                          [](auto v) { return v.index() == v.value(); });
+    };
+    bool batched =
+        dims.getUpdateWindowDims().empty() &&
+        prefix(dims.getInputBatchingDims(), axis) &&
+        prefix(dims.getScatterIndicesBatchingDims(), axis) &&
+        dims.getIndexVectorDim() == axis + 1 &&
+        indicesTy.getRank() == rank + 1 &&
+        indicesTy.getShape().drop_back(2) == inputTy.getShape().drop_back();
+    bool window = prefix(dims.getUpdateWindowDims(), axis) &&
+                  dims.getInputBatchingDims().empty() &&
+                  dims.getScatterIndicesBatchingDims().empty() &&
+                  dims.getIndexVectorDim() == 1 && indicesTy.getRank() == 2;
+    if ((!batched && !window) || indicesTy.getShape().back() != 1)
+      return failure();
+    int64_t count = updatesTy.getShape().back();
+    if (!count || count > INT32_MAX ||
+        indicesTy.getShape()[indicesTy.getRank() - 2] != count)
+      return failure();
+    DenseIntElementsAttr table;
+    if (!matchPattern(op.getScatterIndices(), m_Constant(&table)) ||
+        !table.getNumElements() ||
+        table.getElementType().getIntOrFloatBitWidth() > 64)
+      return failure();
+    SmallVector<int64_t> destinations;
+    for (auto [i, value] : llvm::enumerate(table.getValues<APInt>())) {
+      int64_t destination = value.getSExtValue();
+      if (destination < 0 || destination >= inputTy.getShape().back())
+        return failure();
+      if (i < count)
+        destinations.push_back(destination);
+      else if (destination != destinations[i % count])
+        return failure();
+    }
+    auto [minimum, maximum] =
+        std::minmax_element(destinations.begin(), destinations.end());
+    int64_t low = *minimum, span = *maximum - low + 1;
+    if (span > 4 * count)
+      return failure();
+    SmallVector<int32_t> inverse(span, count);
+    for (auto [i, destination] : llvm::enumerate(destinations)) {
+      if (inverse[destination - low] != count)
+        return failure();
+      inverse[destination - low] = i;
+    }
+
+    auto loc = op.getLoc();
+    auto scalarTy = RankedTensorType::get({}, elem);
+    Value zero = stablehlo::ConstantOp::create(
+        rewriter, loc, cast<ElementsAttr>(makeAttr(scalarTy, 0)));
+    SmallVector<int64_t> rowShape(inputTy.getShape());
+    rowShape.back() = 1;
+    Value row = stablehlo::BroadcastInDimOp::create(
+        rewriter, loc, RankedTensorType::get(rowShape, elem), zero,
+        rewriter.getDenseI64ArrayAttr({}));
+    Value extended = stablehlo::ConcatenateOp::create(
+        rewriter, loc, ValueRange{updates, row}, axis);
+    Value indices = stablehlo::ConstantOp::create(
+        rewriter, loc,
+        DenseIntElementsAttr::get(
+            RankedTensorType::get({span, 1}, rewriter.getI32Type()),
+            ArrayRef<int32_t>(inverse)));
+    SmallVector<int64_t> offsets;
+    for (int64_t i = 0; i < axis; ++i)
+      offsets.push_back(i);
+    auto gatherDims = stablehlo::GatherDimensionNumbersAttr::get(
+        rewriter.getContext(), offsets, {axis}, {}, {}, {axis}, 1);
+    Value selected = stablehlo::GatherOp::create(
+        rewriter, loc, extended, indices, gatherDims,
+        rewriter.getDenseI64ArrayAttr(rowShape), rewriter.getBoolAttr(false));
+    SmallVector<int64_t> starts(rank, 0), limits(inputTy.getShape()),
+        strides(rank, 1);
+    starts.back() = low;
+    limits.back() = low + span;
+    Value previous = stablehlo::SliceOp::create(rewriter, loc, input, starts,
+                                                limits, strides);
+    if (add) {
+      // Either side can become +0 after inlining. Keep the addition so a -0
+      // update still has the same sign as the original scatter addition.
+      auto operands = stablehlo::OptimizationBarrierOp::create(
+          rewriter, loc, ValueRange{previous, selected});
+      selected = stablehlo::AddOp::create(rewriter, loc, operands.getResults()[0],
+                                        operands.getResults()[1]);
+    }
+    if (span != count) {
+      SmallVector<APInt> present;
+      for (int32_t index : inverse)
+        present.emplace_back(1, index != count);
+      Value mask = stablehlo::ConstantOp::create(
+          rewriter, loc,
+          DenseIntElementsAttr::get(
+              RankedTensorType::get({span}, rewriter.getI1Type()), present));
+      auto maskTy = RankedTensorType::get(
+          cast<RankedTensorType>(previous.getType()).getShape(),
+          rewriter.getI1Type());
+      mask = stablehlo::BroadcastInDimOp::create(
+          rewriter, loc, maskTy, mask, rewriter.getDenseI64ArrayAttr({axis}));
+      selected =
+          stablehlo::SelectOp::create(rewriter, loc, mask, selected, previous);
+    }
+    auto startTy = RankedTensorType::get(
+        {}, low > INT32_MAX ? rewriter.getI64Type() : rewriter.getI32Type());
+    SmallVector<Value> startValues;
+    for (int64_t start : starts)
+      startValues.push_back(stablehlo::ConstantOp::create(
+          rewriter, loc, cast<ElementsAttr>(makeAttr(startTy, start))));
+    rewriter.replaceOpWithNewOp<stablehlo::DynamicUpdateSliceOp>(
+        op, inputTy, input, selected, startValues);
+    return success();
+  }
+};
+
 struct ScatterToDynamicUpdateSlice final
     : CheckedOpRewritePattern<stablehlo::ScatterOp,
                               ScatterToDynamicUpdateSlice> {

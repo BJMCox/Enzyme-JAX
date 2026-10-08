@@ -682,6 +682,7 @@ static void addScatterGatherPasses(std::vector<std::string> &list,
   // scatter patterns
   list.push_back("scatter_op_canon<16>");
   list.push_back("scatter_to_dynamic_update_slice<1>");
+  list.push_back("compact_static_scatter");
   list.push_back("scatter_multiply_simplify");
   list.push_back("scatter_sub_simplify");
   list.push_back("scatter_add_simplify");

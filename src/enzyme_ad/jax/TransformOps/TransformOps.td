@@ -415,6 +415,10 @@ def ApplyScatterToDynamicUpdateSlicePatterns : EnzymeHLOPatternOp<
     "scatter_to_dynamic_update_slice"> {
   let patterns = ["ScatterToDynamicUpdateSlice"];
 }
+def ApplyCompactStaticScatterPatterns : EnzymeHLOPatternOp<
+    "compact_static_scatter"> {
+  let patterns = ["CompactStaticScatter"];
+}
 def ApplyReduceConcatPatterns : EnzymeHLOPatternOp<
     "reduce_concat"> {
   let patterns = ["ReduceConcat"];
