@@ -78,6 +78,12 @@ py_test(
 )
 
 py_test(
+    name = "test_hlo_static_scatter",
+    srcs = ["test_hlo_static_scatter.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_sharding",
     srcs = ["test_hlo_sharding.py"],
     env = {"JAX_NUM_CPU_DEVICES": "4"},
