@@ -1,4 +1,5 @@
 from absl.testing import absltest
+import re
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -53,6 +54,55 @@ class HloBatching(absltest.TestCase):
             atol=1e-6,
         )
 
+    def test_pointwise_derivatives_have_no_lane_loop(self):
+        x = jnp.linspace(-2, 3, 17)
+        scale = jnp.float32(2)
+        mapped = jax.vmap(weighted_polynomial, in_axes=(0, None))
+        calls = (
+            jax.vmap(
+                jax.value_and_grad(weighted_polynomial, argnums=(0, 1)),
+                in_axes=(0, None),
+            ),
+            jax.value_and_grad(lambda x, s: mapped(x, s).sum(), argnums=(0, 1)),
+        )
+        for call in calls:
+            compiled = jax.jit(call).lower(x, scale).compile()
+            self.assertEmpty(re.findall(r"\bwhile\(", compiled.as_text()))
+
+    def test_fixed_scan_batches_time_steps_and_shared_derivatives(self):
+        def scan(scale, xs):
+            def step(state, x):
+                value = jnp.tanh(scale * state + x)
+                return value, value
+
+            return jax.lax.scan(step, jnp.float32(0.2), xs)[1].sum()
+
+        scale = jnp.float32(0.4)
+        xs = jnp.linspace(-0.3, 0.7, 40).reshape(5, 8)
+        source = str(jax.jit(scan).lower(scale, xs[0]).compiler_ir())
+        imported = lambda a, x: hlo_call(a, x, source=source)[0]
+
+        def summed(f):
+            return lambda a, x: jax.vmap(f, in_axes=(None, 0))(a, x).sum()
+
+        for transform, loops in (
+            (lambda f: jax.vmap(f, in_axes=(None, 0)), 1),
+            (
+                lambda f: jax.vmap(
+                    jax.value_and_grad(f, argnums=(0, 1)), in_axes=(None, 0)
+                ),
+                2,
+            ),
+            (lambda f: jax.value_and_grad(summed(f), argnums=(0, 1)), 2),
+        ):
+            compiled = jax.jit(transform(imported)).lower(scale, xs).compile()
+            actual, expected = compiled(scale, xs), transform(scan)(scale, xs)
+            for value, reference in zip(
+                jax.tree.leaves(actual), jax.tree.leaves(expected)
+            ):
+                np.testing.assert_allclose(value, reference, rtol=3e-5, atol=3e-5)
+            self.assertLen(re.findall(r"\bwhile\(", compiled.as_text()), loops)
+
     def test_distinct_rng_states_stay_in_their_lanes(self):
         def random_bits(key):
             return jax.lax.rng_bit_generator(key, (4,))
@@ -87,6 +137,46 @@ class HloBatching(absltest.TestCase):
         x = jnp.array([3, -2, 0.5], dtype=jnp.float32)
         actual = jax.jit(jax.vmap(imported))(n, x)
         np.testing.assert_allclose(actual, (x + 1) * 2.0**n - 1)
+
+    def test_loop_counter_comparison_and_narrowing_are_preserved(self):
+        for start, compare, update, expected in (
+            (4294967295, "UNSIGNED", "%next = stablehlo.add %i, %one : tensor<i32>", 0),
+            (
+                -130,
+                "SIGNED",
+                """
+                %sum = stablehlo.add %i, %one : tensor<i32>
+                %small = stablehlo.convert %sum : (tensor<i32>) -> tensor<i8>
+                %next = stablehlo.convert %small : (tensor<i8>) -> tensor<i32>
+            """,
+                1,
+            ),
+        ):
+            with self.subTest(start=start):
+                source = f"""
+                module {{
+                  func.func @main(%x: tensor<f32>) -> tensor<f32> {{
+                    %start = stablehlo.constant dense<{start}> : tensor<i32>
+                    %one = stablehlo.constant dense<1> : tensor<i32>
+                    %inc = stablehlo.constant dense<1.0> : tensor<f32>
+                    %loop:2 = stablehlo.while(%i = %start, %y = %x) : tensor<i32>, tensor<f32>
+                    cond {{
+                      %more = stablehlo.compare LT, %i, %one, {compare} : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                      stablehlo.return %more : tensor<i1>
+                    }} do {{
+                      {update}
+                      %value = stablehlo.add %y, %inc : tensor<f32>
+                      stablehlo.return %next, %value : tensor<i32>, tensor<f32>
+                    }}
+                    return %loop#1 : tensor<f32>
+                  }}
+                }}
+                """
+                if compare == "UNSIGNED":
+                    source = source.replace("tensor<i32>", "tensor<ui32>")
+                function = lambda x: hlo_call(x, source=source)[0]
+                x = jnp.array([-2, 0.5, 3], dtype=jnp.float32)
+                np.testing.assert_allclose(jax.jit(jax.vmap(function))(x), x + expected)
 
     def test_nested_map_with_nonleading_axis_and_shared_input(self):
         x = jnp.array([[-2, 0.5, 3], [1, -1, 0]], dtype=jnp.float32)

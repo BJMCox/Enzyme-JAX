@@ -180,11 +180,17 @@ def _partition(joint, name, input_count, output_count):
         used = set(gradients)
         for op in reverse:
             used.update(_external_values(op.operation))
+        # Literal constants are cheap to reconstruct. Keeping them in the
+        # reverse module also retains static scan bounds for later batching.
+        constants = [op for op in forward if op.operation.name == "stablehlo.constant"]
+        constant_values = {v for op in constants for v in op.results}
         ordered = arguments[:input_count] + [v for op in forward for v in op.results]
-        residuals = [v for v in ordered if v in used]
+        residuals = [v for v in ordered if v in used and v not in constant_values]
         if not all(_tensor(v.type) for v in residuals):
             return None
         return (
             _extract(arguments[:input_count], forward, values + residuals),
-            _extract(residuals + arguments[input_count:], reverse, gradients),
+            _extract(
+                residuals + arguments[input_count:], constants + reverse, gradients
+            ),
         )

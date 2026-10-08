@@ -4435,14 +4435,26 @@ struct SHLOSliceOpBatchInterface
 // invariant we can keep using a single dynamic_slice/dynamic_update_slice on
 // the batched operand. Otherwise the op has to be lowered to a gather/scatter,
 // since one (update-)slice cannot express a different offset per batch element.
-static bool isBatchInvariant(Value batched, ArrayRef<int64_t> batchSizes) {
+static bool isBatchInvariant(Value batched, ArrayRef<int64_t> batchSizes,
+                             DenseMap<Value, bool> &known) {
+  if (auto found = known.find(batched); found != known.end())
+    return found->second;
   SplatElementsAttr splat;
   if (matchPattern(batched, m_Constant(&splat)))
     return true;
 
   auto bcast = batched.getDefiningOp<stablehlo::BroadcastInDimOp>();
-  if (!bcast)
-    return false;
+  if (!bcast) {
+    auto *op = batched.getDefiningOp();
+    // Reverse scans index tapes with expressions such as N - 1 - i. These
+    // remain uniform when i is the broadcast view of a scalar loop counter.
+    bool uniform = op && isa<AddOp, SubtractOp, MulOp, NegOp, ConvertOp>(op) &&
+                   llvm::all_of(op->getOperands(), [&](Value operand) {
+                     return isBatchInvariant(operand, batchSizes, known);
+                   });
+    known[batched] = uniform;
+    return uniform;
+  }
 
   // `broadcast_dimensions` maps operand dimensions onto result dimensions. If
   // no batch dimension is mapped onto, every batch dimension is an expanded
@@ -4456,8 +4468,9 @@ static bool isBatchInvariant(Value batched, ArrayRef<int64_t> batchSizes) {
 static bool allStartIndicesBatchInvariant(Operation::operand_range startIndices,
                                           IRMapping &mapper,
                                           ArrayRef<int64_t> batchSizes) {
+  DenseMap<Value, bool> known;
   return llvm::all_of(startIndices, [&](Value sIndex) {
-    return isBatchInvariant(mapper.lookup(sIndex), batchSizes);
+    return isBatchInvariant(mapper.lookup(sIndex), batchSizes, known);
   });
 }
 
