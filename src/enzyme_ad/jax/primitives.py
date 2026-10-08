@@ -12,7 +12,7 @@ from absl import logging
 import jax
 from jax import lax
 from jax.interpreters import mlir as jax_mlir
-from jax.interpreters import ad
+from jax.interpreters import ad, batching
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import stablehlo, func
 import jax.numpy as jnp
@@ -1140,6 +1140,25 @@ _enzyme_primal_p.def_impl(_enzyme_primal_impl)
 _enzyme_primal_p.def_abstract_eval(_enzyme_primal_abstract_eval)
 jax_mlir.register_lowering(_enzyme_primal_p, _enzyme_primal_lowering)
 
+
+def _enzyme_batch(primitive, args, axes, **params):
+    mapped = tuple(i for i, axis in enumerate(axes) if axis is not None)
+    values = tuple(jnp.moveaxis(args[i], axes[i], 0) for i in mapped)
+
+    def call(items):
+        operands = list(args)
+        for i, item in zip(mapped, items):
+            operands[i] = item
+        return primitive.bind(*operands, **params)
+
+    # Keep arbitrary imported HLO and custom calls pointwise, including RNG
+    # state and lane-dependent loops. lax.map stays on the selected device.
+    outputs = lax.map(call, values)
+    return outputs, (0,) * len(outputs)
+
+
+batching.primitive_batchers[_enzyme_primal_p] = partial(_enzyme_batch, _enzyme_primal_p)
+
 register_custom_call_target("jaxzyme.primal", enzyme_call.get_callback())
 
 _enzyme_fwd_p = Primitive("enzyme_fwd")
@@ -1147,6 +1166,7 @@ _enzyme_fwd_p.multiple_results = True
 _enzyme_fwd_p.def_impl(_enzyme_fwd_impl)
 _enzyme_fwd_p.def_abstract_eval(_enzyme_fwd_abstract_eval)
 jax_mlir.register_lowering(_enzyme_fwd_p, _enzyme_fwd_lowering)
+batching.primitive_batchers[_enzyme_fwd_p] = partial(_enzyme_batch, _enzyme_fwd_p)
 
 register_custom_call_target("jaxzyme.fwd", enzyme_call.get_callback())
 
@@ -1265,6 +1285,7 @@ _enzyme_aug_p.multiple_results = True
 _enzyme_aug_p.def_impl(_enzyme_aug_impl)
 _enzyme_aug_p.def_abstract_eval(_enzyme_aug_abstract_eval)
 jax_mlir.register_lowering(_enzyme_aug_p, _enzyme_aug_lowering)
+batching.primitive_batchers[_enzyme_aug_p] = partial(_enzyme_batch, _enzyme_aug_p)
 
 register_custom_call_target("jaxzyme.aug", enzyme_call.get_callback(), platform="cpu")
 register_custom_call_target("jaxzyme.aug", enzyme_call.get_callback(), platform="CUDA")
@@ -1281,6 +1302,7 @@ _enzyme_rev_p.multiple_results = True
 _enzyme_rev_p.def_impl(_enzyme_rev_impl)
 _enzyme_rev_p.def_abstract_eval(_enzyme_rev_abstract_eval)
 jax_mlir.register_lowering(_enzyme_rev_p, _enzyme_rev_lowering)
+batching.primitive_batchers[_enzyme_rev_p] = partial(_enzyme_batch, _enzyme_rev_p)
 
 register_custom_call_target("jaxzyme.rev", enzyme_call.get_callback(), platform="cpu")
 register_custom_call_target("jaxzyme.rev", enzyme_call.get_callback(), platform="CUDA")
