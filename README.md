@@ -66,9 +66,19 @@ bazel build :wheel
 
 ### FlatPPL alpha wheels
 
-This fork packages `enzyme-ad==0.0.15+flatppl.1` for macOS ARM64 and
+This fork packages `enzyme-ad==0.0.15+flatppl.2` for macOS ARM64 and
 Linux x86-64. Wheels include the native library and use CPython ABI tags.
 Build each Python minor version separately. Linux ARM64 is not packaged.
+
+The alpha wheels pin JAX and jaxlib 0.11.2. Imported StableHLO calls support
+`vmap`, including nested maps and derivatives, through device-side maps.
+These maps preserve per-call control flow and explicit random state but can
+be slower than tensor batching, especially on GPUs.
+
+`shard_map` preserves varying-axis metadata and shared-input gradient sums.
+Keep collectives, hidden-state RNG, and device operations in surrounding JAX.
+Automatic sharding through `jit` and compatibility with `pmap` are tested.
+For Explicit mesh axes, use `jax.sharding.auto_axes(..., out_sharding=...)`.
 
 On macOS, build with the wheel's macOS 14 deployment target:
 
