@@ -36,6 +36,23 @@ def weighted_polynomial(x, scale):
 
 
 class HloBatching(absltest.TestCase):
+    def test_fallback_keeps_imported_symbols_distinct_from_jax_helpers(self):
+        def function(xs):
+            def step(state, x):
+                return state + x, state + x
+
+            return jnp.sort(jax.lax.scan(step, jnp.float32(0.2), xs)[1])
+
+        x = jnp.array([2, -3, 1, -0.5], dtype=jnp.float32)
+        source = str(jax.jit(function).lower(x).compiler_ir())
+        imported = lambda x: hlo_call(x, source=source)[0]
+        points = jnp.stack((x, 2 * x))
+        np.testing.assert_allclose(
+            jax.jit(jax.vmap(lambda x: imported(x) + imported(-x)))(points),
+            jax.vmap(lambda x: function(x) + function(-x))(points),
+            atol=1e-6,
+        )
+
     def test_distinct_rng_states_stay_in_their_lanes(self):
         def random_bits(key):
             return jax.lax.rng_bit_generator(key, (4,))
