@@ -1230,7 +1230,11 @@ def _enzyme_batch(primitive, args, axes, **params):
         # first. Already-split forward/reverse calls have an ordinary tensor ABI.
         pending_ad = pipeline.ad_level() != 0
         source = batch_hlo(
-            params["source"][3], "" if pending_ad else pipeline.pass_pipeline(), size
+            params["source"][3],
+            "" if pending_ad else pipeline.pass_pipeline(),
+            size,
+            # Batching exposes new broadcast, gather, and reduction patterns.
+            post_pipeline=optimization_passes(enable_loop_raising_passes=False),
         )
         if source is not None:
             operands = tuple(
