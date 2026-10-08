@@ -1303,14 +1303,17 @@ def enzyme_jvp(arg_primals, arg_tangents, **kwargs):
 
         avals = {}
 
+        # Reverse cotangents have no argument in the original source ABI.
         for idx, (v, s) in enumerate(zip(arg_primals, arg_tangents)):
-            avals[len(args)] = in_idx_map[idx]
+            if idx in in_idx_map:
+                avals[len(args)] = in_idx_map[idx]
             args.append(v)
             if type(s) is ad.Zero:
                 act_tup.append("enzyme_const")
             else:
                 act_tup.append("enzyme_dup")
-                avals[len(args)] = in_idx_map[idx]
+                if idx in in_idx_map:
+                    avals[len(args)] = in_idx_map[idx]
                 args.append(s)
 
         args = tuple(args)
@@ -1336,10 +1339,8 @@ def enzyme_jvp(arg_primals, arg_tangents, **kwargs):
         if pipeline_options.pass_pipeline() != "":
             oldpasses = pipeline_options.pass_pipeline()
             if "enzyme-wrap" in oldpasses:
-                start = oldpasses.rindex("enzyme-wrap{")
-                end = oldpasses.index("}", start)
-                prev_passes = oldpasses[:end]
-                newpasses = prev_passes + afterad + newpasses + oldpasses[end:]
+                # Build the prior derivative before differentiating its full ABI.
+                newpasses = oldpasses + "," + newpasses
             else:
                 newpasses = newpasses + "," + oldpasses
         pipeline_options = JaXPipeline(newpasses)
@@ -1417,7 +1418,10 @@ def _enzyme_shadow_aug_lowering(ctx, *args, linearization=None, **params):
     pipeline = params["pipeline_options"]
     if not pipeline.mlir_ad() or params["lang"] != LANG_MHLO:
         raise NotImplementedError("materialized linearize requires StableHLO AD")
-    _, activities, _ = arg_activity_from_pipeline(pipeline.pass_pipeline())
+    passes = pipeline.pass_pipeline()
+    _, activities, _ = arg_activity_from_pipeline(
+        passes[passes.rindex("enzyme-wrap{") :]
+    )
     residual_count = 0 if linearization is None else linearization[1]
 
     def push(*values):
@@ -1488,7 +1492,8 @@ def primal_partial_eval(trace, *args, **kwargs):
     ):
         return trace.default_process_primitive(_enzyme_primal_p, args, kwargs)
 
-    _, acts, _ = arg_activity_from_pipeline(pipeline_options.pass_pipeline())
+    passes = pipeline_options.pass_pipeline()
+    _, acts, _ = arg_activity_from_pipeline(passes[passes.rindex("enzyme-wrap{") :])
 
     in_tree, in_idx_map, out_idx_map, mfunc, jit_options = kwargs["source"]
     in_idx_map = dict(in_idx_map)
@@ -1498,7 +1503,9 @@ def primal_partial_eval(trace, *args, **kwargs):
     avals = {}
 
     for idx, v in enumerate(acts):
-        avals[idx] = in_idx_map[len(primals) + len(tangents)]
+        argidx = len(primals) + len(tangents)
+        if argidx in in_idx_map:
+            avals[idx] = in_idx_map[argidx]
         primals.append(args[len(primals) + len(tangents)])
         if v == "enzyme_dup":
             tangents.append(args[len(primals) + len(tangents)])
@@ -1672,9 +1679,10 @@ def enzyme_vjp(shadow_rets, *prim_args, **kwargs):
         argidx = 0
         outidx = 0
         for idx, v in enumerate(acts):
-            avals[idx] = in_idx_map[argidx]
+            if argidx in in_idx_map:
+                avals[idx] = in_idx_map[argidx]
             if v == "enzyme_dup":
-                outmap[outidx] = in_idx_map[argidx]
+                outmap[outidx] = in_idx_map.get(argidx, -1)
                 outidx += 1
             argidx += 1
             if v == "enzyme_dup":
