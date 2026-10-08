@@ -29,6 +29,20 @@ def recurrence(parameter):
 
 
 class HLOLinearize(absltest.TestCase):
+    def test_vector_cache_with_i32_scan_counter(self):
+        def function(x):
+            def step(state, _):
+                return jnp.tanh(state), None
+
+            return jax.lax.scan(step, x, None, length=32)[0].sum()
+
+        point = jnp.array([-0.5, 0.2, 0.8], dtype=jnp.float32)
+        imported = import_hlo(function, point)
+        actual = jax.jit(jax.value_and_grad(lambda x: imported(x)[0]))(point)
+        expected = jax.value_and_grad(function)(point)
+        for value, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+            np.testing.assert_allclose(value, reference, rtol=3e-6, atol=3e-6)
+
     @absltest.skipUnless(
         HAS_EFFECT_QUERIES,
         "requires MLIR memory effect queries",

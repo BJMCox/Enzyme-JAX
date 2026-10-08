@@ -3453,8 +3453,6 @@ public:
       inductionVariable = body->getArgument(0);
     }
 
-    auto zero = makeI64Constant(whileOp->getLoc(), rewriter, 0);
-
     // Stand-in for the reverse loop's counter while the min cut runs. The
     // counter itself can only be built in step 4 (the loop is rebuilt there),
     // but the min cut needs to know *now* that the forward induction variable
@@ -3598,6 +3596,8 @@ public:
         if (auto TT = dyn_cast<TensorType>(cinfo.cachedType())) {
           auto shape = TT.getShape();
 
+          auto zero = makeZero(rewriter, cinfo.pushOp->getLoc(),
+                               inductionVariable.getType());
           SmallVector<Value> startIndices(shape.size() + 1, zero);
           startIndices[0] = inductionVariable;
 
@@ -3786,6 +3786,8 @@ public:
         Value popValue;
         if (auto TT = dyn_cast<TensorType>(info.cachedType())) {
           auto shape = TT.getShape();
+          auto zero = makeZero(rewriter, info.popOp->getLoc(),
+                               newInductionVariable.getType());
           SmallVector<Value> startIndices(shape.size() + 1, zero);
           startIndices[0] = newInductionVariable;
           SmallVector<int64_t> sliceSizes;
