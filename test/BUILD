@@ -66,6 +66,12 @@ py_test(
 )
 
 py_test(
+    name = "test_hlo_inactive_output",
+    srcs = ["test_hlo_inactive_output.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_sharding",
     srcs = ["test_hlo_sharding.py"],
     env = {"JAX_NUM_CPU_DEVICES": "4"},
