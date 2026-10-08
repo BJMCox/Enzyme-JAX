@@ -7,7 +7,7 @@ from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import func
 
 from . import enzyme_call
-from ._hlo_linearize import _external_values, _pure, _tensor
+from ._hlo_linearize import _external_values, _pure, _tensor, _walk
 
 # Unknown operations retain pointwise execution. In particular, batching an RNG
 # state is not equivalent to asking one RNG state for a larger output tensor.
@@ -62,16 +62,16 @@ def _batchable(op):
 
 
 @lru_cache(maxsize=32)
-def batch_hlo(source, pipeline, size):
+def batch_hlo(source, pipeline, size, post_pipeline=""):
     """Return a tensorized module, or None for the pointwise fallback."""
     try:
-        return _batch_hlo(source, pipeline, size)
+        return _batch_hlo(source, pipeline, size, post_pipeline)
     except (ValueError, RuntimeError, ir.MLIRError):
         # Batching support must not narrow the imported program's scalar ABI.
         return None
 
 
-def _batch_hlo(source, pipeline, size):
+def _batch_hlo(source, pipeline, size, post_pipeline):
     if not size:
         return None
     passes = pipeline + "," if pipeline else ""
@@ -121,7 +121,8 @@ def _batch_hlo(source, pipeline, size):
     name, result = enzyme_call.run_pass_pipeline(
         [],
         batched_source,
-        "enzyme-batch,arith-raise{stablehlo=true},inline,canonicalize,cse,symbol-dce",
+        "enzyme-batch,arith-raise{stablehlo=true},inline,canonicalize,cse,symbol-dce"
+        + ",tensor-empty-raise,drop-unsupported-attributes",
     )
     with mlir.make_ir_context(), ir.Location.unknown():
         module = ir.Module.parse(result)
@@ -129,4 +130,18 @@ def _batch_hlo(source, pipeline, size):
         # This module is a new source program, which a later AD pipeline may
         # optimize again. Its entry must survive symbol dead-code elimination.
         function.attributes["sym_visibility"] = ir.StringAttr.get("public")
+        # The optimizer's loop range analysis does not preserve unsigned
+        # comparisons or narrowing counter updates. Optimize tensor graphs
+        # here; leave native scans and per-operation loop fallbacks intact.
+        if post_pipeline and not any(
+            op.name == "stablehlo.while" for op in _walk(function.operation)
+        ):
+            name, result = enzyme_call.run_pass_pipeline(
+                [],
+                str(module),
+                post_pipeline + ",tensor-empty-raise,drop-unsupported-attributes",
+            )
+            module = ir.Module.parse(result)
+            function = next(f for f in module.body.operations if f.name.value == name)
+            function.attributes["sym_visibility"] = ir.StringAttr.get("public")
         return str(module)

@@ -6,6 +6,7 @@ import numpy as np
 
 from enzyme_ad.jax import hlo_call
 from enzyme_ad.jax._hlo_batch import batch_hlo
+from enzyme_ad.jax.primitives import optimization_passes
 
 
 def polynomial(x, scale):
@@ -38,6 +39,26 @@ def weighted_polynomial(x, scale):
 
 
 class HloBatching(absltest.TestCase):
+    def test_postoptimized_batch_remains_reusable(self):
+        source = str(jax.jit(lambda x: x * x).lower(jnp.float32(1)).compiler_ir())
+        passes = optimization_passes(enable_loop_raising_passes=False)
+        batch_hlo.cache_clear()
+        plain = batch_hlo(source, "", 3)
+        optimized = batch_hlo(source, "", 3, post_pipeline=passes)
+        self.assertIsNotNone(plain)
+        self.assertIsNotNone(optimized)
+        self.assertEqual(batch_hlo.cache_info().misses, 2)
+        self.assertEqual(batch_hlo(source, "", 3, post_pipeline=passes), optimized)
+        self.assertEqual(batch_hlo.cache_info().hits, 1)
+
+        def total(x):
+            return hlo_call(x, source=optimized, passes="symbol-dce")[0].sum()
+
+        x = jnp.array([-0.5, 1.0, 2.0])
+        value, gradient = jax.jit(jax.value_and_grad(total))(x)
+        np.testing.assert_allclose(value, (x * x).sum())
+        np.testing.assert_allclose(gradient, 2 * x)
+
     def test_scatter_update_cannot_capture_outer_values(self):
         # Native batching clones the update region unchanged. A capture must
         # never refer to an outer value whose type gained a batch dimension.
