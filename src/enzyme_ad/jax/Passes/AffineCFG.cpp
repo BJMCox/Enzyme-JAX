@@ -49,9 +49,52 @@ using namespace mlir::arith;
 using namespace mlir::affine;
 using namespace mlir::enzyme;
 
+// How many of the low bits of `v` are known to be zero: those a shift left,
+// or a multiply, by a constant clears, seen through the casts between.
+static unsigned knownTrailingZeros(Value v) {
+  APInt cst;
+  if (matchPattern(v, m_ConstantInt(&cst)))
+    return cst.countr_zero();
+  Operation *def = v.getDefiningOp();
+  if (!def)
+    return 0;
+  if (isa<ExtUIOp, ExtSIOp, IndexCastOp, IndexCastUIOp>(def))
+    return knownTrailingZeros(def->getOperand(0));
+  unsigned width =
+      v.getType().isIndex() ? 64 : v.getType().getIntOrFloatBitWidth();
+  if (auto trunc = dyn_cast<TruncIOp>(def))
+    return std::min(knownTrailingZeros(trunc.getIn()), width);
+  if (auto shl = dyn_cast<ShLIOp>(def)) {
+    APInt amount;
+    if (!matchPattern(shl.getRhs(), m_ConstantInt(&amount)) ||
+        amount.uge(width))
+      return 0;
+    return std::min<unsigned>(
+        knownTrailingZeros(shl.getLhs()) + amount.getZExtValue(), width);
+  }
+  if (auto mul = dyn_cast<MulIOp>(def))
+    return std::min(knownTrailingZeros(mul.getLhs()) +
+                        knownTrailingZeros(mul.getRhs()),
+                    width);
+  return 0;
+}
+
+// An or that adds: imported as one, or setting with a constant only bits the
+// other operand is known to leave zero, as `(e << 2) | k` with k < 4 does.
 bool isDisjoint(Value v) {
-  if (auto op = v.getDefiningOp()) {
-    return op->hasAttr("isDisjoint");
+  Operation *op = v.getDefiningOp();
+  if (!op)
+    return false;
+  if (op->hasAttr("isDisjoint"))
+    return true;
+  auto orOp = dyn_cast<OrIOp>(op);
+  if (!orOp)
+    return false;
+  for (unsigned i = 0; i < 2; ++i) {
+    APInt cst;
+    if (matchPattern(orOp->getOperand(1 - i), m_ConstantInt(&cst)) &&
+        cst.getActiveBits() <= knownTrailingZeros(orOp->getOperand(i)))
+      return true;
   }
   return false;
 }
@@ -5292,6 +5335,24 @@ struct SplitParallelInductions
                                                         U->getOperand(1));
           } else if (isa<arith::RemUIOp>(U)) {
             rewriter.replaceAllUsesWith(U->getResult(0), newIv);
+          } else if (isa<affine::AffineDialect>(U->getDialect())) {
+            // An affine use, as a loop bound, reads the variable as an
+            // affine.apply of the two: a valid dim, where the arith form
+            // below is not.
+            rewriter.setInsertionPoint(U);
+            auto ctx = iv.getContext();
+            SmallVector<Value> operands{iv, newIv};
+            if (base.isValue)
+              operands.push_back(base.v_val);
+            auto replacement = affine::AffineApplyOp::create(
+                rewriter, U->getLoc(),
+                AffineMap::get(2, base.isValue ? 1 : 0,
+                               getAffineDimExpr(0, ctx) * baseExpr +
+                                   getAffineDimExpr(1, ctx)),
+                operands);
+            rewriter.replaceUsesWithIf(
+                iv, replacement.getResult(),
+                [&](OpOperand &op) { return op.getOwner() == U; });
           } else {
             rewriter.setInsertionPoint(U);
             auto replacement = arith::MulIOp::create(
@@ -8304,11 +8365,26 @@ static Value asIndex(Value v, Operation *at, DominanceInfo &dom) {
   return nullptr;
 }
 
+// Every index `v` is read as that dominates `at`: its index casts, and the
+// index casts of its extensions. They all agree where v is non-negative.
+static void indexForms(Value v, Operation *at, DominanceInfo &dom,
+                       SmallVectorImpl<Value> &forms) {
+  for (Operation *user : v.getUsers()) {
+    if (isa<arith::IndexCastOp, arith::IndexCastUIOp>(user) &&
+        user->getResult(0).getType().isIndex() &&
+        dom.properlyDominates(user, at))
+      forms.push_back(user->getResult(0));
+    else if (isa<arith::ExtUIOp, arith::ExtSIOp>(user))
+      indexForms(user->getResult(0), at, dom, forms);
+  }
+}
+
 // The constraints that `cond` taking the value `holds` gives over the values
 // it compares (as indices), appended to `facts`/`eqs` over `syms`: an and
 // that holds or an or that fails gives each of its operands, a signed
 // comparison a linear constraint. A sign-extending cast keeps a signed
-// comparison.
+// comparison. A value compared to a constant and found non-negative is read
+// the same through each of its index forms, which are then one value.
 static void addConditionFacts(Value cond, bool holds, Operation *at,
                               DominanceInfo &dom, SmallVectorImpl<Value> &syms,
                               SmallVectorImpl<AffineExpr> &facts,
@@ -8340,11 +8416,77 @@ static void addConditionFacts(Value cond, bool holds, Operation *at,
     }
     return getAffineSymbolExpr(it - syms.begin(), ctx);
   };
+  auto pred =
+      holds ? cmp.getPredicate() : arith::invertPredicate(cmp.getPredicate());
+  // x != 0, which a strict comparison with 0 gives too: the square of x,
+  // x * x without signed wrap, is at least 1. Its index forms read as such, as
+  // the count NQ = Q1D * Q1D of a kernel does past a check on Q1D.
+  {
+    Value x;
+    APInt c;
+    if (matchPattern(cmp.getRhs(), m_ConstantInt(&c)) && c.isZero())
+      x = cmp.getLhs();
+    else if (matchPattern(cmp.getLhs(), m_ConstantInt(&c)) && c.isZero())
+      x = cmp.getRhs();
+    if (x && (pred == arith::CmpIPredicate::ne ||
+              pred == arith::CmpIPredicate::sgt ||
+              pred == arith::CmpIPredicate::slt)) {
+      for (Operation *user : x.getUsers()) {
+        auto mul = dyn_cast<arith::MulIOp>(user);
+        if (!mul || mul.getLhs() != x || mul.getRhs() != x ||
+            !bitEnumContainsAll(mul.getOverflowFlags(),
+                                arith::IntegerOverflowFlags::nsw))
+          continue;
+        SmallVector<Value> forms;
+        indexForms(mul.getResult(), at, dom, forms);
+        if (Value idx = asIndex(mul.getResult(), at, dom))
+          forms.push_back(idx);
+        for (Value form : forms) {
+          AffineExpr e = side(form);
+          if (!e)
+            continue;
+          facts.push_back(e - 1);
+          eqs.push_back(false);
+        }
+      }
+    }
+  }
   AffineExpr a = side(cmp.getLhs()), b = side(cmp.getRhs());
   if (!a || !b)
     return;
-  auto pred =
-      holds ? cmp.getPredicate() : arith::invertPredicate(cmp.getPredicate());
+  // v > c or v >= c for a constant c >= 0 (or -1 for >): v is non-negative,
+  // and its other index forms equal the one read
+  {
+    Value v;
+    APInt c;
+    bool nonneg = false;
+    if (matchPattern(cmp.getRhs(), m_ConstantInt(&c))) {
+      v = cmp.getLhs();
+      nonneg = (pred == arith::CmpIPredicate::sgt && c.sge(-1)) ||
+               (pred == arith::CmpIPredicate::sge && c.sge(0)) ||
+               (pred == arith::CmpIPredicate::eq && c.sge(0));
+    } else if (matchPattern(cmp.getLhs(), m_ConstantInt(&c))) {
+      v = cmp.getRhs();
+      nonneg = (pred == arith::CmpIPredicate::slt && c.sge(-1)) ||
+               (pred == arith::CmpIPredicate::sle && c.sge(0)) ||
+               (pred == arith::CmpIPredicate::eq && c.sge(0));
+    }
+    if (nonneg) {
+      SmallVector<Value> forms;
+      indexForms(v, at, dom, forms);
+      Value first = asIndex(v, at, dom);
+      AffineExpr firstExpr = side(first);
+      for (Value form : forms) {
+        if (form == first)
+          continue;
+        AffineExpr e = side(form);
+        if (!e)
+          continue;
+        facts.push_back(e - firstExpr);
+        eqs.push_back(true);
+      }
+    }
+  }
   switch (pred) {
   case arith::CmpIPredicate::slt:
     facts.push_back(b - a - 1);
@@ -8388,26 +8530,39 @@ static bool reaches(Block *from, Block *to) {
 // op of its body, give: where one successor of a branch that dominates its
 // block cannot reach it, it only runs with the condition taking the other
 // way, as past an MFEM_VERIFY, whose failing side ends in a call that does
-// not return. The values compared are read as index casts dominating `at`.
-static IntegerSet guardFacts(Operation *at, DominanceInfo &dom,
+// not return; and an scf.if `at` is under runs only with its condition
+// taking the way to the region it is in. The values compared are read as
+// index casts dominating `at`.
+static IntegerSet guardFacts(Operation *at, Operation *loop, DominanceInfo &dom,
                              SmallVectorImpl<Value> &syms) {
   SmallVector<AffineExpr> facts;
   SmallVector<bool> eqs;
   Block *block = at->getBlock();
   Region *region = block->getParent();
-  if (region->hasOneBlock())
-    return IntegerSet();
-  auto &tree = dom.getDomTree(region);
-  for (auto *node = tree.getNode(block); node && node->getIDom();
-       node = node->getIDom()) {
-    Block *d = node->getIDom()->getBlock();
-    auto br = dyn_cast<cf::CondBranchOp>(d->getTerminator());
-    if (!br)
+  if (!region->hasOneBlock()) {
+    auto &tree = dom.getDomTree(region);
+    for (auto *node = tree.getNode(block); node && node->getIDom();
+         node = node->getIDom()) {
+      Block *d = node->getIDom()->getBlock();
+      auto br = dyn_cast<cf::CondBranchOp>(d->getTerminator());
+      if (!br)
+        continue;
+      bool fromTrue = reaches(br.getTrueDest(), block);
+      bool fromFalse = reaches(br.getFalseDest(), block);
+      if (fromTrue != fromFalse)
+        addConditionFacts(br.getCondition(), fromTrue, at, dom, syms, facts,
+                          eqs);
+    }
+  }
+  // the scf.ifs the loop analyzed is under, which are above every access
+  // of the loop
+  for (Operation *op = loop->getParentOp(); op && !isa<FunctionOpInterface>(op);
+       op = op->getParentOp()) {
+    auto ifOp = dyn_cast<scf::IfOp>(op);
+    if (!ifOp)
       continue;
-    bool fromTrue = reaches(br.getTrueDest(), block);
-    bool fromFalse = reaches(br.getFalseDest(), block);
-    if (fromTrue != fromFalse)
-      addConditionFacts(br.getCondition(), fromTrue, at, dom, syms, facts, eqs);
+    bool inThen = ifOp.getThenRegion().isAncestor(loop->getParentRegion());
+    addConditionFacts(ifOp.getCondition(), inThen, loop, dom, syms, facts, eqs);
   }
   if (facts.empty())
     return IntegerSet();
@@ -8602,10 +8757,74 @@ struct InvariantTerms {
     return it->second;
   }
 
+  // A product of operands with a coefficient: one term of an expression
+  // multiplied out.
+  struct Monomial {
+    int64_t coeff;
+    SmallVector<AffineExpr> vars; // dims and symbols, sorted
+  };
+
+  // `e`, a tree of sums and products over the operands and constants,
+  // multiplied out into monomials; nullopt when it divides or takes a
+  // remainder, which do not distribute.
+  static std::optional<SmallVector<Monomial>> expand(AffineExpr e) {
+    if (auto c = dyn_cast<AffineConstantExpr>(e))
+      return SmallVector<Monomial>{{c.getValue(), {}}};
+    if (isa<AffineDimExpr, AffineSymbolExpr>(e))
+      return SmallVector<Monomial>{{1, {e}}};
+    auto bin = dyn_cast<AffineBinaryOpExpr>(e);
+    if (!bin)
+      return std::nullopt;
+    auto lhs = expand(bin.getLHS()), rhs = expand(bin.getRHS());
+    if (!lhs || !rhs)
+      return std::nullopt;
+    SmallVector<Monomial> out;
+    if (bin.getKind() == AffineExprKind::Add) {
+      out = *lhs;
+      out.append(rhs->begin(), rhs->end());
+    } else if (bin.getKind() == AffineExprKind::Mul) {
+      for (const Monomial &a : *lhs)
+        for (const Monomial &b : *rhs) {
+          Monomial m{a.coeff * b.coeff, a.vars};
+          m.vars.append(b.vars.begin(), b.vars.end());
+          llvm::sort(m.vars, [](AffineExpr x, AffineExpr y) {
+            return x.getAsOpaquePointer() < y.getAsOpaquePointer();
+          });
+          out.push_back(std::move(m));
+        }
+    } else {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // `e` with each largest loop-invariant subexpression that is not affine
-  // replaced by its placeholder, appended to `symbols`.
+  // replaced by its placeholder, appended to `symbols`. A sum of products is
+  // multiplied out first, so that the invariant product under a different
+  // coefficient or offset in another access, (e * 3 + 1) * n against
+  // (e * 3) * n, say, is the same placeholder in both.
   AffineExpr abstract(AffineExpr e, ValueRange operands, unsigned numDims,
                       SmallVectorImpl<Value> &symbols) {
+    if (!e.isPureAffine())
+      if (auto monomials = expand(e)) {
+        MLIRContext *ctx = e.getContext();
+        AffineExpr sum = getAffineConstantExpr(0, ctx);
+        for (Monomial &m : *monomials) {
+          AffineExpr term = getAffineConstantExpr(1, ctx);
+          for (AffineExpr v : m.vars)
+            term = term * v;
+          if (!term.isPureAffine() && isInvariant(term, operands, numDims)) {
+            Value v = placeholder(term, operands, numDims);
+            auto *it = llvm::find(symbols, v);
+            unsigned pos = std::distance(symbols.begin(), it);
+            if (it == symbols.end())
+              symbols.push_back(v);
+            term = getAffineSymbolExpr(pos, ctx);
+          }
+          sum = sum + term * m.coeff;
+        }
+        return sum;
+      }
     if (!e.isPureAffine() && isInvariant(e, operands, numDims)) {
       Value v = placeholder(e, operands, numDims);
       auto *it = llvm::find(symbols, v);
@@ -8637,7 +8856,7 @@ struct InvariantTerms {
     auto it = guards.find(at);
     if (it == guards.end()) {
       SmallVector<Value> syms;
-      IntegerSet set = guardFacts(at, dom, syms);
+      IntegerSet set = guardFacts(at, loop, dom, syms);
       it = guards.try_emplace(at, set, syms).first;
     }
     auto &[set, syms] = it->second;
@@ -8690,6 +8909,16 @@ static bool isStructural(Operation *op) {
              scf::IfOp, scf::YieldOp>(op);
 }
 
+// Whether two accesses index one buffer, so that their relations compare:
+// two memref values of one type that are views of one object at no offset
+// from it, as the same pointer2memref taken in each arm of a branch the loop
+// body was duplicated under, index the same elements.
+static bool sameBuffer(Value a, Value b) {
+  return a.getType() == b.getType() &&
+         enzyme::oputils::getBaseObject(a, /*offsetAllowed=*/false) ==
+             enzyme::oputils::getBaseObject(b, /*offsetAllowed=*/false);
+}
+
 static bool isLoopMemoryParallel(AffineForOp forOp) {
   // Any memref-typed iteration arguments are treated as serializing.
   if (llvm::any_of(forOp.getResultTypes(), llvm::IsaPred<BaseMemRefType>))
@@ -8729,24 +8958,23 @@ static bool isLoopMemoryParallel(AffineForOp forOp) {
   if (walkResult.wasInterrupted())
     return false;
 
-  // The dependence analysis compares the accesses of each memref value with
-  // each other only, taking two memref values never to alias, which holds
-  // for distinct buffers but not for two views of one: a loop that writes a
-  // buffer it also reaches through another view of it is not parallel.
-  llvm::MapVector<Value, SmallPtrSet<Value, 2>> views;
-  DenseSet<Value> written;
+  // The dependence analysis compares the accesses of one buffer with each
+  // other only, taking two buffers never to alias, which holds for distinct
+  // objects but not for two views of one at an offset from each other: a
+  // loop that writes an object it also reaches through such a view is not
+  // parallel.
   SmallVector<Value> writtenMemrefs;
+  for (Operation *op : loadAndStoreOps)
+    if (isa<AffineWriteOpInterface>(op))
+      writtenMemrefs.push_back(MemRefAccess(op).memref);
   for (Operation *op : loadAndStoreOps) {
     Value memref = MemRefAccess(op).memref;
-    views[enzyme::oputils::getBaseObject(memref)].insert(memref);
-    if (isa<AffineWriteOpInterface>(op)) {
-      written.insert(enzyme::oputils::getBaseObject(memref));
-      writtenMemrefs.push_back(memref);
-    }
+    for (Value written : writtenMemrefs)
+      if (!sameBuffer(memref, written) &&
+          enzyme::oputils::getBaseObject(memref) ==
+              enzyme::oputils::getBaseObject(written))
+        return false;
   }
-  for (auto &[base, memrefs] : views)
-    if (written.count(base) && memrefs.size() > 1)
-      return false;
   for (memref::LoadOp load : opaqueReads)
     for (Value memref : writtenMemrefs)
       if (enzyme::oputils::mayAlias(load.getMemRef(), memref))
@@ -8760,7 +8988,7 @@ static bool isLoopMemoryParallel(AffineForOp forOp) {
   InvariantTerms terms(forOp);
   for (auto *srcOp : loadAndStoreOps) {
     for (auto *dstOp : loadAndStoreOps) {
-      if (MemRefAccess(srcOp).memref != MemRefAccess(dstOp).memref ||
+      if (!sameBuffer(MemRefAccess(srcOp).memref, MemRefAccess(dstOp).memref) ||
           (!isa<AffineWriteOpInterface>(srcOp) &&
            !isa<AffineWriteOpInterface>(dstOp)))
         continue;
@@ -9119,7 +9347,7 @@ static bool isLoopMemoryLockStepExecutable(AffineForOp forOp) {
                               << "dst: " << *dstOp << "\n");
       MemRefAccess dstAccess(dstOp);
       DependenceResult result(DependenceResult::NoDependence);
-      if (srcAccess.memref == dstAccess.memref &&
+      if (sameBuffer(srcAccess.memref, dstAccess.memref) &&
           (isa<AffineWriteOpInterface>(srcOp) ||
            isa<AffineWriteOpInterface>(dstOp))) {
         presburger::IntegerRelation srcRel(
