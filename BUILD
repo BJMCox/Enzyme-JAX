@@ -179,7 +179,7 @@ py_wheel(
         "@bazel_tools//src/conditions:windows_x64": "win_amd64",
         "@bazel_tools//src/conditions:darwin_arm64": "macosx_14_0_arm64",
         "@bazel_tools//src/conditions:darwin_x86_64": "macosx_10_14_x86_64",
-        "@bazel_tools//src/conditions:linux_aarch64": "manylinux2014_aarch64",
+        "@bazel_tools//src/conditions:linux_aarch64": "linux_aarch64",
         "@bazel_tools//src/conditions:linux_x86_64": "linux_x86_64",
         "@bazel_tools//src/conditions:linux_ppc64le": "manylinux2014_ppc64le",
     }),
