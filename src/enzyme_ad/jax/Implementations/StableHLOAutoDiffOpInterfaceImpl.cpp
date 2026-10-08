@@ -2269,6 +2269,85 @@ struct SHLOTransposeOpBatchInterface
   }
 };
 
+struct AutoDiffBarrierFwd
+    : AutoDiffOpInterface::ExternalModel<AutoDiffBarrierFwd,
+                                         OptimizationBarrierOp> {
+  LogicalResult createForwardModeTangent(Operation *op, OpBuilder &builder,
+                                         MGradientUtils *gutils) const {
+    SmallVector<Value> tangents, results;
+    for (auto result : op->getOpResults()) {
+      if (gutils->isConstantValue(result))
+        continue;
+      tangents.push_back(gutils->invertPointerM(
+          op->getOperand(result.getResultNumber()), builder));
+      results.push_back(result);
+    }
+    if (tangents.empty())
+      return success();
+    auto barrier =
+        OptimizationBarrierOp::create(builder, op->getLoc(), tangents);
+    for (auto [result, tangent] :
+         llvm::zip_equal(results, barrier.getResults()))
+      gutils->setDiffe(result, tangent, builder);
+    return success();
+  }
+};
+
+struct AutoDiffBarrierRev
+    : ReverseAutoDiffOpInterface::ExternalModel<AutoDiffBarrierRev,
+                                                OptimizationBarrierOp> {
+  LogicalResult createReverseModeAdjoint(Operation *op, OpBuilder &builder,
+                                         MGradientUtilsReverse *gutils,
+                                         SmallVector<Value> caches) const {
+    SmallVector<Value> cotangents, operands;
+    for (auto result : op->getOpResults()) {
+      if (gutils->isConstantValue(result))
+        continue;
+      cotangents.push_back(gutils->diffe(result, builder));
+      gutils->zeroDiffe(result, builder);
+      operands.push_back(op->getOperand(result.getResultNumber()));
+    }
+    if (cotangents.empty())
+      return success();
+    auto barrier =
+        OptimizationBarrierOp::create(builder, op->getLoc(), cotangents);
+    for (auto [operand, cotangent] :
+         llvm::zip_equal(operands, barrier.getResults()))
+      if (!gutils->isConstantValue(operand))
+        gutils->addToDiffe(operand, cotangent, builder);
+    return success();
+  }
+
+  SmallVector<Value> cacheValues(Operation *op,
+                                 MGradientUtilsReverse *gutils) const {
+    return {};
+  }
+
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
+    return success();
+  }
+};
+
+struct ADDataFlowBarrierOp
+    : ADDataFlowOpInterface::ExternalModel<ADDataFlowBarrierOp,
+                                           OptimizationBarrierOp> {
+  SmallVector<Value> getPotentialIncomingValuesRes(Operation *op,
+                                                   OpResult result) const {
+    return {op->getOperand(result.getResultNumber())};
+  }
+
+  SmallVector<Value> getPotentialIncomingValuesArg(Operation *op,
+                                                   BlockArgument value) const {
+    return {};
+  }
+
+  SmallVector<Value> getPotentialTerminatorUsers(Operation *op, Operation *term,
+                                                 Value value) const {
+    return {};
+  }
+};
+
 struct ADDataFlowSortOp
     : public ADDataFlowOpInterface::ExternalModel<ADDataFlowSortOp, SortOp> {
 
@@ -5150,6 +5229,8 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
 
     WhileOp::attachInterface<ADDataFlowWhileOp>(*context);
     SortOp::attachInterface<ADDataFlowSortOp>(*context);
+    OptimizationBarrierOp::attachInterface<
+        ADDataFlowBarrierOp, AutoDiffBarrierFwd, AutoDiffBarrierRev>(*context);
     ScatterOp::attachInterface<ADDataFlowScatterOp>(*context);
     ReduceOp::attachInterface<ADDataFlowReduceOp>(*context);
 
