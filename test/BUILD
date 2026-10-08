@@ -65,6 +65,13 @@ py_test(
     deps = TEST_DEPS,
 )
 
+py_test(
+    name = "test_hlo_sharding",
+    srcs = ["test_hlo_sharding.py"],
+    env = {"JAX_NUM_CPU_DEVICES": "4"},
+    deps = TEST_DEPS,
+)
+
 [
     lit_test(
         name = "%s.test" % src,

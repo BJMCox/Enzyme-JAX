@@ -18,6 +18,9 @@ from jaxlib.mlir.dialects import stablehlo, func
 import jax.numpy as jnp
 import jax.extend
 from jax._src.interpreters import partial_eval as pe
+from jax._src import core
+from jax._src.mesh import get_abstract_mesh
+from jax.sharding import NamedSharding, PartitionSpec
 
 from . import enzyme_call
 from ._hlo_linearize import linearize_hlo
@@ -351,6 +354,60 @@ def _enzyme_rev_impl(
     raise RuntimeError("must be JIT'ed")
 
 
+def _local_output_avals(inputs, outputs):
+    mesh = get_abstract_mesh()
+    if mesh.explicit_axes:
+        raise NotImplementedError(
+            "Imported HLO needs Auto or Manual mesh axes. Wrap the call with "
+            "jax.sharding.auto_axes(..., out_sharding=...)."
+        )
+    if any(a.mat.unreduced or a.mat.reduced for a in inputs):
+        raise NotImplementedError("Imported HLO needs ordinary, fully reduced inputs")
+    varying = core.standard_vma_rule("enzyme", *inputs)
+    return tuple(
+        aval.update(
+            sharding=NamedSharding(mesh, PartitionSpec()),
+            manual_axis_type=core.ManualAxisType(varying=varying),
+        )
+        for aval in outputs
+    )
+
+
+def _check_local_hlo(module):
+    if not get_abstract_mesh().manual_axes:
+        return
+    nonlocal_ops = {
+        "all_gather",
+        "all_reduce",
+        "all_to_all",
+        "collective_broadcast",
+        "collective_permute",
+        "reduce_scatter",
+        "partition_id",
+        "replica_id",
+        "send",
+        "recv",
+        "infeed",
+        "outfeed",
+        "custom_call",
+        "rng",
+    }
+    pending = [module.operation]
+    while pending:
+        op = pending.pop()
+        if op.name.removeprefix("stablehlo.") in nonlocal_ops:
+            raise NotImplementedError(
+                f"Imported HLO under shard_map requires local operations, got {op.name}. "
+                "Express device operations and collectives in the surrounding JAX function."
+            )
+        pending.extend(
+            child.operation
+            for region in op.regions
+            for block in region
+            for child in block
+        )
+
+
 def _enzyme_primal_abstract_eval(
     *args_flat: jax.core.ShapedArray,
     source,
@@ -362,7 +419,7 @@ def _enzyme_primal_abstract_eval(
 ) -> Sequence[jax.core.ShapedArray]:
     # TODO: we may attempt some lightweight parsing of source to extract the
     # result types instead.
-    return out_shapes
+    return _local_output_avals(args_flat, out_shapes)
 
 
 def _enzyme_fwd_abstract_eval(
@@ -374,8 +431,9 @@ def _enzyme_fwd_abstract_eval(
     lang: enzyme_call.Language,
     pipeline_options,
 ) -> Sequence[jax.core.ShapedArray]:
-    del source, fn, args_flat
-    return tuple(o for o in out_shapes for _ in range(2))
+    return _local_output_avals(
+        args_flat, tuple(o for o in out_shapes for _ in range(2))
+    )
 
 
 def absmaketup(ty):
@@ -438,7 +496,7 @@ def _enzyme_aug_abstract_eval(
     res = tuple(prev_out_shapes) + (
         jax.core.ShapedArray((tapeSize,), (jax.numpy.int8)),
     )
-    return res
+    return _local_output_avals(args_flat, res)
 
 
 def _enzyme_shadow_aug_abstract_eval(
@@ -451,7 +509,7 @@ def _enzyme_shadow_aug_abstract_eval(
     pipeline_options,
     linearization=None,
 ) -> Sequence[jax.core.ShapedArray]:
-    return out_shapes
+    return _local_output_avals(args_flat, out_shapes)
 
 
 def _enzyme_rev_abstract_eval(
@@ -463,8 +521,11 @@ def _enzyme_rev_abstract_eval(
     lang: enzyme_call.Language,
     pipeline_options,
 ) -> Sequence[jax.core.ShapedArray]:
-    return tuple(
-        jax.core.ShapedArray(shape, dejaxify(tyid)) for (shape, tyid) in in_shapes
+    return _local_output_avals(
+        args_flat,
+        tuple(
+            jax.core.ShapedArray(shape, dejaxify(tyid)) for (shape, tyid) in in_shapes
+        ),
     )
 
 
@@ -1030,6 +1091,14 @@ def ffi_call(
     pipeline_options=DefaultCPPPipeline,
 ):
     assert isinstance(source, str) or len(source) == 5
+    if (
+        lang == LANG_MHLO
+        and isinstance(source[3], str)
+        and get_abstract_mesh().manual_axes
+    ):
+        with jax_mlir.make_ir_context():
+            _check_local_hlo(ir.Module.parse(source[3]))
+    args = core.auto_insert_reshard(*args)
     return _enzyme_primal_p.bind(
         *args,
         source=source,
@@ -1065,6 +1134,7 @@ def hlo_call(
     fn = "main"
     with jax_mlir.make_ir_context():
         nmod = ir.Module.parse(source)
+        _check_local_hlo(nmod)
         func = None
         names = []
         for f in nmod.body:
@@ -1099,7 +1169,7 @@ def hlo_call(
     in_idx_map = {i: i for (i, v) in enumerate(in_tys)}
 
     return _enzyme_primal_p.bind(
-        *args,
+        *core.auto_insert_reshard(*args_flat),
         source=(
             in_tree,
             tuple(in_idx_map.items()),
@@ -1510,7 +1580,10 @@ def enzyme_vjp(shadow_rets, *prim_args, **kwargs):
         prim_args = prim_args[: len(acts)]
 
         primal_in_shapes = tuple(
-            jax.core.ShapedArray(a.shape, a.dtype) for a in prim_args
+            (
+                a.aval if isinstance(a, ad.UndefinedPrimal) else core.typeof(a)
+            ).to_ct_aval()
+            for a in prim_args
         )
         out_shapes2 = [
             shape
