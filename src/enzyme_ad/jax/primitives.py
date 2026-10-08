@@ -1368,6 +1368,37 @@ _enzyme_shadow_aug_p.multiple_results = True
 _enzyme_shadow_aug_p.def_impl(_enzyme_shadow_aug_impl)
 _enzyme_shadow_aug_p.def_abstract_eval(_enzyme_shadow_aug_abstract_eval)
 
+
+def _enzyme_shadow_aug_lowering(ctx, *args, linearization=None, **params):
+    pipeline = params["pipeline_options"]
+    if not pipeline.mlir_ad() or params["lang"] != LANG_MHLO:
+        raise NotImplementedError("materialized linearize requires StableHLO AD")
+    _, activities, _ = arg_activity_from_pipeline(pipeline.pass_pipeline())
+    residual_count = 0 if linearization is None else linearization[1]
+
+    def push(*values):
+        # A materialized JVP executes forward AD. Reverse AD instead uses the
+        # transpose rule below and consumes the saved forward residuals.
+        values = values[residual_count:]
+        primals, tangents = values[: len(activities)], iter(values[len(activities) :])
+        operands = []
+        for primal, activity in zip(primals, activities):
+            operands.append(primal)
+            if activity == "enzyme_dup":
+                operands.append(next(tangents))
+        shapes = tuple(shape for shape in params["out_shapes"] for _ in range(2))
+        return _enzyme_primal_p.bind(*operands, **(params | {"out_shapes": shapes}))[
+            1::2
+        ]
+
+    return jax_mlir.lower_fun(push, multiple_results=True)(ctx, *args)
+
+
+jax_mlir.register_lowering(_enzyme_shadow_aug_p, _enzyme_shadow_aug_lowering)
+batching.primitive_batchers[_enzyme_shadow_aug_p] = partial(
+    _enzyme_batch, _enzyme_shadow_aug_p
+)
+
 _enzyme_rev_p = Primitive("enzyme_rev")
 _enzyme_rev_p.multiple_results = True
 _enzyme_rev_p.def_impl(_enzyme_rev_impl)

@@ -29,6 +29,20 @@ def recurrence(parameter):
 
 
 class HLOLinearize(absltest.TestCase):
+    def test_materialized_pushforward_after_jit(self):
+        x = jnp.linspace(-2, 3, 17)
+        scale = jnp.float32(2)
+        function = lambda x, s: s * x**2 + 2 * x + 3 * x**3
+        imported = import_hlo(function, x, scale)
+        values, push = jax.linearize(jax.jit(lambda x, s: imported(x, s)[0]), x, scale)
+        np.testing.assert_allclose(values, function(x, scale))
+        dx = jnp.linspace(-1, 1, 17)
+        np.testing.assert_allclose(
+            jax.jit(push)(dx, jnp.float32(-3)),
+            (2 * scale * x + 2 + 9 * x**2) * dx - 3 * x**2,
+            rtol=2e-6,
+        )
+
     def test_vector_cache_with_i32_scan_counter(self):
         def function(x):
             def step(state, _):
