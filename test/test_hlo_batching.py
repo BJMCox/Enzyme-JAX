@@ -39,6 +39,26 @@ def weighted_polynomial(x, scale):
 
 
 class HloBatching(absltest.TestCase):
+    def test_optimization_barrier_batches_mixed_outputs(self):
+        function = lambda x, tag: jax.lax.optimization_barrier((x, tag))
+        x = jnp.array([[0.0, -0.0], [np.nan, np.inf], [-2.0, 3.0]])
+        tags = jnp.array([3, 1, 7], dtype=jnp.int32)
+        source = str(jax.jit(function).lower(x[0], tags[0]).compiler_ir())
+        imported = lambda x, tag: tuple(
+            hlo_call(x, tag, source=source, passes="symbol-dce")
+        )
+        for axis, tag in ((None, tags[0]), (0, tags)):
+            axes = (0, axis)
+            compiled = (
+                jax.jit(jax.vmap(imported, in_axes=axes)).lower(x, tag).compile()
+            )
+            actual = compiled(x, tag)
+            expected = jax.vmap(function, in_axes=axes)(x, tag)
+            for value, reference in zip(actual, expected):
+                np.testing.assert_array_equal(value, reference)
+            np.testing.assert_array_equal(np.signbit(actual[0][0]), [False, True])
+            self.assertEmpty(re.findall(r"\bwhile\(", compiled.as_text()))
+
     def test_postoptimized_batch_remains_reusable(self):
         source = str(jax.jit(lambda x: x * x).lower(jnp.float32(1)).compiler_ir())
         passes = optimization_passes(enable_loop_raising_passes=False)

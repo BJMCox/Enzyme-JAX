@@ -20,8 +20,8 @@ _ELEMENTWISE = frozenset(
 )
 _SHAPED = frozenset(
     "broadcast_in_dim concatenate constant dot_general dynamic_slice "
-    "dynamic_update_slice gather get_dimension_size iota pad reshape reverse "
-    "slice transpose".split()
+    "dynamic_update_slice gather get_dimension_size iota optimization_barrier "
+    "pad reshape reverse slice transpose".split()
 )
 
 
