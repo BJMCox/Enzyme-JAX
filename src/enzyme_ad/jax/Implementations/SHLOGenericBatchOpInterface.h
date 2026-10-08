@@ -7,6 +7,7 @@
 #include "Enzyme/MLIR/Passes/EnzymeBatchPass.h"
 #include "Enzyme/MLIR/Passes/RemovalUtils.h"
 
+#include "src/enzyme_ad/jax/Implementations/WhileLoopInfo.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
 #include "mlir/IR/Builders.h"
@@ -79,6 +80,114 @@ inline void batchCloneBlock(Block *srcBlock, Block *destBlock,
 inline LogicalResult tryToBatchInner(Operation *src, OpBuilder &builder,
                                      IRMapping &mapper,
                                      ArrayRef<int64_t> batchSizes) {
+  if (auto loop = dyn_cast<stablehlo::WhileOp>(src)) {
+    // Fixed scans advance all lanes together. Keep the induction variable
+    // scalar so body slices stay slices, rather than per-lane gathers.
+    enzyme::WhileLoopInfo info(loop);
+    if (failed(info.computeInfo()) || !info.isConstant() ||
+        llvm::is_contained(batchSizes, 0))
+      return failure();
+    bool safe = true;
+    loop.walk([&](Operation *op) {
+      auto tensor = [](Type type) {
+        auto ty = dyn_cast<RankedTensorType>(type);
+        return ty && ty.hasStaticShape() && !ty.getEncoding() &&
+               (ty.getElementType().isIntOrFloat() ||
+                isa<ComplexType>(ty.getElementType()));
+      };
+      if (op->getName().getDialectNamespace() != "stablehlo" ||
+          !llvm::all_of(op->getOperandTypes(), tensor) ||
+          !llvm::all_of(op->getResultTypes(), tensor) ||
+          !(op->hasTrait<OpTrait::Elementwise>() ||
+            isa<WhileOp, ReturnOp, ConstantOp, ReshapeOp, BroadcastInDimOp,
+                TransposeOp, SliceOp, DynamicSliceOp, DynamicUpdateSliceOp,
+                ConcatenateOp, DotGeneralOp, GatherOp, IotaOp,
+                GetDimensionSizeOp, ReverseOp>(op)) ||
+          !isMemoryEffectFree(op))
+        safe = false;
+    });
+    if (!safe)
+      return failure();
+    auto index = info.getArgNumber();
+    Value iv = loop.getBody().front().getArgument(index);
+    Value update = loop.getBody().front().getTerminator()->getOperand(index);
+    // The range analysis also follows converts. Narrowing an induction value
+    // changes its wraparound, so only replace a direct same-type recurrence.
+    auto *step = update.getDefiningOp();
+    if (!step || update.getType() != iv.getType() ||
+        !((isa<AddOp>(step) &&
+           ((step->getOperand(0) == iv &&
+             matchPattern(step->getOperand(1), m_Constant())) ||
+            (step->getOperand(1) == iv &&
+             matchPattern(step->getOperand(0), m_Constant())))) ||
+          (isa<SubtractOp>(step) && step->getOperand(0) == iv &&
+           matchPattern(step->getOperand(1), m_Constant()))))
+      return failure();
+    auto loc = src->getLoc();
+    auto indexType = cast<RankedTensorType>(loop->getOperand(index).getType());
+    auto constant = [&](OpBuilder &b, int64_t value) -> Value {
+      return details::makeIntegerConstant(loc, b, indexType.getElementType(),
+                                          value);
+    };
+    SmallVector<Value> operands;
+    for (auto [i, operand] : llvm::enumerate(loop.getOperands()))
+      operands.push_back(i == index
+                             ? constant(builder, *info.getConstantStart())
+                             : mapper.lookup(operand));
+    auto batched = WhileOp::create(builder, loc, operands);
+    auto *cond = new Block();
+    auto *body = new Block();
+    batched.getCond().push_back(cond);
+    batched.getBody().push_back(body);
+    for (auto operand : operands) {
+      cond->addArgument(operand.getType(), loc);
+      body->addArgument(operand.getType(), loc);
+    }
+    {
+      OpBuilder b(cond, cond->end());
+      auto more = CompareOp::create(b, loc, cond->getArgument(index),
+                                    constant(b, *info.getConstantLimit()),
+                                    ComparisonDirection::LT);
+      auto original = loop.getCond()
+                          .front()
+                          .getTerminator()
+                          ->getOperand(0)
+                          .getDefiningOp<CompareOp>();
+      more->setAttrs(original->getAttrs());
+      ReturnOp::create(b, loc, ValueRange(more));
+    }
+    {
+      OpBuilder b(body, body->end());
+      IRMapping bodyMapper = mapper;
+      for (auto [i, arg] :
+           llvm::enumerate(loop.getBody().front().getArguments())) {
+        Value value = body->getArgument(i);
+        if (i == index)
+          value = BroadcastInDimOp::create(
+              b, loc, applyBatchSizes(arg.getType(), batchSizes), value,
+              b.getDenseI64ArrayAttr({}));
+        bodyMapper.map(arg, value);
+      }
+      std::map<enzyme::batchutils::BatchCacheKey, FunctionOpInterface> cache;
+      enzyme::batchutils::batchCloneBlock(b, &loop.getBody().front(),
+                                          bodyMapper, batchSizes, cache, false);
+      auto *term = body->getTerminator();
+      b.setInsertionPoint(term);
+      auto next = AddOp::create(b, loc, body->getArgument(index),
+                                constant(b, *info.getConstantStep()));
+      term->setOperand(index, next);
+    }
+    for (auto [i, result] : llvm::enumerate(loop.getResults())) {
+      Value value = batched.getResult(i);
+      if (i == index)
+        value = BroadcastInDimOp::create(
+            builder, loc, applyBatchSizes(result.getType(), batchSizes), value,
+            builder.getDenseI64ArrayAttr({}));
+      mapper.map(result, value);
+    }
+    return success();
+  }
+
   if (auto ifOp = dyn_cast<stablehlo::IfOp>(src)) {
     auto predBroadcast =
         mapper.lookup(ifOp.getPred()).getDefiningOp<BroadcastInDimOp>();

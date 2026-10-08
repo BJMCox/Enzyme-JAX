@@ -71,9 +71,13 @@ Linux x86-64. Wheels include the native library and use CPython ABI tags.
 Build each Python minor version separately. Linux ARM64 is not packaged.
 
 The alpha wheels pin JAX and jaxlib 0.11.2. Imported StableHLO calls support
-`vmap`, including nested maps and derivatives, through device-side maps.
-These maps preserve per-call control flow and explicit random state but can
-be slower than tensor batching, especially on GPUs.
+`vmap`, including nested maps and derivatives. Supported pure tensor programs
+use Enzyme's native batching pass. Fixed scans keep a scalar time index and
+advance all batch lanes together. Values and pullbacks share forward residuals.
+
+Unsupported operations, data-dependent loops, and explicit random state retain
+pointwise device maps. These preserve per-call behavior but can be slower than
+tensor batching, especially on GPUs.
 
 `shard_map` preserves varying-axis metadata and shared-input gradient sums.
 Keep collectives, hidden-state RNG, and device operations in surrounding JAX.

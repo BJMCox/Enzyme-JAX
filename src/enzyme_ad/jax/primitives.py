@@ -24,6 +24,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 from . import enzyme_call
 from ._hlo_linearize import linearize_hlo
+from ._hlo_batch import batch_hlo
 
 from .utils import default_nowheel_resource, default_linux_cflags
 
@@ -1215,6 +1216,45 @@ jax_mlir.register_lowering(_enzyme_primal_p, _enzyme_primal_lowering)
 def _enzyme_batch(primitive, args, axes, **params):
     mapped = tuple(i for i, axis in enumerate(axes) if axis is not None)
     values = tuple(jnp.moveaxis(args[i], axes[i], 0) for i in mapped)
+
+    pipeline = params["pipeline_options"]
+    if (
+        primitive is _enzyme_primal_p
+        and params["lang"] == LANG_MHLO
+        and pipeline.stablehlo_inject()
+        and isinstance(params["source"][3], str)
+    ):
+        size = values[0].shape[0]
+        # A pending forward-AD call must retain its activity metadata until
+        # partial evaluation splits primals from tangents. Batch its source
+        # first. Already-split forward/reverse calls have an ordinary tensor ABI.
+        pending_ad = pipeline.ad_level() != 0
+        source = batch_hlo(
+            params["source"][3], "" if pending_ad else pipeline.pass_pipeline(), size
+        )
+        if source is not None:
+            operands = tuple(
+                (
+                    jnp.broadcast_to(value, (size, *value.shape))
+                    if axis is None
+                    else jnp.moveaxis(value, axis, 0)
+                )
+                for value, axis in zip(args, axes)
+            )
+            if pending_ad:
+                in_tree, in_map, out_map, _, options = params["source"]
+                batched_params = dict(
+                    params,
+                    source=(in_tree, in_map, out_map, source, options),
+                    out_shapes=tuple(
+                        aval.update(shape=(size, *aval.shape))
+                        for aval in params["out_shapes"]
+                    ),
+                )
+                outputs = primitive.bind(*operands, **batched_params)
+            else:
+                outputs = hlo_call(*operands, source=source)
+            return outputs, (0,) * len(outputs)
 
     def call(items):
         operands = list(args)
