@@ -66,7 +66,7 @@ bazel build :wheel
 
 ### FlatPPL alpha wheels
 
-This fork packages `enzyme-ad==0.0.15+flatppl.2` for macOS ARM64 and
+This fork packages `enzyme-ad==0.0.15+flatppl.3` for macOS ARM64 and
 Linux x86-64. Wheels include the native library and use CPython ABI tags.
 Build each Python minor version separately. Linux ARM64 is not packaged.
 
@@ -88,8 +88,10 @@ On macOS, build with the wheel's macOS 14 deployment target:
 
 ```sh
 MACOSX_DEPLOYMENT_TARGET=14.0 HERMETIC_PYTHON_VERSION=3.14 \
-  bazel build --config=public_cache --macos_minimum_os=14.0 \
-  --host_cxxopt=-mmacosx-version-min=14.0 \
+  bazel build --config=public_cache \
+  --copt=-mmacosx-version-min=14.0 \
+  --host_copt=-mmacosx-version-min=14.0 \
+  --linkopt=-mmacosx-version-min=14.0 \
   --host_linkopt=-mmacosx-version-min=14.0 :wheel
 ```
 

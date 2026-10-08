@@ -195,7 +195,7 @@ py_wheel(
     ],
     strip_path_prefixes = ["src/"],
     summary = "Enzyme automatic differentiation tool.",
-    version = "0.0.15+flatppl.2",
+    version = "0.0.15+flatppl.3",
     deps = [
         ":enzyme_jax_data",
         "//src/enzyme_ad/jax:enzyme_jax_internal",
