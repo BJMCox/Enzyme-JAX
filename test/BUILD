@@ -59,6 +59,12 @@ TEST_DEPS = [
     "//conditions:default": [],
 })
 
+py_test(
+    name = "test_hlo_batching",
+    srcs = ["test_hlo_batching.py"],
+    deps = TEST_DEPS,
+)
+
 [
     lit_test(
         name = "%s.test" % src,
