@@ -135,7 +135,9 @@ class HloBatching(absltest.TestCase):
         imported = lambda n, x: hlo_call(n, x, source=source)[0]
         n = jnp.array([0, 1, 4], dtype=jnp.int32)
         x = jnp.array([3, -2, 0.5], dtype=jnp.float32)
-        actual = jax.jit(jax.vmap(imported))(n, x)
+        lowered = jax.jit(jax.vmap(imported)).lower(n, x)
+        self.assertNotIn("arith.", str(lowered.compiler_ir()))
+        actual = lowered.compile()(n, x)
         np.testing.assert_allclose(actual, (x + 1) * 2.0**n - 1)
 
     def test_loop_counter_comparison_and_narrowing_are_preserved(self):

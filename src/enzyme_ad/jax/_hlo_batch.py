@@ -118,7 +118,9 @@ def _batch_hlo(source, pipeline, size):
                 func.ReturnOp(call.results)
         batched_source = str(module)
     name, result = enzyme_call.run_pass_pipeline(
-        [], batched_source, "enzyme-batch,inline,canonicalize,cse,symbol-dce"
+        [],
+        batched_source,
+        "enzyme-batch,arith-raise{stablehlo=true},inline,canonicalize,cse,symbol-dce",
     )
     with mlir.make_ir_context(), ir.Location.unknown():
         module = ir.Module.parse(result)
