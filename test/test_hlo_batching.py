@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from enzyme_ad.jax import hlo_call
+from enzyme_ad.jax._hlo_batch import batch_hlo
 
 
 def polynomial(x, scale):
@@ -37,6 +38,74 @@ def weighted_polynomial(x, scale):
 
 
 class HloBatching(absltest.TestCase):
+    def test_scatter_update_cannot_capture_outer_values(self):
+        # Native batching clones the update region unchanged. A capture must
+        # never refer to an outer value whose type gained a batch dimension.
+        source = """
+        module {
+          func.func @main(%base: tensor<5xf32>, %indices: tensor<4x1xi32>,
+                          %updates: tensor<4xf32>, %scale: tensor<f32>) -> tensor<5xf32> {
+            %result = "stablehlo.scatter"(%base, %indices, %updates) ({
+              ^bb0(%old: tensor<f32>, %update: tensor<f32>):
+                %scaled = stablehlo.multiply %update, %scale : tensor<f32>
+                %next = stablehlo.add %old, %scaled : tensor<f32>
+                stablehlo.return %next : tensor<f32>
+            }) {scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0],
+                scatter_dims_to_operand_dims = [0], index_vector_dim = 1>,
+                indices_are_sorted = false, unique_indices = false}
+                : (tensor<5xf32>, tensor<4x1xi32>, tensor<4xf32>) -> tensor<5xf32>
+            return %result : tensor<5xf32>
+          }
+        }
+        """
+        self.assertIsNone(batch_hlo(source, "", 3))
+
+    def test_padding_batches_shared_and_mapped_fill_values(self):
+        function = lambda x, fill: jax.lax.pad(x, fill, [(1, 2, 1)])
+        x = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
+        fills = jnp.array([-1.0, 0.5, 2.0])
+        source = str(jax.jit(function).lower(x[0], fills[0]).compiler_ir())
+        imported = lambda x, fill: hlo_call(x, fill, source=source)[0]
+        for axis, fill in ((None, fills[0]), (0, fills)):
+            axes = (0, axis)
+            compiled = (
+                jax.jit(jax.vmap(imported, in_axes=axes)).lower(x, fill).compile()
+            )
+            np.testing.assert_array_equal(
+                compiled(x, fill), jax.vmap(function, in_axes=axes)(x, fill)
+            )
+
+        # A constant fill uses a tensor pad, rather than a loop over lanes.
+        constant = lambda x: function(x, jnp.float32(0))
+        source = str(jax.jit(constant).lower(x[0]).compiler_ir())
+        imported = lambda x: hlo_call(x, source=source)[0]
+        compiled = jax.jit(jax.vmap(imported)).lower(x).compile()
+        np.testing.assert_array_equal(compiled(x), jax.vmap(constant)(x))
+        self.assertEmpty(re.findall(r"\bwhile\(", compiled.as_text()))
+
+    def test_gather_pullbacks_batch_repeated_indices(self):
+        function = lambda x, indices: jnp.sum(x[indices] ** 2)
+        x = jnp.arange(15, dtype=jnp.float32).reshape(3, 5) / 7
+        indices = jnp.array([[0, 2, 2], [4, 1, 3], [1, 1, 1]])
+        source = str(jax.jit(function).lower(x[0], indices[0]).compiler_ir())
+        imported = lambda x, i: hlo_call(x, i, source=source)[0]
+        for axis, selected in ((None, indices[0]), (0, indices)):
+            axes = (0, axis)
+            transforms = (
+                lambda f: jax.vmap(jax.value_and_grad(f), in_axes=axes),
+                lambda f: jax.value_and_grad(
+                    lambda x, i: jax.vmap(f, in_axes=axes)(x, i).sum()
+                ),
+            )
+            for transform in transforms:
+                compiled = jax.jit(transform(imported)).lower(x, selected).compile()
+                for actual, expected in zip(
+                    jax.tree.leaves(compiled(x, selected)),
+                    jax.tree.leaves(transform(function)(x, selected)),
+                ):
+                    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+                self.assertEmpty(re.findall(r"\bwhile\(", compiled.as_text()))
+
     def test_fallback_keeps_imported_symbols_distinct_from_jax_helpers(self):
         def function(xs):
             def step(state, x):
