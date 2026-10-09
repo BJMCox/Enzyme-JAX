@@ -74,7 +74,7 @@ class HloBatching(absltest.TestCase):
         def total(x):
             return hlo_call(x, source=optimized, passes="symbol-dce")[0].sum()
 
-        x = jnp.array([-0.5, 1.0, 2.0])
+        x = jnp.array([-0.5, 1.0, 2.0], dtype=jnp.float32)
         value, gradient = jax.jit(jax.value_and_grad(total))(x)
         np.testing.assert_allclose(value, (x * x).sum())
         np.testing.assert_allclose(gradient, 2 * x)
@@ -104,7 +104,7 @@ class HloBatching(absltest.TestCase):
     def test_padding_batches_shared_and_mapped_fill_values(self):
         function = lambda x, fill: jax.lax.pad(x, fill, [(1, 2, 1)])
         x = jnp.arange(12, dtype=jnp.float32).reshape(3, 4)
-        fills = jnp.array([-1.0, 0.5, 2.0])
+        fills = jnp.array([-1.0, 0.5, 2.0], dtype=x.dtype)
         source = str(jax.jit(function).lower(x[0], fills[0]).compiler_ir())
         imported = lambda x, fill: hlo_call(x, fill, source=source)[0]
         for axis, fill in ((None, fills[0]), (0, fills)):
@@ -165,7 +165,7 @@ class HloBatching(absltest.TestCase):
         )
 
     def test_pointwise_derivatives_have_no_lane_loop(self):
-        x = jnp.linspace(-2, 3, 17)
+        x = jnp.linspace(-2, 3, 17, dtype=jnp.float32)
         scale = jnp.float32(2)
         mapped = jax.vmap(weighted_polynomial, in_axes=(0, None))
         calls = (
@@ -188,7 +188,7 @@ class HloBatching(absltest.TestCase):
             return jax.lax.scan(step, jnp.float32(0.2), xs)[1].sum()
 
         scale = jnp.float32(0.4)
-        xs = jnp.linspace(-0.3, 0.7, 40).reshape(5, 8)
+        xs = jnp.linspace(-0.3, 0.7, 40, dtype=scale.dtype).reshape(5, 8)
         source = str(jax.jit(scan).lower(scale, xs[0]).compiler_ir())
         imported = lambda a, x: hlo_call(a, x, source=source)[0]
 
