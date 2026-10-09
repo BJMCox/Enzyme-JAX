@@ -18,6 +18,60 @@ def polynomial(x, axes):
 
 
 class ProductDerivatives(absltest.TestCase):
+    def test_ordered_slice_product_preserves_finite_cotangents(self):
+        large = 1e200 if jax.config.x64_enabled else 1e20
+        x = jnp.array([[0.0, large, 1 / large, large]])
+        seed = jnp.array([1e-10])
+
+        def product(x):
+            return ((x[:, 0] * x[:, 1]) * x[:, 2]) * x[:, 3]
+
+        source = str(jax.jit(product).lower(x).compiler_ir())
+
+        def imported(x):
+            return hlo_call(x, source=source)[0]
+
+        def pullback(x, seed):
+            value, reverse = jax.vjp(imported, x)
+            return value, reverse(seed)[0]
+
+        value, gradient = jax.jit(pullback)(x, seed)
+        np.testing.assert_array_equal(value, [0.0])
+        np.testing.assert_allclose(
+            gradient, [[large * 1e-10, 0.0, 0.0, 0.0]], rtol=3e-6, atol=0
+        )
+
+    def test_slice_product_zeros_and_mixed_hessians(self):
+        x = jnp.array([[0.0, 2.0, 3.0], [0.0, 0.0, 3.0]])
+        seed = jnp.array([7.0, -2.0])
+        direction = jnp.array([[2.0, -1.0, 0.5], [1.0, 2.0, -0.5]])
+        source = str(
+            jax.jit(lambda x: x[:, 0] * x[:, 1] * x[:, 2]).lower(x).compiler_ir()
+        )
+
+        def imported(x):
+            return hlo_call(x, source=source)[0]
+
+        def gradient(x, seed):
+            return jax.vjp(imported, x)[1](seed)[0]
+
+        np.testing.assert_array_equal(
+            jax.jit(gradient)(x, seed), [[42.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+        )
+        expected = [[-14.0, 42.0, 28.0], [-12.0, -6.0, 0.0]]
+        np.testing.assert_array_equal(
+            jax.jit(
+                lambda x, seed, dx: jax.jvp(lambda x: gradient(x, seed), (x,), (dx,))[1]
+            )(x, seed, direction),
+            expected,
+        )
+        np.testing.assert_array_equal(
+            jax.jit(jax.grad(lambda x, seed, dx: jnp.vdot(gradient(x, seed), dx)))(
+                x, seed, direction
+            ),
+            expected,
+        )
+
     def test_default_passes_preserve_wide_product_hessians(self):
         for size in (5, 9):
             x = jnp.linspace(0.7, 1.3, size).at[:2].set(0)

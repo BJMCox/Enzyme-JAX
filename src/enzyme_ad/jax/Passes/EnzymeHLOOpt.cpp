@@ -32383,6 +32383,12 @@ struct ReduceSliceFusionBase
 
   LogicalResult matchAndRewriteImpl(BinaryOpType binaryOp,
                                     PatternRewriter &rewriter) const {
+    if constexpr (std::is_same_v<BinaryOpType, stablehlo::MulOp>) {
+      // A reduction can reassociate products and overflow finite intermediates.
+      // Even two-factor reductions can be merged by later reduction rewrites.
+      if (!isa<IntegerType>(binaryOp.getType().getElementType()))
+        return failure();
+    }
     SmallVector<SliceInfo, 4> slices;
     SmallVector<Value> extraValues;
 
