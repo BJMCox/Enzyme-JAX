@@ -37,6 +37,7 @@
 #include "src/enzyme_ad/jax/Implementations/XLADerivatives.h"
 #include "src/enzyme_ad/jax/Utils.h"
 #include <cstdint>
+#include <limits>
 #include <utility>
 
 using namespace mlir;
@@ -205,6 +206,203 @@ static bool isEligibleForCompactPrint(ReduceOp op) {
   return llvm::equal(innerOp.getResults(), retOp.getOperands());
 }
 
+static bool hasStaticIdentityProduct(ReduceOp op) {
+  auto input = cast<RankedTensorType>(op.getInputs()[0].getType());
+  auto result = cast<RankedTensorType>(op.getResult(0).getType());
+  if (!input.hasStaticShape() || !result.hasStaticShape() ||
+      !isa<FloatType>(input.getElementType()) ||
+      input.getElementType() != result.getElementType())
+    return false;
+  DenseElementsAttr init;
+  if (!matchPattern(op.getInitValues()[0], m_Constant(&init)) ||
+      !init.isSplat() ||
+      !isOneAttr(cast<TypedAttr>(init.getSplatValue<Attribute>())))
+    return false;
+  int64_t size = 1;
+  for (int64_t dim = 0; dim < input.getRank(); ++dim) {
+    if (!llvm::is_contained(op.getDimensions(), dim))
+      continue;
+    int64_t extent = input.getDimSize(dim);
+    if (extent && size > std::numeric_limits<int64_t>::max() / extent)
+      return false;
+    size *= extent;
+  }
+  return true;
+}
+
+// Pair halves rather than divide by the full product. The resulting polynomial
+// retains derivatives at one or several zeros, including higher derivatives.
+class ProductReductionTree {
+  OpBuilder &builder;
+  Location loc;
+  RankedTensorType inputType, resultType;
+  SmallVector<int64_t> permutation, flatShape;
+  SmallVector<std::pair<Value, Value>> levels;
+  int64_t count = 1;
+
+  SmallVector<int64_t> shadowShape(ArrayRef<int64_t> shape, int64_t width) {
+    SmallVector<int64_t> result;
+    if (width > 1)
+      result.push_back(width);
+    llvm::append_range(result, shape);
+    return result;
+  }
+
+  Value reshape(Value value, ArrayRef<int64_t> shape) {
+    auto type = cast<RankedTensorType>(value.getType());
+    return ReshapeOp::create(
+        builder, loc, RankedTensorType::get(shape, type.getElementType()),
+        value);
+  }
+
+  Value slice(Value value, int64_t start, int64_t limit) {
+    auto type = cast<RankedTensorType>(value.getType());
+    SmallVector<int64_t> starts(type.getRank(), 0), strides(type.getRank(), 1);
+    SmallVector<int64_t> limits(type.getShape()), shape(type.getShape());
+    starts.back() = start;
+    limits.back() = limit;
+    shape.back() = limit - start;
+    return SliceOp::create(builder, loc,
+                           RankedTensorType::get(shape, type.getElementType()),
+                           value, starts, limits, strides);
+  }
+
+  Value pad(Value value, int64_t size, int64_t identity) {
+    auto type = cast<RankedTensorType>(value.getType());
+    if (type.getShape().back() == size)
+      return value;
+    SmallVector<int64_t> shape(type.getShape());
+    shape.back() = 1;
+    auto padType = RankedTensorType::get(shape, type.getElementType());
+    Value padding = ConstantOp::create(
+        builder, loc, padType, cast<ElementsAttr>(makeAttr(padType, identity)));
+    return ConcatenateOp::create(builder, loc, ValueRange{value, padding},
+                                 type.getRank() - 1);
+  }
+
+  Value flatten(Value value, int64_t width) {
+    SmallVector<int64_t> axes;
+    if (width > 1)
+      axes.push_back(0);
+    for (int64_t dim : permutation)
+      axes.push_back(dim + (width > 1));
+    value = TransposeOp::create(builder, loc, value, axes);
+    return reshape(value, shadowShape(flatShape, width));
+  }
+
+  Value broadcast(Value value, int64_t width) {
+    if (width == 1)
+      return value;
+    auto type = cast<RankedTensorType>(value.getType());
+    SmallVector<int64_t> dims;
+    for (int64_t dim = 0; dim < type.getRank(); ++dim)
+      dims.push_back(dim + 1);
+    return BroadcastInDimOp::create(
+        builder, loc,
+        RankedTensorType::get(shadowShape(type.getShape(), width),
+                              type.getElementType()),
+        value, builder.getDenseI64ArrayAttr(dims));
+  }
+
+public:
+  ProductReductionTree(ReduceOp op, Value input, OpBuilder &builder)
+      : builder(builder), loc(op.getLoc()),
+        inputType(cast<RankedTensorType>(input.getType())),
+        resultType(cast<RankedTensorType>(op.getResult(0).getType())) {
+    for (int64_t dim = 0; dim < inputType.getRank(); ++dim)
+      if (!llvm::is_contained(op.getDimensions(), dim))
+        permutation.push_back(dim);
+    for (int64_t dim = 0; dim < inputType.getRank(); ++dim)
+      if (llvm::is_contained(op.getDimensions(), dim)) {
+        permutation.push_back(dim);
+        count *= inputType.getDimSize(dim);
+      }
+    llvm::append_range(flatShape, resultType.getShape());
+    flatShape.push_back(count);
+    Value product = flatten(input, 1);
+    for (int64_t size = count; size > 1; size = size / 2 + size % 2) {
+      int64_t half = size / 2 + size % 2;
+      Value left = slice(product, 0, half);
+      Value right = pad(slice(product, half, size), half, 1);
+      levels.emplace_back(left, right);
+      product = MulOp::create(builder, loc, left, right);
+    }
+  }
+
+  Value forward(Value tangent, int64_t width) {
+    if (count == 0)
+      return makeZero(
+          builder, loc,
+          RankedTensorType::get(shadowShape(resultType.getShape(), width),
+                                resultType.getElementType()));
+    tangent = flatten(tangent, width);
+    int64_t size = count;
+    for (auto [left, right] : levels) {
+      int64_t half = size / 2 + size % 2;
+      Value dleft = slice(tangent, 0, half);
+      Value dright = pad(slice(tangent, half, size), half, 0);
+      Value first = MulOp::create(builder, loc, dleft, broadcast(right, width));
+      Value second =
+          MulOp::create(builder, loc, broadcast(left, width), dright);
+      tangent = AddOp::create(builder, loc, first, second);
+      size = half;
+    }
+    return reshape(tangent, shadowShape(resultType.getShape(), width));
+  }
+
+  Value reverse(Value cotangent, int64_t width) {
+    if (count == 0)
+      return makeZero(
+          builder, loc,
+          RankedTensorType::get(shadowShape(inputType.getShape(), width),
+                                inputType.getElementType()));
+    auto shape = shadowShape(resultType.getShape(), width);
+    shape.push_back(1);
+    cotangent = reshape(cotangent, shape);
+    SmallVector<int64_t> sizes;
+    for (int64_t size = count; size > 1; size = size / 2 + size % 2)
+      sizes.push_back(size);
+    for (size_t i = levels.size(); i > 0; --i) {
+      auto [left, right] = levels[i - 1];
+      Value dleft =
+          MulOp::create(builder, loc, cotangent, broadcast(right, width));
+      Value dright =
+          MulOp::create(builder, loc, cotangent, broadcast(left, width));
+      dright = slice(dright, 0, sizes[i - 1] / 2);
+      cotangent = ConcatenateOp::create(builder, loc, ValueRange{dleft, dright},
+                                        shape.size() - 1);
+    }
+    SmallVector<int64_t> transposedShape, inverse(permutation.size());
+    for (auto [i, dim] : llvm::enumerate(permutation)) {
+      transposedShape.push_back(inputType.getDimSize(dim));
+      inverse[dim] = i;
+    }
+    cotangent = reshape(cotangent, shadowShape(transposedShape, width));
+    if (width > 1) {
+      for (int64_t &dim : inverse)
+        ++dim;
+      inverse.insert(inverse.begin(), 0);
+    }
+    return TransposeOp::create(builder, loc, cotangent, inverse);
+  }
+};
+
+static void eraseReductionShadows(ReduceOp op, MGradientUtils *gutils) {
+  auto result = op.getBody().front().front().getResult(0);
+  if (auto shadow = gutils->invertedPointers.lookupOrNull(result)) {
+    gutils->invertedPointers.erase(result);
+    gutils->erase(shadow.getDefiningOp());
+  }
+  auto primal = cast<ReduceOp>(gutils->getNewFromOriginal(op.getOperation()));
+  BitVector toErase(primal.getBody().front().getNumArguments());
+  for (auto argument : op.getBody().front().getArguments())
+    if (auto shadow = gutils->invertedPointers.lookupOrNull(argument)) {
+      toErase.set(cast<BlockArgument>(shadow).getArgNumber());
+      gutils->invertedPointers.erase(argument);
+    }
+  primal.getBody().front().eraseArguments(toErase);
+}
+
 template <typename OpTy>
 class AutoDiffReduceCF : public ControlFlowAutoDiffOpInterface::ExternalModel<
                              AutoDiffReduceCF<OpTy>, OpTy> {
@@ -252,13 +450,32 @@ public:
           resultPositionsToShadow);
     }
 
+    if (isa<MulOp>(innerOp) &&
+        ((red.getDimensions().empty() &&
+          cast<RankedTensorType>(red.getInputs()[0].getType()).hasStaticShape()) ||
+         (hasStaticIdentityProduct(red) &&
+          gutils->isConstantValue(red.getInitValues()[0])))) {
+      Value input = red.getInputs()[0];
+      Value tangent = gutils->isConstantValue(input)
+                          ? makeZero(builder, orig->getLoc(),
+                                     gutils->getShadowType(input.getType()))
+                          : gutils->invertPointerM(input, builder);
+      if (!red.getDimensions().empty()) {
+        ProductReductionTree tree(red, gutils->getNewFromOriginal(input), builder);
+        tangent = tree.forward(tangent, gutils->width);
+      }
+      eraseReductionShadows(red, gutils);
+      if (!gutils->isConstantValue(red.getResult(0)))
+        gutils->setDiffe(red.getResult(0), tangent, builder);
+      gutils->eraseIfUnused(orig);
+      return success();
+    }
+
     if (!isa<AddOp>(innerOp)) {
       orig->emitError() << "Unsupported operation in reduction autodiff(2): "
                         << *orig << "\n";
       return failure();
     }
-
-    Operation *primal = gutils->getNewFromOriginal(orig);
 
     IRMapping map;
     for (auto &operand : orig->getOpOperands()) {
@@ -307,16 +524,7 @@ public:
       shadow = builder.clone(*orig, map);
     }
 
-    auto invAdd = gutils->invertedPointers.lookup(innerOp.getResult(0));
-    gutils->invertedPointers.erase(innerOp.getResult(0));
-    gutils->erase(invAdd.getDefiningOp());
-    BitVector baToErase(cast<OpTy>(primal).getBody().front().getNumArguments());
-    for (auto ba : red.getBody().front().getArguments()) {
-      auto invBA = cast<BlockArgument>(gutils->invertedPointers.lookup(ba));
-      gutils->invertedPointers.erase(ba);
-      baToErase.set(invBA.getArgNumber());
-    }
-    cast<OpTy>(primal).getBody().front().eraseArguments(baToErase);
+    eraseReductionShadows(red, gutils);
 
     if (gutils->width > 1) { // batched forward mode
       auto dimsAttr =
@@ -2060,9 +2268,23 @@ public:
       Value value = op->getOperand(0);
       Value init = op->getOperand(1);
 
+      if (op.getDimensions().empty()) {
+        if (!gutils->isConstantValue(value))
+          gutils->addToDiffe(value, inDiffe, builder);
+        return success();
+      }
+
       Value cachedValue = gutils->popCache(caches[0], builder);
       Value cachedInit = gutils->popCache(caches[1], builder);
       Value cachedResult = gutils->popCache(caches[2], builder);
+
+      if (hasStaticIdentityProduct(op) && gutils->isConstantValue(init)) {
+        if (!gutils->isConstantValue(value)) {
+          ProductReductionTree tree(op, cachedValue, builder);
+          gutils->addToDiffe(value, tree.reverse(inDiffe, gutils->width), builder);
+        }
+        return success();
+      }
 
       if (!gutils->isConstantValue(value)) {
         auto binDiffe = stablehlo::BroadcastInDimOp::create(
@@ -2123,6 +2345,8 @@ public:
     }
 
     Operation &innerOp = op.getBody().front().front();
+    if (isa<MulOp>(innerOp) && op.getDimensions().empty())
+      return {};
     if (isa<MulOp, MaxOp, MinOp>(innerOp)) {
       SmallVector<Value> caches;
 
