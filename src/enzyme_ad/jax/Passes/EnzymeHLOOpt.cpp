@@ -7813,6 +7813,8 @@ struct CompactStaticScatter final
     if (!rank || !inputTy.hasStaticShape() || !updatesTy.hasStaticShape() ||
         !indicesTy.hasStaticShape() || updatesTy.getRank() != rank ||
         !(elem.isF32() || elem.isF64()) ||
+        updatesTy.getElementType() != elem ||
+        cast<RankedTensorType>(op.getResult(0).getType()).getElementType() != elem ||
         inputTy.getShape().drop_back() != updatesTy.getShape().drop_back())
       return failure();
     // Zero-based additive scatters need a separate reduction lowering.
