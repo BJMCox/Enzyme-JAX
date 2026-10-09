@@ -108,9 +108,27 @@ func.func @main_mul1(%arg0: tensor<8x2xf64>) -> tensor<2xf64> {
 }
 
 // CHECK: func.func @main_mul1(%arg0: tensor<8x2xf64>) -> tensor<2xf64> {
-// CHECK-NEXT:     %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
-// CHECK-NEXT:     %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.multiply across dimensions = [0] : (tensor<8x2xf64>, tensor<f64>) -> tensor<2xf64>
-// CHECK-NEXT:     return %0 : tensor<2xf64>
+// CHECK-NEXT:   %cst = stablehlo.constant dense<1.000000e+00> : tensor<f64>
+// CHECK-NEXT:   %0 = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<8x2xf64>) -> tensor<2x8xf64>
+// CHECK-NEXT:   %1 = stablehlo.slice %0 [0:2, 0:4] : (tensor<2x8xf64>) -> tensor<2x4xf64>
+// CHECK-NEXT:   %2 = stablehlo.reduce(%1 init: %cst) applies stablehlo.multiply across dimensions = [1] : (tensor<2x4xf64>, tensor<f64>) -> tensor<2xf64>
+// CHECK-NEXT:   %3 = stablehlo.reshape %2 : (tensor<2xf64>) -> tensor<2x1xf64>
+// CHECK-NEXT:   %4 = stablehlo.slice %0 [0:2, 4:7] : (tensor<2x8xf64>) -> tensor<2x3xf64>
+// CHECK-NEXT:   %5 = "stablehlo.reduce_window"(%4, %cst) <{window_dilations = array<i64: 1, 2>, window_dimensions = array<i64: 1, 2>}> ({
+// CHECK-NEXT:   ^bb0(%arg1: tensor<f64>, %arg2: tensor<f64>):
+// CHECK-NEXT:     %11 = stablehlo.multiply %arg1, %arg2 : tensor<f64>
+// CHECK-NEXT:     stablehlo.return %11 : tensor<f64>
+// CHECK-NEXT:   }) : (tensor<2x3xf64>, tensor<f64>) -> tensor<2x1xf64>
+// CHECK-NEXT:   %6 = stablehlo.slice %0 [0:2, 5:8] : (tensor<2x8xf64>) -> tensor<2x3xf64>
+// CHECK-NEXT:   %7 = "stablehlo.reduce_window"(%6, %cst) <{window_dilations = array<i64: 1, 2>, window_dimensions = array<i64: 1, 2>}> ({
+// CHECK-NEXT:   ^bb0(%arg1: tensor<f64>, %arg2: tensor<f64>):
+// CHECK-NEXT:     %11 = stablehlo.multiply %arg1, %arg2 : tensor<f64>
+// CHECK-NEXT:     stablehlo.return %11 : tensor<f64>
+// CHECK-NEXT:   }) : (tensor<2x3xf64>, tensor<f64>) -> tensor<2x1xf64>
+// CHECK-NEXT:   %8 = stablehlo.multiply %7, %5 : tensor<2x1xf64>
+// CHECK-NEXT:   %9 = stablehlo.multiply %8, %3 : tensor<2x1xf64>
+// CHECK-NEXT:   %10 = stablehlo.reshape %9 : (tensor<2x1xf64>) -> tensor<2xf64>
+// CHECK-NEXT:   return %10 : tensor<2xf64>
 // CHECK-NEXT: }
 
 func.func @main_max1(%arg0: tensor<8x2xf64>) -> tensor<2xf64> {
@@ -254,8 +272,26 @@ func.func @main_complex_mul(%arg0: tensor<8x2xcomplex<f64>>) -> tensor<2xcomplex
 }
 
 // CHECK: func.func @main_complex_mul(%arg0: tensor<8x2xcomplex<f64>>) -> tensor<2xcomplex<f64>> {
-// CHECK-NEXT:     %cst = stablehlo.constant dense<(1.000000e+00,0.000000e+00)> : tensor<complex<f64>>
-// CHECK-NEXT:     %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.multiply across dimensions = [0] : (tensor<8x2xcomplex<f64>>, tensor<complex<f64>>) -> tensor<2xcomplex<f64>>
-// CHECK-NEXT:     return %0 : tensor<2xcomplex<f64>>
+// CHECK-NEXT:   %cst = stablehlo.constant dense<(1.000000e+00,0.000000e+00)> : tensor<complex<f64>>
+// CHECK-NEXT:   %0 = stablehlo.transpose %arg0, dims = [1, 0] {enzymexla.complex_is_purely_real = [#enzymexla.guaranteed<NOTGUARANTEED>]} : (tensor<8x2xcomplex<f64>>) -> tensor<2x8xcomplex<f64>>
+// CHECK-NEXT:   %1 = stablehlo.slice %0 [0:2, 0:4] : (tensor<2x8xcomplex<f64>>) -> tensor<2x4xcomplex<f64>>
+// CHECK-NEXT:   %2 = stablehlo.reduce(%1 init: %cst) applies stablehlo.multiply across dimensions = [1] : (tensor<2x4xcomplex<f64>>, tensor<complex<f64>>) -> tensor<2xcomplex<f64>>
+// CHECK-NEXT:   %3 = stablehlo.reshape %2 : (tensor<2xcomplex<f64>>) -> tensor<2x1xcomplex<f64>>
+// CHECK-NEXT:   %4 = stablehlo.slice %0 [0:2, 4:7] : (tensor<2x8xcomplex<f64>>) -> tensor<2x3xcomplex<f64>>
+// CHECK-NEXT:   %5 = "stablehlo.reduce_window"(%4, %cst) <{window_dilations = array<i64: 1, 2>, window_dimensions = array<i64: 1, 2>}> ({
+// CHECK-NEXT:   ^bb0(%arg1: tensor<complex<f64>>, %arg2: tensor<complex<f64>>):
+// CHECK-NEXT:     %11 = stablehlo.multiply %arg1, %arg2 : tensor<complex<f64>>
+// CHECK-NEXT:     stablehlo.return %11 : tensor<complex<f64>>
+// CHECK-NEXT:   }) : (tensor<2x3xcomplex<f64>>, tensor<complex<f64>>) -> tensor<2x1xcomplex<f64>>
+// CHECK-NEXT:   %6 = stablehlo.slice %0 [0:2, 5:8] : (tensor<2x8xcomplex<f64>>) -> tensor<2x3xcomplex<f64>>
+// CHECK-NEXT:   %7 = "stablehlo.reduce_window"(%6, %cst) <{window_dilations = array<i64: 1, 2>, window_dimensions = array<i64: 1, 2>}> ({
+// CHECK-NEXT:   ^bb0(%arg1: tensor<complex<f64>>, %arg2: tensor<complex<f64>>):
+// CHECK-NEXT:     %11 = stablehlo.multiply %arg1, %arg2 : tensor<complex<f64>>
+// CHECK-NEXT:     stablehlo.return %11 : tensor<complex<f64>>
+// CHECK-NEXT:   }) {enzymexla.complex_is_purely_real = [#enzymexla.guaranteed<NOTGUARANTEED>]} : (tensor<2x3xcomplex<f64>>, tensor<complex<f64>>) -> tensor<2x1xcomplex<f64>>
+// CHECK-NEXT:   %8 = stablehlo.multiply %7, %5 {enzymexla.complex_is_purely_real = [#enzymexla.guaranteed<NOTGUARANTEED>]} : tensor<2x1xcomplex<f64>>
+// CHECK-NEXT:   %9 = stablehlo.multiply %8, %3 : tensor<2x1xcomplex<f64>>
+// CHECK-NEXT:   %10 = stablehlo.reshape %9 : (tensor<2x1xcomplex<f64>>) -> tensor<2xcomplex<f64>>
+// CHECK-NEXT:   return %10 : tensor<2xcomplex<f64>>
 // CHECK-NEXT: }
 
