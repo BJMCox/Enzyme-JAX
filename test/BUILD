@@ -84,6 +84,12 @@ py_test(
 )
 
 py_test(
+    name = "test_hlo_gamma",
+    srcs = ["test_hlo_gamma.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_inactive_output",
     srcs = ["test_hlo_inactive_output.py"],
     deps = TEST_DEPS,
