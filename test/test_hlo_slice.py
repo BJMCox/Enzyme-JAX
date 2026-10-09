@@ -35,6 +35,51 @@ class HloSlice(absltest.TestCase):
             jax.jit(jax.grad(density))(x), weights * expected, rtol=2e-6
         )
 
+    def test_strided_adjoint_padding(self):
+        dtype = "f64" if jax.config.x64_enabled else "f32"
+        cases = [
+            ((8,), (0,), (8,), (2,)),
+            ((9,), (2,), (9,), (3,)),
+            ((5, 8), (1, 0), (5, 8), (3, 2)),
+            ((8,), (3,), (3,), (2,)),
+            ((0, 3), (0, 1), (0, 3), (2, 2)),
+        ]
+        for shape, starts, limits, strides in cases:
+            with self.subTest(shape=shape, starts=starts, strides=strides):
+                axes = tuple(zip(starts, limits, strides))
+                selection = tuple(slice(*axis) for axis in axes)
+                sizes = tuple(len(range(*axis)) for axis in axes)
+                input_type = "tensor<" + "x".join(map(str, shape)) + "x" + dtype + ">"
+                output_type = "tensor<" + "x".join(map(str, sizes)) + "x" + dtype + ">"
+                indices = ", ".join(":".join(map(str, axis)) for axis in axes)
+                source = f"""
+                module {{
+                  func.func @main(%x: {input_type}) -> {output_type} {{
+                    %y = stablehlo.slice %x [{indices}] : ({input_type}) -> {output_type}
+                    return %y : {output_type}
+                  }}
+                }}
+                """
+
+                def loss(x):
+                    y = hlo_call(x, source=source)[0]
+                    return jnp.sum(y * y)
+
+                x = jnp.arange(np.prod(shape), dtype=float).reshape(shape) / 8
+                direction = jnp.ones_like(x)
+                expected = np.zeros(shape)
+                expected[selection] = 2 * np.asarray(x)[selection]
+                gradient = jax.grad(loss)
+                np.testing.assert_array_equal(jax.jit(gradient)(x), expected)
+                expected_hvp = np.zeros(shape)
+                expected_hvp[selection] = 2
+                hvp = jax.jit(lambda x: jax.jvp(gradient, (x,), (direction,))[1])(x)
+                np.testing.assert_array_equal(hvp, expected_hvp)
+                mapped = jax.jit(jax.vmap(gradient))(jnp.stack([x, 2 * x]))
+                np.testing.assert_array_equal(
+                    mapped, np.stack([expected, 2 * expected])
+                )
+
 
 if __name__ == "__main__":
     absltest.main()
