@@ -16,3 +16,19 @@ func.func @main(%arg0: tensor<16xf64>) -> (tensor<3xf64>, tensor<3xf64>, tensor<
 // CHECK-NEXT:    %4 = stablehlo.slice %1 [0:11:5] : (tensor<14xf64>) -> tensor<3xf64>
 // CHECK-NEXT:    return %4, %3, %2 : tensor<3xf64>, tensor<3xf64>, tensor<3xf64>
 // CHECK-NEXT:  }
+
+// Shared strided slices retain the source lattice, including an incomplete
+// final stride. Rebase both offsets and limits in that lattice.
+func.func @shared_stride(%arg0: tensor<8xf64>) -> (tensor<4xf64>, tensor<3xf64>) {
+  %0 = stablehlo.exponential %arg0 : tensor<8xf64>
+  %1 = stablehlo.slice %0 [0:7:2] : (tensor<8xf64>) -> tensor<4xf64>
+  %2 = stablehlo.slice %0 [2:7:2] : (tensor<8xf64>) -> tensor<3xf64>
+  return %1, %2 : tensor<4xf64>, tensor<3xf64>
+}
+
+// CHECK-LABEL: func.func @shared_stride
+// CHECK: %[[SLICE:.*]] = stablehlo.slice %arg0 [0:7:2] : (tensor<8xf64>) -> tensor<4xf64>
+// CHECK: %[[EXP:.*]] = stablehlo.exponential %[[SLICE]] : tensor<4xf64>
+// CHECK: %[[TAIL:.*]] = stablehlo.slice %[[EXP]] [1:4] : (tensor<4xf64>) -> tensor<3xf64>
+// CHECK: %[[ALL:.*]] = stablehlo.slice %[[EXP]] [0:4] : (tensor<4xf64>) -> tensor<4xf64>
+// CHECK: return %[[ALL]], %[[TAIL]] : tensor<4xf64>, tensor<3xf64>

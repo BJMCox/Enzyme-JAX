@@ -3827,8 +3827,8 @@ struct SliceElementwise final
       if (ints[en.index()] != 1) {
         changed = true;
       }
-      sizes.push_back((stops[en.index()] - starts[en.index()]) /
-                      ints[en.index()]);
+      sizes.push_back(llvm::divideCeil(
+          stops[en.index()] - starts[en.index()], ints[en.index()]));
     }
     if (!changed)
       return failure();
@@ -3853,8 +3853,8 @@ struct SliceElementwise final
            llvm::zip(sl.getStartIndices(), sl.getLimitIndices(),
                      sl.getStrides(), starts, stops, ints)) {
         if (stride == ostride) {
-          sstarts.push_back(start - ostart);
-          sstops.push_back((stop - ostart) / stride);
+          sstarts.push_back((start - ostart) / ostride);
+          sstops.push_back(llvm::divideCeil(stop - ostart, ostride));
           sints.push_back(1);
         } else {
           assert(ostride == 1);
