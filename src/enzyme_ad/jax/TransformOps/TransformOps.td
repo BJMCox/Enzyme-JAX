@@ -419,6 +419,10 @@ def ApplyCompactStaticScatterPatterns : EnzymeHLOPatternOp<
     "compact_static_scatter"> {
   let patterns = ["CompactStaticScatter"];
 }
+def ApplyPruneStaticScatterPaddingPatterns : EnzymeHLOPatternOp<
+    "prune_static_scatter_padding"> {
+  let patterns = ["PruneStaticScatterPadding"];
+}
 def ApplyReduceConcatPatterns : EnzymeHLOPatternOp<
     "reduce_concat"> {
   let patterns = ["ReduceConcat"];
