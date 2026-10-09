@@ -78,6 +78,12 @@ py_test(
 )
 
 py_test(
+    name = "test_hlo_power",
+    srcs = ["test_hlo_power.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_inactive_output",
     srcs = ["test_hlo_inactive_output.py"],
     deps = TEST_DEPS,
