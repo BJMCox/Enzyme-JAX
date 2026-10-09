@@ -35,6 +35,33 @@ class HloSlice(absltest.TestCase):
             jax.jit(jax.grad(density))(x), weights * expected, rtol=2e-6
         )
 
+    def test_strided_reshape(self):
+        dtype = "f64" if jax.config.x64_enabled else "f32"
+        source = f"""
+        module {{
+          func.func @main(%x: tensor<1x3x{dtype}>) -> tensor<2x{dtype}> {{
+            %y = stablehlo.exponential %x : tensor<1x3x{dtype}>
+            %r = stablehlo.reshape %y : (tensor<1x3x{dtype}>) -> tensor<3x{dtype}>
+            %s = stablehlo.slice %r [0:3:2] : (tensor<3x{dtype}>) -> tensor<2x{dtype}>
+            return %s : tensor<2x{dtype}>
+          }}
+        }}
+        """
+        x = jnp.arange(3, dtype=float).reshape(1, 3) / 8
+        selected = lambda x: hlo_call(
+            x,
+            source=source,
+            passes="enzyme-hlo-generate-td{patterns=slice_reshape_elementwise},"
+            "transform-interpreter,enzyme-hlo-remove-transform",
+        )[0]
+        expected = np.exp(np.asarray(x))
+        np.testing.assert_allclose(jax.jit(selected)(x), expected[0, ::2], rtol=2e-6)
+        np.testing.assert_allclose(
+            jax.jit(jax.grad(lambda x: selected(x).sum()))(x),
+            expected * [[1, 0, 1]],
+            rtol=2e-6,
+        )
+
     def test_strided_adjoint_padding(self):
         dtype = "f64" if jax.config.x64_enabled else "f32"
         cases = [
