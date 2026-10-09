@@ -23,15 +23,25 @@ _SHAPED = frozenset(
     "dynamic_update_slice gather get_dimension_size iota optimization_barrier "
     "pad reshape reverse slice transpose".split()
 )
+# CHLO unary operations preserve each lane's shape. Keep their native AD rules
+# instead of differentiating an expanded special-function approximation.
+_CHLO_UNARY = frozenset(
+    "_asin_acos_kernel acos acosh asin asinh atan atanh bessel_i1e conj cosh "
+    "digamma erf erf_inv erfc is_inf is_neg_inf is_pos_inf lgamma sinh square tan".split()
+)
 
 
 def _batchable(op):
     name = op.name.removeprefix("stablehlo.")
     if op.name == "func.return" or name == "return":
         return True
-    if not op.name.startswith("stablehlo.") or not _pure(op):
+    if not _pure(op):
         return False
     if not all(_tensor(v.type) for v in (*op.operands, *op.results)):
+        return False
+    if op.name.startswith("chlo."):
+        return op.name.removeprefix("chlo.") in _CHLO_UNARY and not op.regions
+    if not op.name.startswith("stablehlo."):
         return False
     if name in _ELEMENTWISE or name in _SHAPED:
         return not op.regions

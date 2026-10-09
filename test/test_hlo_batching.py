@@ -1,4 +1,5 @@
 from absl.testing import absltest
+import math
 import re
 import jax
 import jax.numpy as jnp
@@ -39,6 +40,39 @@ def weighted_polynomial(x, scale):
 
 
 class HloBatching(absltest.TestCase):
+    def test_chlo_lgamma_batches_forward_and_shared_gradient(self):
+        source = """
+        module {
+          func.func @main(%x: tensor<f32>) -> tensor<f32> {
+            %y = chlo.lgamma %x : tensor<f32> -> tensor<f32>
+            return %y : tensor<f32>
+          }
+        }
+        """
+        imported = lambda x: hlo_call(x, source=source)[0]
+        x = jnp.array([0.5, 1.0, 2.0, 4.0], dtype=jnp.float32)
+        values = np.array([math.lgamma(float(v)) for v in x])
+        gradients = np.array(
+            [
+                -np.euler_gamma - 2 * math.log(2),
+                -np.euler_gamma,
+                1 - np.euler_gamma,
+                11 / 6 - np.euler_gamma,
+            ]
+        )
+        transforms = (
+            (jax.vmap, values),
+            (lambda f: jax.vmap(jax.value_and_grad(f)), (values, gradients)),
+            (lambda f: jax.grad(lambda xs: jax.vmap(f)(xs).sum()), gradients),
+        )
+        for transform, expected in transforms:
+            executable = jax.jit(transform(imported)).lower(x).compile()
+            for actual, reference in zip(
+                jax.tree.leaves(executable(x)), jax.tree.leaves(expected)
+            ):
+                np.testing.assert_allclose(actual, reference, rtol=2e-6, atol=2e-6)
+            self.assertEmpty(re.findall(r"\bwhile\(", executable.as_text()))
+
     def test_optimization_barrier_batches_mixed_outputs(self):
         function = lambda x, tag: jax.lax.optimization_barrier((x, tag))
         x = jnp.array([[0.0, -0.0], [np.nan, np.inf], [-2.0, 3.0]])
