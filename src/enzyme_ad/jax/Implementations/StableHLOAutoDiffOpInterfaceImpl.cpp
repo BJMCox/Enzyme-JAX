@@ -1948,11 +1948,12 @@ public:
     SmallVector<int64_t> starts;
     SmallVector<int64_t> edge_padding_high;
     SmallVector<int64_t> interior_padding;
-    for (auto &&[start, limit, stride, dim] :
-         llvm::zip(op.getStartIndices(), op.getLimitIndices(), op.getStrides(),
+    for (auto &&[start, size, stride, dim] :
+         llvm::zip(op.getStartIndices(), op.getType().getShape(), op.getStrides(),
                    inTy.getShape())) {
       starts.push_back(start);
-      edge_padding_high.push_back(dim - limit);
+      int64_t span = size == 0 ? 0 : (size - 1) * stride + 1;
+      edge_padding_high.push_back(dim - start - span);
       interior_padding.push_back(stride - 1);
     }
 
