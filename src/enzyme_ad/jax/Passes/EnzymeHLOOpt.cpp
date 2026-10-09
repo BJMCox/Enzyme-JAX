@@ -30035,6 +30035,28 @@ struct PowerMultiplyToPower final
   using CheckedOpRewritePattern<stablehlo::MulOp,
                                 PowerMultiplyToPower>::CheckedOpRewritePattern;
 
+  static bool canCombineExponents(APFloat lhs, const APFloat &rhs) {
+    if (!lhs.isFinite() || !rhs.isFinite() || !lhs.isInteger() ||
+        !rhs.isInteger() || lhs.isNegative() || rhs.isNegative() ||
+        lhs.isZero() || rhs.isZero())
+      return false;
+
+    // Fractional or mixed-sign powers can change the domain at negative or zero
+    // bases. Keep integer sums and derivative decrements exactly representable.
+    const auto &semantics = lhs.getSemantics();
+    auto one = APFloat::getOne(semantics);
+    auto limit = scalbn(one, APFloat::semanticsPrecision(semantics) - 1,
+                        APFloat::rmNearestTiesToEven);
+    if (lhs.add(rhs, APFloat::rmNearestTiesToEven) != APFloat::opOK ||
+        !lhs.isFinite() || lhs > limit)
+      return false;
+
+    auto previous = lhs;
+    previous.subtract(one, APFloat::rmNearestTiesToEven);
+    lhs.multiply(previous, APFloat::rmNearestTiesToEven);
+    return lhs.isFinite();
+  }
+
   LogicalResult matchAndRewriteImpl(stablehlo::MulOp op,
                                     PatternRewriter &rewriter) const {
     auto lhs = op.getLhs();
@@ -30044,6 +30066,13 @@ struct PowerMultiplyToPower final
     auto rhsDefOp = rhs.getDefiningOp<stablehlo::PowOp>();
 
     auto rType = cast<RankedTensorType>(op.getType());
+    APFloat lhsExponent(0.0), rhsExponent(0.0);
+    if (lhsDefOp &&
+        !matchPattern(lhsDefOp.getRhs(), m_ConstantFloat(&lhsExponent)))
+      lhsDefOp = nullptr;
+    if (rhsDefOp &&
+        !matchPattern(rhsDefOp.getRhs(), m_ConstantFloat(&rhsExponent)))
+      rhsDefOp = nullptr;
 
     if (lhsDefOp && isOnlyUsedInOperation(lhsDefOp, op)) {
       auto lhsLhs = lhsDefOp.getLhs();
@@ -30051,8 +30080,8 @@ struct PowerMultiplyToPower final
       if (rhsDefOp && isOnlyUsedInOperation(rhsDefOp, op)) {
         auto rhsLhs = rhsDefOp.getLhs();
 
-        if (lhsLhs ==
-            rhsLhs) { // (mul (pow a b) (pow a c)) => (pow a (add b c))
+        if (lhsLhs == rhsLhs && canCombineExponents(lhsExponent, rhsExponent)) {
+          // (mul (pow a b) (pow a c)) => (pow a (add b c))
           auto newPowVal = stablehlo::AddOp::create(
               rewriter, op.getLoc(), lhsDefOp.getRhs(), rhsDefOp.getRhs());
           rewriter.replaceOpWithNewOp<stablehlo::PowOp>(op, lhsLhs, newPowVal);
@@ -30065,9 +30094,10 @@ struct PowerMultiplyToPower final
         auto rhsMulLhs = rhsMulDefOp.getLhs();
         auto rhsMulRhs = rhsMulDefOp.getRhs();
 
-        if (rhsMulLhs == rhsMulRhs &&
-            rhsMulLhs ==
-                lhsLhs) { // (mul (pow a b) (mul a a)) => (pow a (add b 2))
+        if (rhsMulLhs == rhsMulRhs && rhsMulLhs == lhsLhs &&
+            canCombineExponents(lhsExponent,
+                                APFloat(lhsExponent.getSemantics(), 2U))) {
+          // (mul (pow a b) (mul a a)) => (pow a (add b 2))
           auto newPowVal = stablehlo::AddOp::create(
               rewriter, op.getLoc(), lhsDefOp.getRhs(),
               stablehlo::ConstantOp::create(
@@ -30078,7 +30108,10 @@ struct PowerMultiplyToPower final
         }
       }
 
-      if (lhsLhs == rhs) { // (mul (pow x y) x) => (pow x (add y 1))
+      if (lhsLhs == rhs &&
+          canCombineExponents(lhsExponent,
+                              APFloat::getOne(lhsExponent.getSemantics()))) {
+        // (mul (pow x y) x) => (pow x (add y 1))
         auto newPowVal = stablehlo::AddOp::create(
             rewriter, op.getLoc(), lhsDefOp.getRhs(),
             stablehlo::ConstantOp::create(
@@ -30092,7 +30125,10 @@ struct PowerMultiplyToPower final
     if (rhsDefOp && isOnlyUsedInOperation(rhsDefOp, op)) {
       auto rhsLhs = rhsDefOp.getLhs();
 
-      if (rhsLhs == lhs) { // (mul x (pow x y)) => (pow x (add y 1))
+      if (rhsLhs == lhs &&
+          canCombineExponents(rhsExponent,
+                              APFloat::getOne(rhsExponent.getSemantics()))) {
+        // (mul x (pow x y)) => (pow x (add y 1))
         auto newPowVal = stablehlo::AddOp::create(
             rewriter, op.getLoc(), rhsDefOp.getRhs(),
             stablehlo::ConstantOp::create(
@@ -30107,9 +30143,10 @@ struct PowerMultiplyToPower final
         auto lhsMulLhs = lhsMulDefOp.getLhs();
         auto lhsMulRhs = lhsMulDefOp.getRhs();
 
-        if (lhsMulLhs == lhsMulRhs &&
-            lhsMulLhs ==
-                rhsLhs) { // (mul (mul a a) (pow a b)) => (pow a (add b 2))
+        if (lhsMulLhs == lhsMulRhs && lhsMulLhs == rhsLhs &&
+            canCombineExponents(rhsExponent,
+                                APFloat(rhsExponent.getSemantics(), 2U))) {
+          // (mul (mul a a) (pow a b)) => (pow a (add b 2))
           auto newPowVal = stablehlo::AddOp::create(
               rewriter, op.getLoc(), rhsDefOp.getRhs(),
               stablehlo::ConstantOp::create(
