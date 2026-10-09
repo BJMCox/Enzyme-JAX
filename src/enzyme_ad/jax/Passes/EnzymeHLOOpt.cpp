@@ -13014,7 +13014,7 @@ struct SliceReshapeElementwise final
     }
     SmallVector<int64_t> sizes;
     for (auto &&[start, stop, stride] : llvm::zip(starts, limits, strides))
-      sizes.push_back((stop - start) / stride);
+      sizes.push_back(llvm::divideCeil(stop - start, stride));
     auto nex = rewriter.create(
         elem->getLoc(), elem->getName().getIdentifier(), ValueRange(ops),
         TypeRange(RankedTensorType::get(
