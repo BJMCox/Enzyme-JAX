@@ -1213,9 +1213,61 @@ _enzyme_primal_p.def_abstract_eval(_enzyme_primal_abstract_eval)
 jax_mlir.register_lowering(_enzyme_primal_p, _enzyme_primal_lowering)
 
 
+def _jvp_primals_unmapped(primitive, axes, params):
+    if primitive is _enzyme_fwd_p:
+        return all(axis is None for axis in axes[::2])
+    pipeline = params["pipeline_options"]
+    if (
+        primitive is not _enzyme_primal_p
+        or not pipeline.mlir_ad()
+        or params["lang"] != LANG_MHLO
+        or not pipeline.ad_level()
+    ):
+        return False
+    passes = pipeline.pass_pipeline()
+    last_ad = passes[passes.rindex("enzyme-wrap{") :].split("}", 1)[0] + "}"
+    if "mode=ForwardMode" not in last_ad:
+        return False
+    _, activities, _ = arg_activity_from_pipeline(last_ad)
+    _, returns, _ = ret_activity_from_pipeline(last_ad)
+    if any(activity != "enzyme_dup" for activity in returns):
+        return False
+    position = 0
+    for activity in activities:
+        if activity not in ("enzyme_const", "enzyme_dup") or axes[position] is not None:
+            return False
+        position += 2 if activity == "enzyme_dup" else 1
+    return position == len(axes)
+
+
 def _enzyme_batch(primitive, args, axes, **params):
     mapped = tuple(i for i, axis in enumerate(axes) if axis is not None)
     values = tuple(jnp.moveaxis(args[i], axes[i], 0) for i in mapped)
+    size = values[0].shape[0]
+
+    def result(outputs):
+        if not _jvp_primals_unmapped(primitive, axes, params):
+            return outputs, (0,) * len(outputs)
+        # Jacobian evaluation maps tangent directions while keeping primal
+        # results unbatched. The combined AD ABI interleaves both result kinds.
+        if size:
+            primals = tuple(output[0] for output in outputs[::2])
+        else:
+            operands = tuple(
+                (
+                    value
+                    if axis is None
+                    else jnp.zeros(
+                        jnp.moveaxis(value, axis, 0).shape[1:], dtype=value.dtype
+                    )
+                )
+                for value, axis in zip(args, axes)
+            )
+            primals = primitive.bind(*operands, **params)[::2]
+        return (
+            tuple(value for pair in zip(primals, outputs[1::2]) for value in pair),
+            (None, 0) * len(primals),
+        )
 
     pipeline = params["pipeline_options"]
     if (
@@ -1224,7 +1276,6 @@ def _enzyme_batch(primitive, args, axes, **params):
         and pipeline.stablehlo_inject()
         and isinstance(params["source"][3], str)
     ):
-        size = values[0].shape[0]
         # A pending forward-AD call must retain its activity metadata until
         # partial evaluation splits primals from tangents. Batch its source
         # first. Already-split forward/reverse calls have an ordinary tensor ABI.
@@ -1258,7 +1309,7 @@ def _enzyme_batch(primitive, args, axes, **params):
                 outputs = primitive.bind(*operands, **batched_params)
             else:
                 outputs = hlo_call(*operands, source=source)
-            return outputs, (0,) * len(outputs)
+            return result(outputs)
 
     def call(items):
         operands = list(args)
@@ -1269,7 +1320,7 @@ def _enzyme_batch(primitive, args, axes, **params):
     # Keep arbitrary imported HLO and custom calls pointwise, including RNG
     # state and lane-dependent loops. lax.map stays on the selected device.
     outputs = lax.map(call, values)
-    return outputs, (0,) * len(outputs)
+    return result(outputs)
 
 
 batching.primitive_batchers[_enzyme_primal_p] = partial(_enzyme_batch, _enzyme_primal_p)
