@@ -109,9 +109,9 @@ def : HLODerivative<"ConjOp", (Op $z), [(Conj (DiffeRet))], (Conj (Shadow $z))>;
 
 def : HLODerivative<"CoshOp", (Op $x), [(Mul (DiffeRet), (Sinh $x))]>;
 
-def : HLODerivative<"DigammaOp", (Op $x), 
-                    [(Mul (DiffeRet), (Polygamma $x, (HLOConstantFP<"2"> $x)))],
-                    (Mul (Shadow $x), (Polygamma $x, (HLOConstantFP<"2"> $x)))
+def : HLODerivative<"DigammaOp", (Op $x),
+                    [(Mul (DiffeRet), (Polygamma (HLOConstantFP<"1"> $x), $x))],
+                    (Mul (Shadow $x), (Polygamma (HLOConstantFP<"1"> $x), $x))
 >;
 
 def : HLODerivative<"ErfOp", (Op $x), [
@@ -124,10 +124,10 @@ def : HLOInactiveOp<"IsNegInfOp">;
 
 def : HLOInactiveOp<"IsPosInfOp">;
 
-def : HLODerivative<"PolygammaOp", (Op $x, $n),
+def : HLODerivative<"PolygammaOp", (Op $n, $x),
                     [
-                      (Mul (DiffeRet), (Polygamma $x, (Add $n, (HLOConstantFP<"1"> $n)))),
-                      (AssertingInactiveArg)
+                      (AssertingInactiveArg),
+                      (Mul (DiffeRet), (Polygamma (Add $n, (HLOConstantFP<"1"> $n)), $x))
                     ]
                     >;
 
