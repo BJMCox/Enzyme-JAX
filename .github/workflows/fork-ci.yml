@@ -1,4 +1,4 @@
-name: Fork native wheels
+name: Fork formatting
 
 on:
   pull_request:
@@ -10,105 +10,14 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: fork-native-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
-  native:
+  black:
     if: github.repository == 'BJMCox/Enzyme-JAX'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            platform: linux_x86_64
-            jobs: 3
-            memory: 10000
-          - os: macos-26
-            platform: macosx_14_0_arm64
-            jobs: 2
-            memory: 4500
-    env:
-      HERMETIC_PYTHON_VERSION: "3.14"
-      JAX_PLATFORMS: cpu
-      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: psf/black@stable
         with:
-          python-version: "3.14"
-      - uses: bazel-contrib/setup-bazel@0.19.0
-        with:
-          bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-${{ matrix.os }}
-
-      - name: Select the Linux compiler
-        if: runner.os == 'Linux'
-        run: |
-          echo 'CC=clang-18' >> "$GITHUB_ENV"
-          echo 'CXX=clang++-18' >> "$GITHUB_ENV"
-
-      - name: Build wheels and test StableHLO derivatives
-        shell: bash
-        run: |
-          flags=(--config=public_cache --remote_upload_local_results=false
-                 --jobs=${{ matrix.jobs }} --local_resources=memory=${{ matrix.memory }})
-          if [[ "$RUNNER_OS" == macOS ]]; then
-            flags+=(--macos_minimum_os=14.0
-                    --host_cxxopt=-mmacosx-version-min=14.0
-                    --host_linkopt=-mmacosx-version-min=14.0)
-          fi
-          mkdir -p dist
-          bazel build "${flags[@]}" //:wheel //:enzymexlamlir-opt 2>&1 | tee dist/build.log
-          bazel query 'filter("^//test/lit_tests:diffrules_stablehlo_.*", //test/lit_tests:all)' \
-            --output=label > "$RUNNER_TEMP/native-tests.txt"
-          targets=()
-          while IFS= read -r target; do
-            targets+=("$target")
-          done < "$RUNNER_TEMP/native-tests.txt"
-          test "${#targets[@]}" -gt 0
-          bazel test "${flags[@]}" --test_output=errors "${targets[@]}" 2>&1 | tee dist/native-tests.log
-          cp bazel-bin/*.whl dist/
-          cp bazel-bin/enzymexlamlir-opt dist/
-          git rev-parse HEAD > dist/revision.txt
-
-      - name: Set honest host and CPython wheel tags
-        shell: bash
-        run: |
-          python -m pip install wheel
-          python -m wheel tags --python-tag=cp314 --abi-tag=cp314 \
-            --platform-tag=${{ matrix.platform }} --remove dist/*.whl
-
-      - name: Test the installed wheel with current JAX
-        shell: bash
-        run: |
-          python -m venv "$RUNNER_TEMP/consumer"
-          "$RUNNER_TEMP/consumer/bin/python" -m pip install dist/*.whl \
-            "jax==0.11.2" "jaxlib==0.11.2" "pytest==9.1.1"
-          mkdir -p "$RUNNER_TEMP/consumer-tests"
-          cp test/*.py "$RUNNER_TEMP/consumer-tests/"
-          tests=(test.py)
-          if [[ -f test/hlo_linearize.py ]]; then
-            tests+=(hlo_linearize.py)
-          fi
-          selection=()
-          # The C++ kernel fixture requires a separate system-header setup on macOS.
-          if [[ "$RUNNER_OS" == macOS ]]; then
-            selection=(-k 'not test_custom_cpp_kernel')
-          fi
-          cd "$RUNNER_TEMP/consumer-tests"
-          "$RUNNER_TEMP/consumer/bin/python" -m pytest "${tests[@]}" "${selection[@]}" -q \
-            --junitxml="$GITHUB_WORKSPACE/dist/python-tests.xml"
-          "$RUNNER_TEMP/consumer/bin/python" -m pip freeze > "$GITHUB_WORKSPACE/dist/runtime.txt"
-
-      - uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() }}
-        with:
-          name: enzyme-${{ matrix.os }}-py3.14
-          path: dist/
-          if-no-files-found: error
+          options: "--check --verbose"
