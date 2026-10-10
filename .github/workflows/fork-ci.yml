@@ -23,7 +23,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             platform: linux_x86_64
             jobs: 3
             memory: 10000
@@ -50,8 +50,8 @@ jobs:
       - name: Select the Linux compiler
         if: runner.os == 'Linux'
         run: |
-          echo 'CC=clang-15' >> "$GITHUB_ENV"
-          echo 'CXX=clang++-15' >> "$GITHUB_ENV"
+          echo 'CC=clang-18' >> "$GITHUB_ENV"
+          echo 'CXX=clang++-18' >> "$GITHUB_ENV"
 
       - name: Build wheels and test StableHLO derivatives
         shell: bash
