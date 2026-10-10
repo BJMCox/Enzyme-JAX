@@ -169,6 +169,7 @@ py_library(
 
 py_wheel(
     name = "wheel",
+    abi = "cp" + HERMETIC_PYTHON_VERSION.replace(".", ""),
     author = "Enzyme Authors",
     author_email = "wmoses@mit.edu, zinenko@google.com",
     distribution = "enzyme_ad",
@@ -176,25 +177,25 @@ py_wheel(
     license = "LLVM",
     platform = select({
         "@bazel_tools//src/conditions:windows_x64": "win_amd64",
-        "@bazel_tools//src/conditions:darwin_arm64": "macosx_11_0_arm64",
+        "@bazel_tools//src/conditions:darwin_arm64": "macosx_14_0_arm64",
         "@bazel_tools//src/conditions:darwin_x86_64": "macosx_10_14_x86_64",
-        "@bazel_tools//src/conditions:linux_aarch64": "manylinux2014_aarch64",
-        "@bazel_tools//src/conditions:linux_x86_64": "manylinux2014_x86_64",
+        "@bazel_tools//src/conditions:linux_aarch64": "linux_aarch64",
+        "@bazel_tools//src/conditions:linux_x86_64": "linux_x86_64",
         "@bazel_tools//src/conditions:linux_ppc64le": "manylinux2014_ppc64le",
     }),
     project_urls = {
-        "GitHub": "https://github.com/EnzymeAD/Enzyme-JAX/",
+        "GitHub": "https://github.com/BJMCox/Enzyme-JAX/",
     },
     python_requires = "==" + HERMETIC_PYTHON_VERSION + ".*",
-    python_tag = "py" + HERMETIC_PYTHON_VERSION.replace(".", ""),
+    python_tag = "cp" + HERMETIC_PYTHON_VERSION.replace(".", ""),
     requires = [
         "absl_py >= 2.0.0",
-        "jax >= 0.8.0",
-        "jaxlib >= 0.8.0",
+        "jax == 0.11.2",
+        "jaxlib == 0.11.2",
     ],
     strip_path_prefixes = ["src/"],
     summary = "Enzyme automatic differentiation tool.",
-    version = "0.0.10",
+    version = "0.0.15+flatppl.5",
     deps = [
         ":enzyme_jax_data",
         "//src/enzyme_ad/jax:enzyme_jax_internal",
