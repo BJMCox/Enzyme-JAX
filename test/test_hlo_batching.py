@@ -83,9 +83,7 @@ class HloBatching(absltest.TestCase):
         )
         for axis, tag in ((None, tags[0]), (0, tags)):
             axes = (0, axis)
-            compiled = (
-                jax.jit(jax.vmap(imported, in_axes=axes)).lower(x, tag).compile()
-            )
+            compiled = jax.jit(jax.vmap(imported, in_axes=axes)).lower(x, tag).compile()
             actual = compiled(x, tag)
             expected = jax.vmap(function, in_axes=axes)(x, tag)
             for value, reference in zip(actual, expected):
