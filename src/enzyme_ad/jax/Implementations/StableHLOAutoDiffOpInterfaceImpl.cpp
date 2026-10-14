@@ -3777,6 +3777,7 @@ public:
     // nothing folds, CSEs or constant-propagates through it while the min cut
     // and its cloning run.
     enzyme::PlaceholderOp reverseIVPlaceholder = nullptr;
+    IRMapping recomputedValues;
 
     // Run min cut partitioning to limit the amount of values to be cached.
     if (hasMinCut(whileOp) && caches.size()) {
@@ -3792,7 +3793,50 @@ public:
         fwdrevmap.map(inductionVariable, reverseIVPlaceholder.getResult());
       }
       mlir::enzyme::minCutCache(forward, reverse, caches, rewriter, fwdrevmap,
-                                lastFwd);
+                                lastFwd, &recomputedValues);
+    }
+
+    // A selected state tape already stores s[0], ..., s[N-1]. Reuse row t+1
+    // in reverse, with the final result s[N] for the last forward step.
+    // Keep that result invariant in reverse to avoid a writable state carry.
+    struct CachedState {
+      unsigned index;
+      Value recomputed;
+      enzyme::InitOp finalState;
+    };
+    DenseMap<Value, CachedState> cachedStates;
+    llvm::SmallDenseSet<Value> reusedValues;
+    if (info.isConstant() && numIters > 0) {
+      for (auto &cache : caches) {
+        auto argument = dyn_cast<BlockArgument>(cache.pushedValue());
+        if (!argument || argument.getOwner() != body ||
+            argument.getArgNumber() >= whileOp->getNumOperands() ||
+            argument == inductionVariable ||
+            cache.popOp->getParentOp() != otherWhileOp)
+          continue;
+        auto type = dyn_cast<RankedTensorType>(argument.getType());
+        if (!type || !type.hasStaticShape() ||
+            !isa<FloatType>(type.getElementType()))
+          continue;
+        Value yielded = term->getOperand(argument.getArgNumber());
+        Value recomputed = recomputedValues.lookupOrNull(yielded);
+        Operation *definition =
+            recomputed ? recomputed.getDefiningOp() : nullptr;
+        if (!definition || definition->getParentOp() != otherWhileOp ||
+            definition->getNumRegions() || !isPure(definition) ||
+            isa<enzyme::PopOp>(definition) || recomputed.use_empty() ||
+            recomputed.getType() != type ||
+            !reusedValues.insert(recomputed).second)
+          continue;
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPoint(cache.initOp);
+        auto finalState = enzyme::InitOp::create(
+            rewriter, yielded.getLoc(),
+            enzyme::CacheType::get(op->getContext(), type));
+        cachedStates.try_emplace(
+            cache.initOp.getResult(),
+            CachedState{argument.getArgNumber(), recomputed, finalState});
+      }
     }
 
     Value itersV = nullptr;
@@ -3959,6 +4003,7 @@ public:
     // placeholder behind. `minCutCache` clears `caches` when every push was
     // hoisted out of the loop, so the second condition is not implied by the
     // first.
+    BlockArgument reverseInductionVariable;
     if (inductionVariable &&
         (caches.size() != 0 ||
          (reverseIVPlaceholder && !reverseIVPlaceholder->use_empty()))) {
@@ -3986,8 +4031,9 @@ public:
 
       Block *otherBody = &otherWhileOp.getBody().front();
       Block *otherCond = &otherWhileOp.getCond().front();
-      Value otherInductionVariable = otherBody->addArgument(
+      reverseInductionVariable = otherBody->addArgument(
           operands.back().getType(), otherWhileOp->getLoc());
+      Value otherInductionVariable = reverseInductionVariable;
       otherCond->addArgument(otherInductionVariable.getType(),
                              otherWhileOp->getLoc());
       auto otherTerm = otherBody->getTerminator();
@@ -4049,14 +4095,8 @@ public:
 
       Value cache = info.initOp.getResult();
 
-      auto newType =
-          cast<ShapedType>(cast<AutoDiffTypeInterface>(info.cachedType())
-                               .getShadowType(numIters));
-      // Must match step 3: use 1D cache type for scalar so dynamic_update_slice
-      // is valid.
-      if (newType.getRank() == 0) {
-        newType = RankedTensorType::get({numIters}, newType.getElementType());
-      }
+      auto newType = cast<ShapedType>(newWhile->getResult(resultIdx).getType());
+      auto state = cachedStates.find(cache);
       enzyme::InitOp newInit = ({
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPoint(info.initOp);
@@ -4068,6 +4108,10 @@ public:
       info.pushOp = ({
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPointAfter(newWhile);
+        if (state != cachedStates.end())
+          enzyme::PushOp::create(rewriter, cache.getLoc(),
+                                 state->second.finalState.getResult(),
+                                 newWhile->getResult(state->second.index));
         auto newPush = enzyme::PushOp::create(rewriter, cache.getLoc(),
                                               newInit.getResult(),
                                               newWhile->getResult(resultIdx));
@@ -4085,11 +4129,15 @@ public:
         auto popNewValue = enzyme::PopOp::create(rewriter, info.popOp->getLoc(),
                                                  newType, newInit.getResult());
 
-        Block *popBody = &otherWhileOp.getBody().front();
+        Value finalState;
+        if (state != cachedStates.end())
+          finalState = enzyme::PopOp::create(
+              rewriter, info.popOp->getLoc(), info.cachedType(),
+              state->second.finalState.getResult());
+
         rewriter.setInsertionPoint(info.popOp);
 
-        Value newInductionVariable =
-            popBody->getArgument(popBody->getNumArguments() - 1);
+        Value newInductionVariable = reverseInductionVariable;
 
         Value popValue;
         if (auto TT = dyn_cast<TensorType>(info.cachedType())) {
@@ -4111,6 +4159,33 @@ public:
         } else {
           assert(false && "todo");
           // popValue = tensor.extract(%popNewValue)
+        }
+
+        if (state != cachedStates.end()) {
+          Value recomputed = state->second.recomputed;
+          rewriter.setInsertionPoint(recomputed.getDefiningOp());
+          auto type = cast<RankedTensorType>(recomputed.getType());
+          auto loc = recomputed.getLoc();
+          auto zero = makeZero(rewriter, loc, newInductionVariable.getType());
+          auto one = makeI64Constant(loc, rewriter, 1);
+          SmallVector<Value> indices(type.getRank() + 1, zero);
+          indices[0] = stablehlo::AddOp::create(rewriter, loc,
+                                                newInductionVariable, one);
+          SmallVector<int64_t> sizes{1};
+          llvm::append_range(sizes, type.getShape());
+          Value nextState = stablehlo::DynamicSliceOp::create(
+              rewriter, loc, type.clone(sizes), popNewValue, indices, sizes);
+          nextState =
+              stablehlo::ReshapeOp::create(rewriter, loc, type, nextState);
+          // The t+1 slice clamps at N-1 on the first reverse iteration;
+          // select s[N] there. The slice is unused and in bounds even for N=1.
+          auto last = makeI64Constant(loc, rewriter, numIters - 1);
+          Value isLast = stablehlo::CompareOp::create(
+              rewriter, loc, newInductionVariable, last,
+              stablehlo::ComparisonDirection::EQ);
+          nextState = stablehlo::SelectOp::create(rewriter, loc, isLast,
+                                                  finalState, nextState);
+          rewriter.replaceAllUsesWith(recomputed, nextState);
         }
 
         rewriter.replaceAllUsesWith(info.popOp, popValue);

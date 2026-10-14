@@ -1,0 +1,28 @@
+diff --git a/Enzyme/MLIR/Passes/RemovalUtils.h b/Enzyme/MLIR/Passes/RemovalUtils.h
+--- a/Enzyme/MLIR/Passes/RemovalUtils.h
++++ b/Enzyme/MLIR/Passes/RemovalUtils.h
+@@ -70,5 +70,6 @@
+ void minCutCache(Block *forward, Block *reverse, SmallVector<CacheInfo> &caches,
+                  PatternRewriter &rewriter, const IRMapping &fwdrevmap,
+-                 Operation *lastFwd = nullptr);
++                 Operation *lastFwd = nullptr,
++                 IRMapping *recomputedValues = nullptr);
+ 
+ // Perform a modified version of the loop invariant cache algorithm described in
+diff --git a/Enzyme/MLIR/Passes/RemovalUtils.cpp b/Enzyme/MLIR/Passes/RemovalUtils.cpp
+--- a/Enzyme/MLIR/Passes/RemovalUtils.cpp
++++ b/Enzyme/MLIR/Passes/RemovalUtils.cpp
+@@ -760,6 +760,7 @@
+ void mlir::enzyme::minCutCache(Block *forward, Block *reverse,
+                                SmallVector<CacheInfo> &caches0,
+                                PatternRewriter &rewriter,
+-                               const IRMapping &fwdrevmap, Operation *lastFwd) {
++                               const IRMapping &fwdrevmap, Operation *lastFwd,
++                               IRMapping *recomputedValues) {
+   assert(rewriter.getInsertionBlock() == reverse);
+   assert(rewriter.getInsertionPoint()->getBlock() == reverse);
+@@ -1245,2 +1246,4 @@
+   caches0 = std::move(newCacheInfos);
++  if (recomputedValues)
++    *recomputedValues = std::move(mapping);
+ }

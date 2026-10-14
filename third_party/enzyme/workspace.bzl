@@ -15,4 +15,6 @@ def repo():
             sha256 = ENZYME_SHA256,
             strip_prefix = "Enzyme-" + ENZYME_COMMIT + "/enzyme",
             urls = ["https://github.com/EnzymeAD/Enzyme/archive/{commit}.tar.gz".format(commit = ENZYME_COMMIT)],
+            patches = ["//:patches/enzyme_mincut_mapping.patch"],
+            patch_args = ["-p1"],
         )
