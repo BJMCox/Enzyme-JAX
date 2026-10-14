@@ -13743,9 +13743,13 @@ struct ReshapeElementwise final
 
   LogicalResult matchAndRewriteImpl(stablehlo::ReshapeOp op,
                                     PatternRewriter &rewriter) const {
+    // Cloning shared recurrence work creates separate AD accumulators for each
+    // shape. Keep that work shared while still moving single-use expressions.
+    bool preserveShared =
+        onlySingleUser || op->getParentOfType<stablehlo::WhileOp>();
     auto elem = op.getOperand().getDefiningOp();
     if (!elem || !stablehlo::hasTraitElementwise(elem) ||
-        (onlySingleUser && !llvm::hasSingleElement(elem->getUsers()))) {
+        (preserveShared && !llvm::hasSingleElement(elem->getUsers()))) {
       return failure();
     }
 
@@ -13770,7 +13774,7 @@ struct ReshapeElementwise final
         }
 
         // Check single user constraint for intermediate ops
-        if (onlySingleUser && defOp != elem &&
+        if (preserveShared && defOp != elem &&
             !llvm::hasSingleElement(defOp->getUsers())) {
           // Treat as a leaf if it has multiple users
           leafOperands.push_back(operand);
