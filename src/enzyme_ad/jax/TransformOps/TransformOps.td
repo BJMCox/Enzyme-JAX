@@ -511,9 +511,21 @@ def ApplySliceBroadcastPatterns : EnzymeHLOPatternOp<
     "slice_broadcast"> {
   let patterns = ["SliceBroadcast"];
 }
+def SliceIota : EnzymeHLOPatternOp<
+    "slice_iota"> {
+  let patterns = ["SliceIota"];
+}
 def ApplySliceGatherPatterns : EnzymeHLOPatternOp<
     "slice_gather"> {
   let patterns = ["SliceGather"];
+}
+def ApplyTransposeGatherPatterns : EnzymeHLOPatternOp<
+    "transpose_gather"> {
+  let patterns = ["TransposeGather"];
+}
+def ApplyTransposeScatterPatterns : EnzymeHLOPatternOp<
+    "transpose_scatter"> {
+  let patterns = ["TransposeScatter"];
 }
 def ApplyReducePadPatterns : EnzymeHLOPatternOp<
     "reduce_pad"> {
@@ -1290,6 +1302,11 @@ def IfRemoveUnused : EnzymeHLOPatternOp<
   let patterns = ["IfRemoveUnused"];
 }
 
+def CaseRemoveUnused : EnzymeHLOPatternOp<
+    "case_remove_unused"> {
+  let patterns = ["CaseRemoveUnused"];
+}
+
 def IfInline : EnzymeHLOPatternOp<
     "if_inline"> {
   let patterns = ["IfInline"];
@@ -1877,6 +1894,11 @@ def ApplyGatherOfMaskedScatterPatterns : EnzymeHLOPatternOp<
   let patterns = ["GatherOfMaskedScatter"];
 }
 
+def ApplyGatherOfBroadcastBatchingDimsPatterns : EnzymeHLOPatternOp<
+    "gather_of_broadcast_batching_dims"> {
+  let patterns = ["GatherOfBroadcastBatchingDims"];
+}
+
 def ApplyReduceTransposeSimplifyPatterns : EnzymeHLOPatternOp<
     "reduce_transpose_simplify"> {
   let patterns = ["ReduceTransposeSimplify"];
@@ -2196,6 +2218,11 @@ def ConcatConcatToDUS : EnzymeHLOPatternOp<
 def WhileInductionReduction : EnzymeHLOPatternOp<
     "while_induction_reduction"> {
   let patterns = ["WhileInductionReduction"];
+}
+
+def WhileSliceElementwiseCarry : EnzymeHLOPatternOp<
+    "while_slice_elementwise_carry"> {
+  let patterns = ["WhileSliceElementwiseCarry"];
 }
 
 def SinkDUS : EnzymeHLOPatternOp<

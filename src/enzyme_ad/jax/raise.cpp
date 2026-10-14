@@ -145,7 +145,9 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
   // iteration is then a constant or a symbol in each copy. Loops of zero or
   // one iteration go whatever the maximum.
   pass_pipeline += "unroll-small-loops{max_trip_count=" +
-                   std::to_string(options->unrollMaxTripCount) + "}," +
+                   std::to_string(options->unrollMaxTripCount) +
+                   " max_nested_ops=" +
+                   std::to_string(options->unrollMaxNestedOps) + "}," +
                    canonicalize + ",";
   pass_pipeline += "affine-cfg," + canonicalize + ","
       "split-branched-accesses," + canonicalize + ",polygeist-mem2reg,"
@@ -216,10 +218,17 @@ extern "C" std::string runLLVMToMLIRRoundTrip(std::string input,
       pass_pipeline += ",affine-cfg," + canonicalize +
                        ",llvm-to-affine-access," + canonicalize +
                        ",affine-cfg," + canonicalize + ",";
+      // What a kernel reads only of the host's copy of its by-value
+      // arguments, the host reads before the launch (parallel-licm hoists it
+      // out of the lanes, then out of the launch): the raiser can capture a
+      // buffer whose pointer the host read, not one read inside the kernel.
+      pass_pipeline += "parallel-licm," + canonicalize + ",";
       pass_pipeline += "func.func(kernelcast),raise-affine-to-stablehlo{prefer_while_raising=false "
       "dump_failed_lockstep=true";
       if (options->specializeIndexStrides)
         pass_pipeline += " specialize_index_strides=true";
+      if (options->specializeIntScalars)
+        pass_pipeline += " specialize_int_scalars=true";
       pass_pipeline += "}," + canonicalize + ",arith-raise{stablehlo=true},"
       "cse,enzyme-hlo-opt," + canonicalize + ","
       "symbol-dce";

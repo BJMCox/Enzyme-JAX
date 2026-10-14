@@ -2296,11 +2296,13 @@ public:
             builder, op.getLoc(), inTy, cachedResult,
             builder.getDenseI64ArrayAttr(toBroadcast));
 
-        // valueDiffe = inDiffe * cachedResult / cachedValue
-        Value outDiffe = stablehlo::MulOp::create(
-            builder, op.getLoc(), binDiffe,
-            stablehlo::DivOp::create(builder, op.getLoc(), resultBroadcasted,
-                                     cachedValue));
+        // valueDiffe = inDiffe * conj(cachedResult / cachedValue)
+        Value div = stablehlo::DivOp::create(builder, op.getLoc(),
+                                             resultBroadcasted, cachedValue);
+        div = cast<AutoDiffTypeInterface>(div.getType())
+                  .createConjOp(builder, op.getLoc(), div);
+        Value outDiffe =
+            stablehlo::MulOp::create(builder, op.getLoc(), binDiffe, div);
 
         gutils->addToDiffe(value, outDiffe, builder);
       }
@@ -2310,6 +2312,8 @@ public:
             builder.getDenseI64ArrayAttr({}));
         Value divResInit = stablehlo::DivOp::create(
             builder, op.getLoc(), cachedResult, broadcastedInit);
+        divResInit = cast<AutoDiffTypeInterface>(divResInit.getType())
+                         .createConjOp(builder, op.getLoc(), divResInit);
         Value broadcastedInitDiffe =
             stablehlo::MulOp::create(builder, op.getLoc(), divResInit, inDiffe);
 
