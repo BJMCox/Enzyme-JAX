@@ -681,6 +681,35 @@ def LowerEnzymeXLAMPIPass : Pass<"lower-enzymexla-mpi"> {
   ];
 }
 
+def FuseJITPass : Pass<"fuse-jit", "mlir::ModuleOp"> {
+  let summary = "Fuse JIT calls";
+  let dependentDialects = [
+    "enzymexla::EnzymeXLADialect",
+    "LLVM::LLVMDialect",
+    "stablehlo::StablehloDialect",
+  ];
+  let options = [
+    Option<
+        /*C++ variable name=*/"top_down",
+        /*CLI argument=*/"top_down",
+        /*type=*/"bool",
+        /*default=*/"false",
+        /*description=*/"Use top down traversal">,
+    Option<
+        /*C++ variable name=*/"dag",
+        /*CLI argument=*/"dag",
+        /*type=*/"bool",
+        /*default=*/"true",
+        /*description=*/"Fuse JIT calls connected by data dependency">,
+    // Option<
+    //     /*C++ variable name=*/"adjacent",
+    //     /*CLI argument=*/"adjacent",
+    //     /*type=*/"bool",
+    //     /*default=*/"true",
+    //     /*description=*/"Fuse adjacent JIT calls">,
+    ];
+}
+
 def LowerEnzymeXLALapackPass : Pass<"lower-enzymexla-lapack"> {
   let summary = "Lower enzymexla.lapack ops to stablehlo";
   let dependentDialects = [
@@ -1380,6 +1409,14 @@ def AffineToStableHLORaising : Pass<"raise-affine-to-stablehlo"> {
            /*description=*/
            "Specialize the kernel over a scalar argument an access index reads, "
            "such as a stride, so the index folds to a constant">,
+       Option<
+           /*C++ variable name=*/"specialize_int_scalars",
+           /*CLI argument=*/"specialize_int_scalars",
+           /*type=*/"bool",
+           /*default=*/"false",
+           /*description=*/
+           "Specialize the kernel over every scalar integer argument it only "
+           "reads (lengths, flags), so none reaches the device as a buffer">,
   ];
 }
 
@@ -1390,7 +1427,11 @@ def XLAMegakernelizePass : Pass<"xla-megakernelize", "ModuleOp"> {
     Operations between the calls must have no memory effects. Use one tensor
     state for each shared buffer. Pass the updated state from the first
     computation to the second computation. Keep separate state for other
-    buffers. Do not fuse a call that still has duplicate buffer inputs.
+    buffers. Allow duplicate buffer inputs when each view returns its input
+    unchanged. For contiguous views of equal total size, use bitcasts and
+    reshapes to read the shared state with a different shape or element type.
+    Get dynamic buffer sizes from the runtime. Do not combine writes through
+    duplicate inputs or views with different total sizes.
     Also apply the registered XLA wrapper canonicalization patterns.
 
     All inputs to the combined call must be available before the first call.
@@ -1467,9 +1508,11 @@ def UnrollSmallLoops : Pass<"unroll-small-loops"> {
   let summary = "Fully unroll scf.for and affine.for loops of few iterations";
   let description = [{
     Fully unrolls every scf.for and affine.for whose trip count is a compile
-    time constant of at most max_trip_count. A loop of no iteration (replaced
-    by its initial values) or of a single one (by its body) is always
-    removed, whatever max_trip_count. No loop is partially unrolled.
+    time constant of at most max_trip_count, while the operations it leaves
+    (its trip count times the operations nested in its body, inner loops
+    already unrolled) number at most max_nested_ops. A loop of no iteration
+    (replaced by its initial values) or of a single one (by its body) is
+    always removed, whatever the limits. No loop is partially unrolled.
   }];
   let dependentDialects = [
     "scf::SCFDialect",
@@ -1484,6 +1527,15 @@ def UnrollSmallLoops : Pass<"unroll-small-loops"> {
       /*default=*/"0",
       /*description=*/"Unroll a loop of at most this many iterations; loops "
                       "of zero or one iteration are always removed">,
+    Option<
+      /*C++ variable name=*/"max_nested_ops",
+      /*CLI argument=*/"max_nested_ops",
+      /*type=*/"int64_t",
+      /*default=*/"-1",
+      /*description=*/"Unroll a loop of two or more iterations only while its "
+                      "iterations times the operations nested in its body, "
+                      "inner loops already unrolled, is at most this "
+                      "(negative: no limit)">,
   ];
 }
 
