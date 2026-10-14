@@ -36,6 +36,10 @@ For pure, static tensor programs, Enzyme generates a joint value/VJP and the JAX
 bridge saves tensor residuals for the pullback. This avoids repeating the forward
 scan when evaluating `jax.jit(jax.value_and_grad(f))`.
 
+For fixed-length scans, a saved incoming-state tape can also supply the next
+state. Reverse mode reads the next row, or the final forward state for the last
+step, avoiding reconstruction of the recurrence.
+
 This optimization requires MLIR memory-effect queries in JAX's Python bindings
 (tested with JAX/jaxlib 0.11.2). Older bindings, effectful programs, retained module
 symbols and unsupported joint derivatives keep the existing differentiation path.

@@ -134,6 +134,36 @@ class HLOLinearize(absltest.TestCase):
             np.testing.assert_allclose(actual(x, data), expected(x, data), rtol=3e-6)
             np.testing.assert_allclose(eager(x, data), expected(x, data), rtol=3e-6)
 
+    def test_nested_scan_state_remains_differentiable(self):
+        def function(p):
+            def outer(state, offset):
+                def step(state, x):
+                    value = 0.2 + p[0] * state + p[1] * x * x
+                    return value, jnp.log(value) + x * x / value
+
+                state, scores = jax.lax.scan(
+                    step, state, jnp.linspace(-0.3, 0.7, 7, dtype=p.dtype) + offset
+                )
+                return state, scores.sum()
+
+            state, scores = jax.lax.scan(
+                outer, jnp.float32(1), jnp.array([0.0, 0.1, -0.1], dtype=p.dtype)
+            )
+            return -0.5 * scores.sum() + 0.1 * state
+
+        point = jnp.array([0.4, 0.3], dtype=jnp.float32)
+        tangent = jnp.array([0.17, -0.11], dtype=jnp.float32)
+        imported = import_hlo(function, point)
+
+        def derivatives(call, p):
+            _, hessian_vector = jax.jvp(jax.grad(call), (p,), (tangent,))
+            return jax.value_and_grad(call)(p), hessian_vector
+
+        actual = jax.jit(lambda p: derivatives(lambda x: imported(x)[0], p))(point)
+        expected = jax.jit(lambda p: derivatives(function, p))(point)
+        for value, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+            np.testing.assert_allclose(value, reference, rtol=3e-5, atol=3e-5)
+
     def test_inactive_nonfinite_output(self):
         point = jnp.float32(-2)
         imported = import_hlo(lambda x: (x * x, jnp.sqrt(x)), point)
