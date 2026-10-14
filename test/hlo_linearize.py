@@ -85,6 +85,40 @@ class HLOLinearize(absltest.TestCase):
             jax.jit(reuse)(point), (value, gradient, value * gradient), rtol=3e-6
         )
 
+    @absltest.skipUnless(HAS_EFFECT_QUERIES, "requires MLIR memory effect queries")
+    def test_scaled_scan_keeps_reverse_state_small(self):
+        observations = jnp.linspace(-0.3, 0.7, 32)
+
+        def function(a, b):
+            def step(state, observation):
+                value = jnp.tanh(a * state + b * observation)
+                return value, value
+
+            _, values = jax.lax.scan(step, jnp.float32(0.2), observations)
+            return -jnp.sum((values - observations) ** 2)
+
+        imported = import_hlo(function, jnp.float32(0.4), jnp.float32(0.3))
+        a, b = jnp.full((4,), 0.4), jnp.full((4,), 0.3)
+        actual = jax.value_and_grad(
+            lambda a, b: jax.vmap(lambda x, y: imported(x, y)[0])(a, b).sum(),
+            argnums=(0, 1),
+        )
+        expected = jax.value_and_grad(
+            lambda a, b: jax.vmap(function)(a, b).sum(), argnums=(0, 1)
+        )(a, b)
+        lowered = jax.jit(actual).lower(a, b)
+        for value, reference in zip(
+            jax.tree.leaves(lowered.compile()(a, b)), jax.tree.leaves(expected)
+        ):
+            np.testing.assert_allclose(value, reference, rtol=3e-6, atol=3e-6)
+
+        loops = re.findall(r"stablehlo\.while[^\n]*", str(lowered.compiler_ir()))
+        self.assertLen(loops, 2)
+        # Reverse accumulation needs one value per lane, not one per time step.
+        for shape in re.findall(r"tensor<([^>]*)>", loops[-1]):
+            elements = np.prod([int(dim) for dim in shape.split("x")[:-1]])
+            self.assertLessEqual(elements, a.size)
+
     def test_constant_input_and_region_capture(self):
         def function(x, data):
             return jax.lax.cond(
