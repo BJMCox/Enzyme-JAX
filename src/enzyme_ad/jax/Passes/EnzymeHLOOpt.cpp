@@ -34485,60 +34485,34 @@ struct DUSToDynamicPad
     auto update = op.getUpdate();
     auto indices = op.getStartIndices();
 
+    auto updateShape = cast<RankedTensorType>(update.getType()).getShape();
+    auto operandShape = cast<RankedTensorType>(operand.getType()).getShape();
+    SmallVector<int64_t> low, high, interior(indices.size(), 0);
+
     for (auto [i, index] : llvm::enumerate(indices)) {
-      if (!matchPattern(index, m_Constant())) {
+      APInt start;
+      if (!matchPattern(index, m_ConstantInt(&start))) {
         return rewriter.notifyMatchFailure(
             op, "not all indices are constant. currently we don't support this "
                 "case");
       }
+      auto indexType = cast<IntegerType>(
+          cast<RankedTensorType>(index.getType()).getElementType());
+      int64_t maxStart = operandShape[i] - updateShape[i];
+      int64_t clamped = !indexType.isUnsigned() && start.isNegative()
+                            ? 0
+                            : start.getLimitedValue(maxStart);
+      low.push_back(clamped);
+      high.push_back(maxStart - clamped);
     }
 
     Value scalarOperand = getScalarPadValue(rewriter, operand);
     if (!scalarOperand)
       return rewriter.notifyMatchFailure(op, "operand is not a scalar pad");
 
-    auto updateShape = cast<RankedTensorType>(update.getType()).getShape();
-    auto operandShape = cast<RankedTensorType>(operand.getType()).getShape();
-
-    SmallVector<Value> edgePaddingLowValues, edgePaddingHighValues;
-    for (auto [i, index] : llvm::enumerate(indices)) {
-      auto cType = RankedTensorType::get(
-          {}, cast<RankedTensorType>(index.getType()).getElementType());
-      auto lowerBound = stablehlo::ConstantOp::create(
-          rewriter, op.getLoc(), cType, cast<ElementsAttr>(makeAttr(cType, 0)));
-      auto upperBound = stablehlo::ConstantOp::create(
-          rewriter, op.getLoc(), cType,
-          cast<ElementsAttr>(
-              makeAttr(cType, operandShape[i] - updateShape[i])));
-      auto clampedIndex = stablehlo::ClampOp::create(
-          rewriter, op.getLoc(), lowerBound, index, upperBound);
-
-      auto reshapedIndex = stablehlo::ReshapeOpCreate(
-          rewriter, op.getLoc(), clampedIndex, ArrayRef<int64_t>{1});
-      edgePaddingLowValues.push_back(reshapedIndex);
-
-      auto iType = RankedTensorType::get(
-          {1}, cast<RankedTensorType>(index.getType()).getElementType());
-      auto tmp = stablehlo::ConstantOp::create(
-          rewriter, op.getLoc(), iType,
-          cast<ElementsAttr>(
-              makeAttr(iType, operandShape[i] - updateShape[i])));
-      auto paddingHigh = stablehlo::SubtractOp::create(rewriter, op.getLoc(),
-                                                       tmp, reshapedIndex);
-      edgePaddingHighValues.push_back(paddingHigh);
-    }
-
-    auto edgePaddingLow = stablehlo::ConcatenateOp::create(
-        rewriter, op.getLoc(), edgePaddingLowValues, 0);
-    auto edgePaddingHigh = stablehlo::ConcatenateOp::create(
-        rewriter, op.getLoc(), edgePaddingHighValues, 0);
-    auto interiorPadding = stablehlo::ConstantOp::create(
-        rewriter, op.getLoc(), edgePaddingLow.getType(),
-        cast<ElementsAttr>(makeAttr(edgePaddingLow.getType(), 0)));
-
-    rewriter.replaceOpWithNewOp<stablehlo::DynamicPadOp>(
-        op, op.getType(), update, scalarOperand, edgePaddingLow,
-        edgePaddingHigh, interiorPadding);
+    // Keep constant padding static even when the folding budget is exhausted.
+    rewriter.replaceOpWithNewOp<stablehlo::PadOp>(
+        op, op.getType(), update, scalarOperand, low, high, interior);
     return success();
   }
 
