@@ -1379,7 +1379,9 @@ def enzyme_jvp(arg_primals, arg_tangents, **kwargs):
         )
         newpasses = (
             "inline{default-pipeline=canonicalize max-iterations=4},"
-            + optimization_passes()
+            # Fission before AD can expand scalar accumulators across every
+            # iteration. Keep it in the post-AD and primal-only pipelines.
+            + optimization_passes(excluded_passes=["greedy_while_loop_batch_fission"])
             + ", cse,enzyme-wrap{infn=main outfn= retTys="
             + ret_act_tup
             + " argTys="
