@@ -18662,17 +18662,23 @@ struct DUSToI32 final
 
     SmallVector<int64_t> newStartIndicesConst;
     for (auto idx : startIndices) {
-      if (cast<RankedTensorType>(idx.getType()).getElementType() == i32)
+      auto indexType = cast<IntegerType>(
+          cast<RankedTensorType>(idx.getType()).getElementType());
+      if (indexType == i32)
         return failure();
 
       llvm::APInt val;
       if (!matchPattern(idx, m_ConstantInt(&val)))
         return failure();
 
-      if (val.getSignificantBits() > 32)
+      // Preserve the integer value so DUS clamps to the same bound.
+      bool isUnsigned = indexType.isUnsigned();
+      if (isUnsigned ? !val.isIntN(31) : !val.isSignedIntN(32))
         return failure();
 
-      newStartIndicesConst.push_back(val.getZExtValue());
+      newStartIndicesConst.push_back(
+          isUnsigned ? static_cast<int64_t>(val.getZExtValue())
+                     : val.getSExtValue());
     }
 
     SmallVector<Value> newStartIndices;
