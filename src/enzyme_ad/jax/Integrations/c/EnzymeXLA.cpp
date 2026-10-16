@@ -469,6 +469,7 @@ static void addBaseTransformPasses(std::vector<std::string> &list,
   list.push_back("shift_right_logical_simplify<16>");
   list.push_back("slice_simplify<16>");
   list.push_back("convert_simplify<16>");
+  list.push_back("clamp_constant_start_indices<17>");
   list.push_back("dynamic_slice_to_static<16>");
   list.push_back("dynamic_update_slice_elim<16>");
   list.push_back("concat_to_broadcast<16>");

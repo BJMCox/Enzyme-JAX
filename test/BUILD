@@ -180,6 +180,12 @@ py_test(
 )
 
 py_test(
+    name = "hlo_clamping",
+    srcs = ["hlo_clamping.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "hlo_linearize",
     srcs = ["hlo_linearize.py"],
     deps = TEST_DEPS,
