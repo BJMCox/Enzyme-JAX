@@ -4867,6 +4867,15 @@ struct ConvertConvertFloat final
     if (isa<FloatType>(prev.getType().getElementType()) &&
         isa<FloatType>(op.getType().getElementType()) &&
         isa<FloatType>(conv0.getType().getElementType())) {
+      // Only bypass a value-preserving first conversion. NaN representations
+      // may change, matching XLA's convert simplification semantics.
+      if (!APFloat::isLosslesslyConvertibleTo(
+              cast<FloatType>(prev.getType().getElementType())
+                  .getFloatSemantics(),
+              cast<FloatType>(conv0.getType().getElementType())
+                  .getFloatSemantics(),
+              /*IgnoreNaNs=*/true))
+        return failure();
       if (prev.getType() == op.getType()) {
         rewriter.replaceOp(op, prev);
         return success();
