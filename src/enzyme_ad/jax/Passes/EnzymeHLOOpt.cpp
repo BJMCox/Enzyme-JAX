@@ -19784,7 +19784,8 @@ struct SelectSelectCommonBranch final
 };
 
 // Inside the branch of a select the predicate is known, so a select on the
-// same predicate feeding that branch through elementwise ops is decided:
+// same predicate feeding that branch through integer elementwise ops is
+// decided:
 //   select(p, f(select(p, a, b)), c) -> select(p, f(a), c)
 //   select(p, c, f(select(p, a, b))) -> select(p, c, f(b))
 // The elementwise ops on the path are cloned when they have other users.
@@ -19810,6 +19811,15 @@ struct SelectKnownPredicateOperand final
     }
     if (depth == 0 || !stablehlo::hasTraitElementwise(op) ||
         op->getNumRegions() != 0)
+      return nullptr;
+    // Floating arithmetic can need the inner mask for finite derivatives,
+    // even when the outer select hides its inactive value. For example,
+    // log(select(p, x, 1)) must not become log(x) before differentiating.
+    auto isInteger = [](Type type) {
+      return isa<IntegerType>(getElementTypeOrSelf(type));
+    };
+    if (!llvm::all_of(op->getOperandTypes(), isInteger) ||
+        !llvm::all_of(op->getResultTypes(), isInteger))
       return nullptr;
     SmallVector<Value> operands(op->getOperands());
     bool changed = false;

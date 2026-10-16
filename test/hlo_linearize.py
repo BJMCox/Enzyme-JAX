@@ -171,6 +171,40 @@ class HLOLinearize(absltest.TestCase):
             jax.jit(jax.value_and_grad(lambda x: imported(x)[0]))(point), (4, -4)
         )
 
+    def test_masked_arithmetic_keeps_first_and_second_derivatives_finite(self):
+        mask = jnp.array([False, True])
+        for operation, inactive in (
+            (jnp.log, 0.0),
+            (jnp.sqrt, 0.0),
+            (jnp.reciprocal, 0.0),
+            (jnp.exp, 1000.0),
+        ):
+            with self.subTest(operation=operation.__name__):
+
+                def function(x, mask):
+                    safe = jnp.where(mask, x, 1.0)
+                    return jnp.where(mask, operation(safe), 0.0).sum()
+
+                point = jnp.array([inactive, 2.0], dtype=jnp.float32)
+                imported = import_hlo(function, point, mask)
+
+                def derivatives(call, point, mask):
+                    value, gradient = jax.value_and_grad(call)(point, mask)
+                    _, second = jax.jvp(
+                        lambda x: jax.grad(call)(x, mask),
+                        (point,),
+                        (jnp.ones_like(point),),
+                    )
+                    return value, gradient, second
+
+                actual = jax.jit(
+                    lambda x, p: derivatives(lambda x, p: imported(x, p)[0], x, p)
+                )(point, mask)
+                expected = derivatives(function, point, mask)
+                for value, reference in zip(actual, expected):
+                    self.assertTrue(np.all(np.isfinite(value)))
+                    np.testing.assert_allclose(value, reference, rtol=3e-6, atol=3e-6)
+
     def test_multiple_active_outputs(self):
         x, y = jnp.float32(0.7), jnp.float32(-1.3)
         function = lambda x, y: (x * y, jnp.sin(x) + y * y)
