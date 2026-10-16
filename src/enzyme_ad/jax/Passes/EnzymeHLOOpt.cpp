@@ -18207,7 +18207,7 @@ private:
   // value walked before under the same permutation (kRef + the step that
   // walked it).
   struct Form {
-    SmallVector<OperationName> ops;
+    SmallVector<Operation *> ops;
     SmallVector<Leaf> leaves;
     SmallVector<int64_t> steps;
     int64_t height = 0;
@@ -18238,7 +18238,7 @@ private:
       for (auto [o, i] : llvm::enumerate(transpose.getPermutation()))
         inner[i] = perm[o];
       form.steps.push_back(kOp);
-      form.ops.push_back(op->getName());
+      form.ops.push_back(op);
       return walk(transpose.getOperand(), inner, form, depth + 1);
     }
     if (auto bcast = dyn_cast_or_null<stablehlo::BroadcastInDimOp>(op)) {
@@ -18248,7 +18248,7 @@ private:
       for (auto [i, d] : llvm::enumerate(bcast.getBroadcastDimensions()))
         leaf.map.push_back(type.getDimSize(i) == 1 ? -1 : perm[d]);
       form.steps.push_back(kOp);
-      form.ops.push_back(op->getName());
+      form.ops.push_back(op);
       form.leaves.push_back(leaf);
       return true;
     }
@@ -18256,7 +18256,7 @@ private:
         stablehlo::hasTraitElementwise(op) && isPure(op) &&
         op->getNumOperands() > 0) {
       form.steps.push_back(kOp);
-      form.ops.push_back(op->getName());
+      form.ops.push_back(op);
       for (Value operand : op->getOperands())
         if (!walk(operand, perm, form, depth + 1))
           return false;
@@ -18292,9 +18292,21 @@ private:
       return false;
     Form otherForm;
     if (!analyze(other.getInputs()[0], otherForm) ||
-        otherForm.steps != form.steps || otherForm.ops != form.ops ||
+        otherForm.steps != form.steps || otherForm.ops.size() != form.ops.size() ||
         otherForm.leaves.size() != form.leaves.size())
       return false;
+    for (auto [a, b] : llvm::zip(form.ops, otherForm.ops)) {
+      if (a->getName() != b->getName() ||
+          a->getNumOperands() != b->getNumOperands())
+        return false;
+      // View attributes are represented by the leaf dimension maps. Elementwise
+      // attributes and intermediate precision remain part of the computation.
+      if (!isa<stablehlo::TransposeOp, stablehlo::BroadcastInDimOp>(a) &&
+          (a->getAttrDictionary() != b->getAttrDictionary() ||
+           getElementTypeOrSelf(a->getResult(0).getType()) !=
+               getElementTypeOrSelf(b->getResult(0).getType())))
+        return false;
+    }
     // p[d]: other's input dimension that op's input dimension d is.
     SmallVector<int64_t> p(rank, -1);
     for (auto [a, b] : llvm::zip(form.leaves, otherForm.leaves)) {
