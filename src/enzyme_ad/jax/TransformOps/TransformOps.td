@@ -145,6 +145,11 @@ def ApplyConvertSimplifyPatterns : EnzymeHLOPatternOp<
     "convert_simplify"> {
   let patterns = ["ConvertSimplify"];
 }
+def ApplyClampConstantStartIndicesPatterns : EnzymeHLOPatternOp<
+    "clamp_constant_start_indices"> {
+  let patterns = ["ClampConstantStartIndices<stablehlo::DynamicSliceOp>",
+                  "ClampConstantStartIndices<stablehlo::DynamicUpdateSliceOp>"];
+}
 def ApplyDynamicSliceToStaticPatterns : EnzymeHLOPatternOp<
     "dynamic_slice_to_static"> {
   let patterns = ["DynamicSliceToStatic"];

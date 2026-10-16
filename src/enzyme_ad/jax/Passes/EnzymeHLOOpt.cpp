@@ -640,6 +640,57 @@ struct DynamicSliceSlice final
   }
 };
 
+template <typename OpTy>
+struct ClampConstantStartIndices final
+    : CheckedOpRewritePattern<OpTy, ClampConstantStartIndices<OpTy>> {
+  using CheckedOpRewritePattern<
+      OpTy, ClampConstantStartIndices<OpTy>>::CheckedOpRewritePattern;
+
+  bool supportsDynamicShapes() const { return true; }
+
+  LogicalResult matchAndRewriteImpl(OpTy op, PatternRewriter &rewriter) const {
+    auto shape = op.getOperand().getType().getShape();
+    ArrayRef<int64_t> sizes;
+    if constexpr (std::is_same_v<OpTy, stablehlo::DynamicSliceOp>)
+      sizes = op.getSliceSizes();
+    else
+      sizes = op.getUpdate().getType().getShape();
+
+    SmallVector<Value> indices(op.getStartIndices());
+    bool changed = false;
+    for (auto [axis, index] : llvm::enumerate(indices)) {
+      if (ShapedType::isDynamic(shape[axis]) ||
+          ShapedType::isDynamic(sizes[axis]))
+        continue;
+      APInt start;
+      if (!matchPattern(index, m_ConstantInt(&start)))
+        continue;
+
+      auto type = cast<RankedTensorType>(index.getType());
+      auto integerType = cast<IntegerType>(type.getElementType());
+      uint64_t maxStart = shape[axis] - sizes[axis];
+      APInt clamped = start;
+      if (!integerType.isUnsigned() && start.isNegative())
+        clamped = APInt(start.getBitWidth(), 0);
+      else if (start.ugt(maxStart))
+        clamped = APInt(start.getBitWidth(), maxStart);
+      if (clamped == start)
+        continue;
+
+      // Clamp per axis before a backend combines indices into a flat offset.
+      indices[axis] = stablehlo::ConstantOp::create(
+          rewriter, index.getLoc(), type,
+          DenseIntElementsAttr::get(type, clamped));
+      changed = true;
+    }
+    if (!changed)
+      return failure();
+    rewriter.modifyOpInPlace(
+        op, [&]() { op.getStartIndicesMutable().assign(indices); });
+    return success();
+  }
+};
+
 struct DynamicSliceToStatic final
     : CheckedOpRewritePattern<stablehlo::DynamicSliceOp, DynamicSliceToStatic> {
   using CheckedOpRewritePattern::CheckedOpRewritePattern;
@@ -45787,6 +45838,10 @@ struct EnzymeHLOOptPass
     patterns.add<TransposeRotate>(context);
     patterns.add<SelectPad>(context);
     patterns.add<BitcastConvertCancellation>(context);
+
+    patterns.add<ClampConstantStartIndices<stablehlo::DynamicSliceOp>,
+                 ClampConstantStartIndices<stablehlo::DynamicUpdateSliceOp>>(
+        context, PatternBenefit(65001));
 
     patterns.add<
         AddSimplify, SubSimplify, AndSimplify, ReduceOrAndPad, ReduceOrAnd,
