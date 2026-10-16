@@ -134,6 +134,67 @@ class HLOLinearize(absltest.TestCase):
             np.testing.assert_allclose(actual(x, data), expected(x, data), rtol=3e-6)
             np.testing.assert_allclose(eager(x, data), expected(x, data), rtol=3e-6)
 
+    def test_scan_output_rows_remain_differentiable(self):
+        point = jnp.array([0.4, 0.3], dtype=jnp.float32)
+        tangent = jnp.array([0.17, -0.11], dtype=jnp.float32)
+        # Empty and single-step loops bound row reuse. Overwriting row zero
+        # must retain recomputation because the earlier outputs are lost.
+        for length, overwrite in ((0, False), (1, False), (4, False), (4, True)):
+            with self.subTest(length=length, overwrite=overwrite):
+
+                def function(p):
+                    def step(i, carry):
+                        state, rows = carry
+                        value = jnp.tanh(p[0] * state + p[1] * (i + 1))
+                        rows = rows.at[0 if overwrite else i].set(value)
+                        return value, rows
+
+                    state, rows = jax.lax.fori_loop(
+                        0, length, step, (jnp.float32(0.2), jnp.zeros(max(length, 1)))
+                    )
+                    return rows.sum() + state * state
+
+                imported = import_hlo(function, point)
+
+                def derivatives(call, p):
+                    return jax.jvp(jax.value_and_grad(call), (p,), (tangent,))
+
+                actual = jax.jit(lambda p: derivatives(lambda x: imported(x)[0], p))(
+                    point
+                )
+                expected = jax.jit(lambda p: derivatives(function, p))(point)
+                for value, reference in zip(
+                    jax.tree.leaves(actual), jax.tree.leaves(expected)
+                ):
+                    np.testing.assert_allclose(value, reference, rtol=3e-5, atol=3e-5)
+
+    def test_nested_scan_outputs_remain_differentiable(self):
+        def function(p):
+            def outer(state, offset):
+                def step(state, x):
+                    value = jnp.tanh(p[0] * state + p[1] * x)
+                    return value, value
+
+                state, rows = jax.lax.scan(
+                    step, state, jnp.array([-0.3, 0.7, 0.2]) + offset
+                )
+                return state, rows.sum()
+
+            state, rows = jax.lax.scan(outer, jnp.float32(0.2), jnp.array([0.0, 0.1]))
+            return rows.sum() + state * state
+
+        point = jnp.array([0.4, 0.3], dtype=jnp.float32)
+        tangent = jnp.array([0.17, -0.11], dtype=jnp.float32)
+        imported = import_hlo(function, point)
+
+        def derivatives(call, p):
+            return jax.jvp(jax.value_and_grad(call), (p,), (tangent,))
+
+        actual = jax.jit(lambda p: derivatives(lambda x: imported(x)[0], p))(point)
+        expected = jax.jit(lambda p: derivatives(function, p))(point)
+        for value, reference in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
+            np.testing.assert_allclose(value, reference, rtol=3e-5, atol=3e-5)
+
     def test_nested_scan_state_remains_differentiable(self):
         def function(p):
             def outer(state, offset):

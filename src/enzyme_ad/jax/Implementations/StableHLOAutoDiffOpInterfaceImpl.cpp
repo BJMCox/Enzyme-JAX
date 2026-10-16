@@ -24,6 +24,7 @@
 #include "llvm/ADT/PointerUnion.h"
 
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/RegionUtils.h"
 
@@ -3796,6 +3797,85 @@ public:
                                 lastFwd, &recomputedValues);
     }
 
+    // An original scan output already stores one result per iteration. Prefer
+    // it to recomputation, including computations created by derivative rules
+    // rather than cloned by min-cut (and thus absent from its result mapping).
+    struct CachedOutput {
+      unsigned index;
+      RankedTensorType rowType;
+      SmallVector<Value> recomputed;
+      enzyme::InitOp cache;
+    };
+    SmallVector<CachedOutput> cachedOutputs;
+    llvm::SmallDenseSet<Value> reusedValues;
+    if (info.isConstant() && numIters > 0 && inductionVariable &&
+        !caches.empty()) {
+      for (unsigned index = 0; index < whileOp->getNumOperands(); ++index) {
+        auto update = term->getOperand(index)
+                          .getDefiningOp<stablehlo::DynamicUpdateSliceOp>();
+        if (!update || whileOp->getResult(index).use_empty() ||
+            update->getBlock() != body ||
+            update.getOperand() != body->getArgument(index))
+          continue;
+        auto tapeType = cast<RankedTensorType>(update.getType());
+        auto rowType = cast<RankedTensorType>(update.getUpdate().getType());
+        auto indices = update.getStartIndices();
+        if (!tapeType.hasStaticShape() || !rowType.hasStaticShape() ||
+            tapeType.getRank() == 0 || tapeType.getDimSize(0) != numIters ||
+            rowType.getDimSize(0) != 1 || indices[0] != inductionVariable ||
+            !llvm::all_of(indices.drop_front(),
+                          [](Value v) { return matchPattern(v, m_Zero()); }) ||
+            tapeType.getShape().drop_front() != rowType.getShape().drop_front())
+          continue;
+        Value value = update.getUpdate();
+        if (auto reshape = value.getDefiningOp<stablehlo::ReshapeOp>())
+          value = reshape.getOperand();
+        Operation *definition = value.getDefiningOp();
+        auto type = dyn_cast<RankedTensorType>(value.getType());
+        if (!definition || definition->getBlock() != body ||
+            definition->getNumResults() != 1 || definition->getNumRegions() ||
+            definition->getNumOperands() == 0 || !isPure(definition) || !type ||
+            !isa<FloatType>(type.getElementType()))
+          continue;
+
+        // All operands must be the exact same forward values in reverse.
+        // Search their users rather than rescanning the reverse body per tape.
+        Value operand =
+            recomputedValues.lookupOrDefault(definition->getOperand(0));
+        SmallVector<Value> matches;
+        for (Operation *candidate : operand.getUsers()) {
+          if (candidate->getBlock() != &otherWhileOp.getBody().front() ||
+              candidate->getNumResults() != 1 || candidate->getNumRegions() ||
+              candidate->use_empty() || !isPure(candidate) ||
+              reusedValues.contains(candidate->getResult(0)))
+            continue;
+          if (OperationEquivalence::isEquivalentTo(
+                  definition, candidate,
+                  [&](Value forward, Value reverse) {
+                    return success(recomputedValues.lookupOrDefault(forward) ==
+                                   reverse);
+                  },
+                  /*markEquivalent=*/nullptr,
+                  OperationEquivalence::IgnoreLocations |
+                      OperationEquivalence::IgnoreCommutativity)) {
+            matches.push_back(candidate->getResult(0));
+            reusedValues.insert(candidate->getResult(0));
+          }
+        }
+        if (matches.empty())
+          continue;
+        llvm::sort(matches, [](Value a, Value b) {
+          return a.getDefiningOp()->isBeforeInBlock(b.getDefiningOp());
+        });
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPoint(caches.front().initOp);
+        auto cache = enzyme::InitOp::create(
+            rewriter, value.getLoc(),
+            enzyme::CacheType::get(op->getContext(), tapeType));
+        cachedOutputs.push_back({index, rowType, std::move(matches), cache});
+      }
+    }
+
     // A selected state tape already stores s[0], ..., s[N-1]. Reuse row t+1
     // in reverse, with the final result s[N] for the last forward step.
     // Keep that result invariant in reverse to avoid a writable state carry.
@@ -3805,7 +3885,6 @@ public:
       enzyme::InitOp finalState;
     };
     DenseMap<Value, CachedState> cachedStates;
-    llvm::SmallDenseSet<Value> reusedValues;
     if (info.isConstant() && numIters > 0) {
       for (auto &cache : caches) {
         auto argument = dyn_cast<BlockArgument>(cache.pushedValue());
@@ -4005,7 +4084,7 @@ public:
     // first.
     BlockArgument reverseInductionVariable;
     if (inductionVariable &&
-        (caches.size() != 0 ||
+        (caches.size() != 0 || !cachedOutputs.empty() ||
          (reverseIVPlaceholder && !reverseIVPlaceholder->use_empty()))) {
       if (isa<BlockArgument>(inductionVariable) &&
           cast<BlockArgument>(inductionVariable).getArgNumber() != 0)
@@ -4089,6 +4168,29 @@ public:
     }
 
     // 5. Finally, replace pops with slices.
+    for (auto &output : cachedOutputs) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointAfter(newWhile);
+      Value tape = newWhile->getResult(output.index);
+      enzyme::PushOp::create(rewriter, tape.getLoc(), output.cache, tape);
+      rewriter.setInsertionPoint(otherWhileOp);
+      Value saved = enzyme::PopOp::create(rewriter, tape.getLoc(),
+                                          tape.getType(), output.cache);
+      Value first = output.recomputed.front();
+      rewriter.setInsertionPoint(first.getDefiningOp());
+      auto zero = makeZero(rewriter, first.getLoc(),
+                           reverseInductionVariable.getType());
+      SmallVector<Value> indices(output.rowType.getRank(), zero);
+      indices[0] = reverseInductionVariable;
+      Value row = stablehlo::DynamicSliceOp::create(
+          rewriter, first.getLoc(), output.rowType, saved, indices,
+          output.rowType.getShape());
+      Value value = stablehlo::ReshapeOp::create(rewriter, first.getLoc(),
+                                                 first.getType(), row);
+      for (Value recomputed : output.recomputed)
+        rewriter.replaceAllUsesWith(recomputed, value);
+    }
+
     for (auto &info : caches) {
       if (info.pushedValue().getParentRegion() != &newWhile.getBody())
         continue;
