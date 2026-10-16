@@ -1068,6 +1068,7 @@ struct DUSReshape final
       return failure();
 
     auto itype = cast<RankedTensorType>(op.getStartIndices()[0].getType());
+    auto indexType = cast<IntegerType>(itype.getElementType());
     SmallVector<Value> newStarts;
     SmallVector<int64_t> newUpdShape;
     for (auto &g : groups) {
@@ -1082,8 +1083,10 @@ struct DUSReshape final
         if (!matchPattern(op.getStartIndices()[d], m_ConstantInt(&idx)))
           return failure();
         // Start indices are clamped so that the update fits.
-        outStarts.push_back(std::clamp<int64_t>(idx.getSExtValue(), 0,
-                                                outShape[d] - updShape[d]));
+        int64_t maxStart = outShape[d] - updShape[d];
+        outStarts.push_back(!indexType.isUnsigned() && idx.isNegative()
+                                ? 0
+                                : idx.getLimitedValue(maxStart));
         outSizes.push_back(updShape[d]);
       }
       int64_t start, size;
