@@ -34,12 +34,12 @@ func.func @select_no_common(%p: tensor<4xi1>, %q: tensor<4xi1>, %a: tensor<4xf32
 // CHECK-NEXT: return %[[S]]
 
 // Under p, select(p, 0, x) is 0, so (select(p, 0, x) + y) is y.
-func.func @select_known_predicate(%p: tensor<4xi1>, %x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xf32> {
-  %zero = stablehlo.constant dense<0.0> : tensor<4xf32>
-  %z = stablehlo.select %p, %zero, %x : tensor<4xi1>, tensor<4xf32>
-  %s = stablehlo.add %z, %y : tensor<4xf32>
-  %r = stablehlo.select %p, %s, %x : tensor<4xi1>, tensor<4xf32>
-  return %r : tensor<4xf32>
+func.func @select_known_predicate(%p: tensor<4xi1>, %x: tensor<4xi32>, %y: tensor<4xi32>) -> tensor<4xi32> {
+  %zero = stablehlo.constant dense<0> : tensor<4xi32>
+  %z = stablehlo.select %p, %zero, %x : tensor<4xi1>, tensor<4xi32>
+  %s = stablehlo.add %z, %y : tensor<4xi32>
+  %r = stablehlo.select %p, %s, %x : tensor<4xi1>, tensor<4xi32>
+  return %r : tensor<4xi32>
 }
 // CHECK-LABEL: func.func @select_known_predicate
 // CHECK-NEXT: %[[S:.+]] = stablehlo.select %arg0, %arg2, %arg1
@@ -47,11 +47,11 @@ func.func @select_known_predicate(%p: tensor<4xi1>, %x: tensor<4xf32>, %y: tenso
 
 // The false branch of the inner select is what the outer false branch sees;
 // the intermediate add has another user and is cloned rather than changed.
-func.func @select_known_predicate_false(%p: tensor<4xi1>, %x: tensor<4xf32>, %y: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>) {
-  %z = stablehlo.select %p, %x, %y : tensor<4xi1>, tensor<4xf32>
-  %s = stablehlo.add %z, %y : tensor<4xf32>
-  %r = stablehlo.select %p, %x, %s : tensor<4xi1>, tensor<4xf32>
-  return %r, %s : tensor<4xf32>, tensor<4xf32>
+func.func @select_known_predicate_false(%p: tensor<4xi1>, %x: tensor<4xi32>, %y: tensor<4xi32>) -> (tensor<4xi32>, tensor<4xi32>) {
+  %z = stablehlo.select %p, %x, %y : tensor<4xi1>, tensor<4xi32>
+  %s = stablehlo.add %z, %y : tensor<4xi32>
+  %r = stablehlo.select %p, %x, %s : tensor<4xi1>, tensor<4xi32>
+  return %r, %s : tensor<4xi32>, tensor<4xi32>
 }
 // CHECK-LABEL: func.func @select_known_predicate_false
 // CHECK-DAG: %[[Z:.+]] = stablehlo.select %arg0, %arg1, %arg2
@@ -59,6 +59,21 @@ func.func @select_known_predicate_false(%p: tensor<4xi1>, %x: tensor<4xf32>, %y:
 // CHECK-DAG: %[[YY:.+]] = stablehlo.add %arg2, %arg2
 // CHECK: %[[R:.+]] = stablehlo.select %arg0, %arg1, %[[YY]]
 // CHECK-NEXT: return %[[R]], %[[S]]
+
+// The inner mask keeps inactive log derivatives finite at x = 0.
+func.func @masked_log(%p: tensor<i1>, %x: tensor<f32>) -> tensor<f32> {
+  %one = stablehlo.constant dense<1.0> : tensor<f32>
+  %zero = stablehlo.constant dense<0.0> : tensor<f32>
+  %safe = stablehlo.select %p, %x, %one : tensor<i1>, tensor<f32>
+  %log = stablehlo.log %safe : tensor<f32>
+  %result = stablehlo.select %p, %log, %zero : tensor<i1>, tensor<f32>
+  return %result : tensor<f32>
+}
+// CHECK-LABEL: func.func @masked_log
+// CHECK: %[[SAFE:.+]] = stablehlo.select %arg0, %arg1,
+// CHECK-NEXT: %[[LOG:.+]] = stablehlo.log %[[SAFE]]
+// CHECK-NEXT: %[[RESULT:.+]] = stablehlo.select %arg0, %[[LOG]],
+// CHECK-NEXT: return %[[RESULT]]
 
 func.func @main() {
   %p = stablehlo.constant dense<[true, false, true, false]> : tensor<4xi1>
@@ -74,13 +89,15 @@ func.func @main() {
   %r2b = func.call @select_no_common(%p, %q, %a, %c) : (tensor<4xi1>, tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
   %e2b = stablehlo.constant dense<[1.0, -2.0, 3.0, 4.0]> : tensor<4xf32>
   check.expect_eq %r2b, %e2b : tensor<4xf32>
-  %r3 = func.call @select_known_predicate(%p, %a, %c) : (tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
-  %e3 = stablehlo.constant dense<[-1.0, 2.0, -3.0, 4.0]> : tensor<4xf32>
-  check.expect_eq %r3, %e3 : tensor<4xf32>
-  %r4:2 = func.call @select_known_predicate_false(%p, %a, %c) : (tensor<4xi1>, tensor<4xf32>, tensor<4xf32>) -> (tensor<4xf32>, tensor<4xf32>)
-  %e4 = stablehlo.constant dense<[1.0, -4.0, 3.0, -8.0]> : tensor<4xf32>
-  check.expect_eq %r4#0, %e4 : tensor<4xf32>
-  %e4b = stablehlo.constant dense<[0.0, -4.0, 0.0, -8.0]> : tensor<4xf32>
-  check.expect_eq %r4#1, %e4b : tensor<4xf32>
+  %ai = stablehlo.constant dense<[1, 2, 3, 4]> : tensor<4xi32>
+  %ci = stablehlo.constant dense<[-1, -2, -3, -4]> : tensor<4xi32>
+  %r3 = func.call @select_known_predicate(%p, %ai, %ci) : (tensor<4xi1>, tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+  %e3 = stablehlo.constant dense<[-1, 2, -3, 4]> : tensor<4xi32>
+  check.expect_eq %r3, %e3 : tensor<4xi32>
+  %r4:2 = func.call @select_known_predicate_false(%p, %ai, %ci) : (tensor<4xi1>, tensor<4xi32>, tensor<4xi32>) -> (tensor<4xi32>, tensor<4xi32>)
+  %e4 = stablehlo.constant dense<[1, -4, 3, -8]> : tensor<4xi32>
+  check.expect_eq %r4#0, %e4 : tensor<4xi32>
+  %e4b = stablehlo.constant dense<[0, -4, 0, -8]> : tensor<4xi32>
+  check.expect_eq %r4#1, %e4b : tensor<4xi32>
   return
 }
