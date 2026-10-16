@@ -1131,11 +1131,19 @@ def to_jax_type(mlir_type):
     assert False
 
 
+# Preserve per-axis clamping before XLA's GPU offset analysis, even when callers
+# do not request the full optimization pipeline. Explicit passes="" stays raw.
+_HLO_IMPORT_PASSES = (
+    "enzyme-hlo-generate-td{patterns=clamp_constant_start_indices},"
+    "transform-interpreter,enzyme-hlo-remove-transform"
+)
+
+
 def hlo_call(
     *args,
     source: str,
     argv: tuple[str] = (),
-    passes: str = "",
+    passes: str = _HLO_IMPORT_PASSES,
 ):
     fn = "main"
     with jax_mlir.make_ir_context():

@@ -9,6 +9,7 @@ from enzyme_ad.jax.primitives import optimization_passes
 
 class HLOClamping(parameterized.TestCase):
     @parameterized.product(
+        optimized=(False, True),
         operation=("dynamic_slice", "dynamic_update_slice"),
         case=(
             ("ui16", "65535", "0", 1, 0),
@@ -17,7 +18,7 @@ class HLOClamping(parameterized.TestCase):
             ("i32", "-1", "2147483647", 0, 2),
         ),
     )
-    def test_constant_indices(self, operation, case):
+    def test_constant_indices(self, operation, case, optimized):
         index_type, first, second, row, column = case
         update = operation == "dynamic_update_slice"
         signature = "%x: tensor<2x3xf32>, %u: tensor<1x1xf32>"
@@ -37,9 +38,8 @@ class HLOClamping(parameterized.TestCase):
           %out = {body}
           return %out : tensor<{result_type}>
         }}"""
-        function = lambda *args: hlo_call(
-            *args, source=source, passes=optimization_passes()
-        )[0]
+        options = {"passes": optimization_passes()} if optimized else {}
+        function = lambda *args: hlo_call(*args, source=source, **options)[0]
         x = np.arange(6, dtype=np.float32).reshape(2, 3)
         if update:
             arguments = (jnp.asarray(x), jnp.array([[9]], dtype=jnp.float32))
