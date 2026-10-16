@@ -18325,8 +18325,11 @@ private:
     // Dimensions no leaf reads along (broadcast only) pair up in order.
     SmallVector<bool> taken(rank, false);
     for (int64_t d : p)
-      if (d >= 0)
+      if (d >= 0) {
+        if (taken[d])
+          return false;
         taken[d] = true;
+      }
     for (int64_t d = 0, e = 0; d < rank; d++) {
       if (p[d] >= 0)
         continue;
