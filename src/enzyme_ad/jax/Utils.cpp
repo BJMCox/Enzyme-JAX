@@ -3150,6 +3150,10 @@ std::optional<ConcatSlicedElem> findConcatSlicedElem(Value concatOperand,
             }
           if (newSliceDim == -1)
             break; // sliceDim is broadcast-only; cannot go deeper
+          // Expanded coordinates do not index the broadcast's source.
+          if (broadcast.getOperand().getType().getDimSize(newSliceDim) !=
+              broadcast.getType().getDimSize(sliceDim))
+            break;
           sliceDim = newSliceDim;
         }
         SmallVector<int64_t> newPerm;
@@ -3230,6 +3234,10 @@ std::optional<ConcatSlicedElem> findConcatSlicedElem(Value concatOperand,
   if (!foundFirst)
     return std::nullopt;
 
+  // Concatenating repeated elements is not a contiguous source slice.
+  if ((limit - start) / stride != operandTy.getDimSize(concatDim))
+    return std::nullopt;
+
   if (iperm[sliceDim] != concatDim) {
     if ((limit - start) / stride != 1 || operandTy.getDimSize(concatDim) != 1)
       return std::nullopt;
@@ -3306,8 +3314,9 @@ static Value mergeConcatSlicedElems(PatternRewriter &rewriter,
   auto origTy = cast<ShapedType>(origOperand.getType());
 
   SmallVector<int64_t> outputShape(origTy.getShape());
-  for (auto [p, d] : llvm::enumerate(perm))
-    outputShape[d] = cast<ShapedType>(newConcatOperand.getType()).getDimSize(p);
+  // Only the concatenated dimension grows. Keep other broadcast extents.
+  outputShape[perm[sliceDim]] =
+      cast<ShapedType>(newConcatOperand.getType()).getDimSize(sliceDim);
 
   if (outputShape.size() != 1)
     newConcatOperand = BroadcastInDimOp::create(

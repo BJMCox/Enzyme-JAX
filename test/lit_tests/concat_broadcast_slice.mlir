@@ -18,6 +18,60 @@ func.func @merge(%arg0: tensor<65xf64>) -> tensor<10x1xf64> {
 
 // -----
 
+// Merging columns preserves the expansion from one row to six rows.
+func.func @expanded_other_dim(%arg0: tensor<10x1xi1>) -> tensor<6x10xi1> {
+  %0 = stablehlo.slice %arg0 [0:5, 0:1] : (tensor<10x1xi1>) -> tensor<5x1xi1>
+  %1 = stablehlo.slice %arg0 [5:10, 0:1] : (tensor<10x1xi1>) -> tensor<5x1xi1>
+  %2 = stablehlo.broadcast_in_dim %0, dims = [1, 0] : (tensor<5x1xi1>) -> tensor<6x5xi1>
+  %3 = stablehlo.broadcast_in_dim %1, dims = [1, 0] : (tensor<5x1xi1>) -> tensor<6x5xi1>
+  %4 = stablehlo.concatenate %2, %3, dim = 1 : (tensor<6x5xi1>, tensor<6x5xi1>) -> tensor<6x10xi1>
+  return %4 : tensor<6x10xi1>
+}
+
+// CHECK-LABEL: func.func @expanded_other_dim
+// CHECK:        %[[SLICE:.+]] = stablehlo.slice %arg0 [0:10, 0:1]
+// CHECK-NEXT:   %[[BCAST:.+]] = stablehlo.broadcast_in_dim %[[SLICE]], dims = [1, 0] : (tensor<10x1xi1>) -> tensor<6x10xi1>
+// CHECK-NEXT:   %[[CONCAT:.+]] = stablehlo.concatenate %[[BCAST]], dim = 1
+// CHECK-NEXT:   return %[[CONCAT]]
+
+// -----
+
+// Slices of expanded rows must keep indexing the expanded value.
+func.func @slice_expanded_dim(%arg0: tensor<1x2xf64>) -> tensor<6x2xf64> {
+  %0 = stablehlo.broadcast_in_dim %arg0, dims = [0, 1] : (tensor<1x2xf64>) -> tensor<6x2xf64>
+  %1 = stablehlo.slice %0 [0:3, 0:2] : (tensor<6x2xf64>) -> tensor<3x2xf64>
+  %2 = stablehlo.slice %0 [3:6, 0:2] : (tensor<6x2xf64>) -> tensor<3x2xf64>
+  %3 = stablehlo.concatenate %1, %2, dim = 0 : (tensor<3x2xf64>, tensor<3x2xf64>) -> tensor<6x2xf64>
+  return %3 : tensor<6x2xf64>
+}
+
+// CHECK-LABEL: func.func @slice_expanded_dim
+// CHECK:        %[[BCAST:.+]] = stablehlo.broadcast_in_dim %arg0, dims = [0, 1] : (tensor<1x2xf64>) -> tensor<6x2xf64>
+// CHECK-NEXT:   %[[SLICE:.+]] = stablehlo.slice %[[BCAST]] [0:6, 0:2]
+// CHECK-NEXT:   %[[MERGED:.+]] = stablehlo.broadcast_in_dim %[[SLICE]], dims = [0, 1] : (tensor<6x2xf64>) -> tensor<6x2xf64>
+// CHECK-NEXT:   %[[CONCAT:.+]] = stablehlo.concatenate %[[MERGED]], dim = 0
+// CHECK-NEXT:   return %[[CONCAT]]
+
+// -----
+
+// Repeating the first element cannot become a single contiguous source slice.
+func.func @expanded_concat_dim(%arg0: tensor<3xf64>) -> tensor<4xf64> {
+  %0 = stablehlo.slice %arg0 [0:1] : (tensor<3xf64>) -> tensor<1xf64>
+  %1 = stablehlo.broadcast_in_dim %0, dims = [0] : (tensor<1xf64>) -> tensor<2xf64>
+  %2 = stablehlo.slice %arg0 [1:3] : (tensor<3xf64>) -> tensor<2xf64>
+  %3 = stablehlo.concatenate %1, %2, dim = 0 : (tensor<2xf64>, tensor<2xf64>) -> tensor<4xf64>
+  return %3 : tensor<4xf64>
+}
+
+// CHECK-LABEL: func.func @expanded_concat_dim
+// CHECK-NEXT:   %[[SLICE:.+]] = stablehlo.slice %arg0 [0:1]
+// CHECK-NEXT:   %[[BCAST:.+]] = stablehlo.broadcast_in_dim %[[SLICE]], dims = [0]
+// CHECK-NEXT:   %[[TAIL:.+]] = stablehlo.slice %arg0 [1:3]
+// CHECK-NEXT:   %[[CONCAT:.+]] = stablehlo.concatenate %[[BCAST]], %[[TAIL]], dim = 0
+// CHECK-NEXT:   return %[[CONCAT]]
+
+// -----
+
 // The slice happens on dim 0 while the concat is on dim 1: merging the slices
 // would grow the wrong dimension, so this must be left alone.
 func.func @wrong_dim(%arg0: tensor<65xf64>) -> tensor<5x3xf64> {
