@@ -30,6 +30,7 @@
 
 #include "Dialect/Ops.h"
 #include "mlir/IR/TypeSupport.h"
+#include "mlir/IR/TypeUtilities.h"
 
 #include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -1949,12 +1950,18 @@ public:
     SmallVector<int64_t> starts;
     SmallVector<int64_t> edge_padding_high;
     SmallVector<int64_t> interior_padding;
-    for (auto &&[start, size, stride, dim] :
-         llvm::zip(op.getStartIndices(), op.getType().getShape(), op.getStrides(),
-                   inTy.getShape())) {
+    for (auto &&[start, stride, dim, outDim] :
+         llvm::zip(op.getStartIndices(), op.getStrides(), inTy.getShape(),
+                   op.getType().getShape())) {
       starts.push_back(start);
-      int64_t span = size == 0 ? 0 : (size - 1) * stride + 1;
-      edge_padding_high.push_back(dim - start - span);
+      // The limit index of a strided slice need not be tight (e.g. x[1:1119:2]
+      // and x[1:1118:2] of a 1120-element tensor both yield 559 elements), so
+      // the high padding must be derived from the number of result elements
+      // rather than from `dim - limit`. The padded result has
+      // `outDim + start + high + (outDim - 1) * (stride - 1)` elements for
+      // `outDim > 0`, which must equal `dim`.
+      int64_t end = outDim == 0 ? start : start + (outDim - 1) * stride + 1;
+      edge_padding_high.push_back(dim - end);
       interior_padding.push_back(stride - 1);
     }
 
@@ -2613,6 +2620,25 @@ struct ScatterActivity
       return false;
     return true;
   }
+};
+
+// A convert between floating-point (or complex) types is linear and is
+// differentiated by the tablegen rule. A convert to or from an integer type
+// (a truncation, or the use of a truncated value) is piecewise constant, so
+// the op is inactive: the integer side carries no shadow and nothing flows
+// through it. Without this, `float(unsafe_trunc(Int, x))` differentiated as
+// the identity since the two converts composed to a linear round trip.
+struct ConvertActivity
+    : public ActivityOpInterface::ExternalModel<ConvertActivity, ConvertOp> {
+  static bool isFloatLike(Type ty) {
+    return isa<FloatType, ComplexType>(getElementTypeOrSelf(ty));
+  }
+  bool isInactive(Operation *op) const {
+    auto cvt = cast<ConvertOp>(op);
+    return !isFloatLike(cvt.getOperand().getType()) ||
+           !isFloatLike(cvt.getResult().getType());
+  }
+  bool isArgInactive(Operation *op, size_t idx) const { return isInactive(op); }
 };
 
 struct ADDataFlowWhileOp
@@ -5641,6 +5667,7 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
     ReduceOp::attachInterface<ADDataFlowReduceOp>(*context);
 
     ScatterOp::attachInterface<ScatterActivity>(*context);
+    ConvertOp::attachInterface<ConvertActivity>(*context);
     ScatterOp::attachInterface<AutoDiffScatterFwd>(*context);
     ScatterOp::attachInterface<AutoDiffScatterRev>(*context);
 
