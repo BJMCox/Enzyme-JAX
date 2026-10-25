@@ -1,11 +1,12 @@
 """JAX primitives for Enzyme connection."""
 
-from functools import partial
+from functools import cache, partial
 from collections.abc import Callable, Sequence
 from typing import Any
 import inspect
 import itertools
 import os
+import subprocess
 import tempfile
 from absl import logging
 
@@ -257,20 +258,36 @@ def resource_dir():
     return res
 
 
+@cache
+def _xcrun_sdk():
+    try:
+        return subprocess.run(
+            ["xcrun", "--show-sdk-path"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+
+
+def macos_sdk():
+    """The macOS SDK: `$SDKROOT`, else the one `xcrun` selects."""
+    return os.environ.get("SDKROOT") or _xcrun_sdk()
+
+
 def cflags():
     import platform
     import os
 
     if platform.system() == "Darwin":
+        sdk = macos_sdk()
         res = (
             "-isysroot",
-            "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+            sdk,
             "-isystem",
-            "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/c++/v1",
+            os.path.join(sdk, "usr", "include", "c++", "v1"),
             "-internal-isystem",
             os.path.join(resource_dir(), "include"),
             "-internal-externc-isystem",
-            "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include",
+            os.path.join(sdk, "usr", "include"),
             "-internal-externc-isystem",
             "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include",
             "-fgnuc-version=4.2.1",
