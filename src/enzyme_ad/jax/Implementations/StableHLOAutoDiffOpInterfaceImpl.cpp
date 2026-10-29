@@ -2638,6 +2638,36 @@ struct SHLOTransposeOpBatchInterface
   }
 };
 
+struct SHLOCholeskyOpBatchInterface
+    : BatchOpInterface::ExternalModel<SHLOCholeskyOpBatchInterface,
+                                      CholeskyOp> {
+  LogicalResult createBatch(Operation *src, OpBuilder &builder,
+                            IRMapping &mapper,
+                            ArrayRef<int64_t> batchSizes) const {
+    auto op = cast<CholeskyOp>(src);
+    Value result = CholeskyOp::create(builder, op.getLoc(),
+                                      mapper.lookup(op.getA()), op.getLower());
+    mapper.map(op.getResult(), result);
+    return success();
+  }
+};
+
+struct SHLOTriangularSolveOpBatchInterface
+    : BatchOpInterface::ExternalModel<SHLOTriangularSolveOpBatchInterface,
+                                      TriangularSolveOp> {
+  LogicalResult createBatch(Operation *src, OpBuilder &builder,
+                            IRMapping &mapper,
+                            ArrayRef<int64_t> batchSizes) const {
+    auto op = cast<TriangularSolveOp>(src);
+    Value a = mapper.lookup(op.getA()), b = mapper.lookup(op.getB());
+    Value result = TriangularSolveOp::create(
+        builder, op.getLoc(), b.getType(), a, b, op.getLeftSide(),
+        op.getLower(), op.getUnitDiagonal(), op.getTransposeA());
+    mapper.map(op.getResult(), result);
+    return success();
+  }
+};
+
 // Work in lower-triangular coordinates for either Cholesky orientation. All
 // operations remain differentiable, including the transposed triangular solves.
 class CholeskyDerivative {
@@ -6006,6 +6036,9 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
     ConstantOp::attachInterface<
         HLOConstantOpBatchInterface<stablehlo::ConstantOp>>(*context);
     TransposeOp::attachInterface<SHLOTransposeOpBatchInterface>(*context);
+    CholeskyOp::attachInterface<SHLOCholeskyOpBatchInterface>(*context);
+    TriangularSolveOp::attachInterface<SHLOTriangularSolveOpBatchInterface>(
+        *context);
     stablehlo::IfOp::attachInterface<
         SHLOGenericBatchOpInterface<stablehlo::IfOp>>(*context);
     WhileOp::attachInterface<SHLOGenericBatchOpInterface<WhileOp>>(*context);
