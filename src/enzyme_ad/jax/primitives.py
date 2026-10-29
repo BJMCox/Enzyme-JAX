@@ -734,6 +734,8 @@ def _enzyme_primal_lowering(
                     print(str(nmod), flush=True)
 
             nmod = ir.Module.parse(nmod)
+            if pass_pipeline:
+                _lower_native_linalg(ctx, nmod)
             fn = None
             pushtop = []
             for f in nmod.body:
@@ -1146,6 +1148,61 @@ def to_jax_type(mlir_type):
         if mtype == et:
             return jax.core.ShapedArray(mlir_type.shape, jtype)
     assert False
+
+
+def _lower_native_linalg(ctx, module):
+    """Use JAX's target lowering after differentiating portable matrix ops."""
+    operations = []
+
+    def collect(op):
+        if op.name in ("stablehlo.cholesky", "stablehlo.triangular_solve"):
+            operations.append(op)
+        return ir.WalkResult.ADVANCE
+
+    module.operation.walk(collect)
+    for op in operations:
+        types = [ir.RankedTensorType(value.type) for value in op.operands]
+        # Keep native lowering for types outside JAX's LAPACK/solver support.
+        if any(
+            not ty.has_static_shape
+            or str(ty.element_type)
+            not in ("f32", "f64", "complex<f32>", "complex<f64>")
+            for ty in types
+        ):
+            continue
+        if op.name == "stablehlo.cholesky":
+            lower = (
+                "lower" in op.attributes and ir.BoolAttr(op.attributes["lower"]).value
+            )
+
+            def function(a, lower=lower):
+                if not lower:
+                    a = jnp.swapaxes(a, -1, -2)
+                factor = lax.linalg.cholesky(a, symmetrize_input=False)
+                return factor if lower else jnp.swapaxes(factor, -1, -2)
+
+        else:
+            transpose = str(op.attributes["transpose_a"])
+            options = {
+                name: ir.BoolAttr(op.attributes[name]).value
+                for name in ("left_side", "lower", "unit_diagonal")
+            }
+            options.update(
+                transpose_a="NO_TRANSPOSE" not in transpose,
+                conjugate_a="ADJOINT" in transpose,
+            )
+            function = partial(lax.linalg.triangular_solve, **options)
+        operation_ctx = ctx.replace(
+            avals_in=[to_jax_type(ty) for ty in types],
+            avals_out=[to_jax_type(ir.RankedTensorType(v.type)) for v in op.results],
+            primitive=None,
+        )
+        with ir.InsertionPoint(op), op.location:
+            replacement = jax_mlir.lower_fun(function, multiple_results=False)(
+                operation_ctx, *op.operands
+            )
+        op.results[0].replace_all_uses_with(replacement[0])
+        op.erase()
 
 
 # Preserve per-axis clamping before XLA's GPU offset analysis, even when callers
