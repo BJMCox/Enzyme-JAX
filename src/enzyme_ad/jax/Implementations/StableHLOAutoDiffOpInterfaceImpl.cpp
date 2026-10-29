@@ -2638,6 +2638,179 @@ struct SHLOTransposeOpBatchInterface
   }
 };
 
+// Work in lower-triangular coordinates for either Cholesky orientation. All
+// operations remain differentiable, including the transposed triangular solves.
+class CholeskyDerivative {
+  OpBuilder &builder;
+  Location loc;
+  bool lower;
+  Value factor;
+
+  Value transpose(Value value) {
+    auto rank = cast<RankedTensorType>(value.getType()).getRank();
+    SmallVector<int64_t> axes;
+    for (int64_t i = 0; i < rank; ++i)
+      axes.push_back(i);
+    std::swap(axes[rank - 2], axes[rank - 1]);
+    return TransposeOp::create(builder, loc, value, axes);
+  }
+
+  Value mask(Value value, ComparisonDirection direction) {
+    auto type = cast<RankedTensorType>(value.getType());
+    auto indexType =
+        RankedTensorType::get(type.getShape(), builder.getI64Type());
+    Value rows = IotaOp::create(builder, loc, indexType, type.getRank() - 2);
+    Value cols = IotaOp::create(builder, loc, indexType, type.getRank() - 1);
+    Value selected = CompareOp::create(builder, loc, rows, cols, direction);
+    return SelectOp::create(builder, loc, selected, value,
+                            makeZero(builder, loc, type));
+  }
+
+  // Retain the strict lower triangle and half the diagonal.
+  Value phi(Value value) {
+    Value diagonal = mask(value, ComparisonDirection::EQ);
+    Value half = ConstantOp::create(
+        builder, loc, cast<ElementsAttr>(makeAttr(value.getType(), 0.5)));
+    diagonal = MulOp::create(builder, loc, diagonal, half);
+    return AddOp::create(builder, loc, mask(value, ComparisonDirection::GT),
+                         diagonal);
+  }
+
+  Value multiply(Value lhs, Value rhs) {
+    auto type = cast<RankedTensorType>(lhs.getType());
+    auto rank = type.getRank();
+    SmallVector<int64_t> batch;
+    for (int64_t i = 0; i < rank - 2; ++i)
+      batch.push_back(i);
+    auto dims = DotDimensionNumbersAttr::get(builder.getContext(), batch, batch,
+                                             {rank - 1}, {rank - 2});
+    // Match the factorization derivative's full scalar precision on
+    // accelerators.
+    auto precision = builder.getArrayAttr(
+        {PrecisionAttr::get(builder.getContext(), Precision::HIGHEST),
+         PrecisionAttr::get(builder.getContext(), Precision::HIGHEST)});
+    return DotGeneralOp::create(builder, loc, type, lhs, rhs, dims, precision,
+                                stablehlo::DotAlgorithmAttr());
+  }
+
+  Value solve(Value rhs, bool left, bool transposed) {
+    return TriangularSolveOp::create(
+        builder, loc, rhs.getType(), factor, rhs, left, /*lower=*/true,
+        /*unit_diagonal=*/false,
+        transposed ? Transpose::TRANSPOSE : Transpose::NO_TRANSPOSE);
+  }
+
+  Value orient(Value value) { return lower ? value : transpose(value); }
+
+public:
+  static LogicalResult check(CholeskyOp op) {
+    auto type = cast<RankedTensorType>(op.getA().getType());
+    if (!type.hasStaticShape() ||
+        !(type.getElementType().isF32() || type.getElementType().isF64()))
+      return op.emitOpError(
+          "differentiation requires statically shaped real f32 or f64 tensors");
+    return success();
+  }
+
+  CholeskyDerivative(OpBuilder &builder, CholeskyOp op, Value primal,
+                     Type shadowType)
+      : builder(builder), loc(op.getLoc()), lower(op.getLower()) {
+    factor = mask(orient(primal), ComparisonDirection::GE);
+    if (factor.getType() != shadowType) {
+      auto rank = cast<RankedTensorType>(factor.getType()).getRank();
+      SmallVector<int64_t> axes;
+      for (int64_t i = 0; i < rank; ++i)
+        axes.push_back(i + 1);
+      factor = BroadcastInDimOp::create(builder, loc, shadowType, factor,
+                                        builder.getDenseI64ArrayAttr(axes));
+    }
+  }
+
+  Value forward(Value tangent) {
+    tangent = orient(tangent);
+    Value strict = mask(tangent, ComparisonDirection::GT);
+    Value lowerTriangle = mask(tangent, ComparisonDirection::GE);
+    Value upperTriangle = transpose(strict);
+    Value symmetric = AddOp::create(builder, loc, lowerTriangle, upperTriangle);
+    Value normalized = solve(solve(symmetric, /*left=*/false,
+                                   /*transposed=*/true),
+                             /*left=*/true, /*transposed=*/false);
+    return orient(multiply(factor, phi(normalized)));
+  }
+
+  Value reverse(Value cotangent) {
+    cotangent = mask(orient(cotangent), ComparisonDirection::GE);
+    Value projected = phi(multiply(transpose(factor), cotangent));
+    Value symmetric =
+        AddOp::create(builder, loc, projected, transpose(projected));
+    Value gradient = solve(solve(symmetric, /*left=*/true,
+                                 /*transposed=*/true),
+                           /*left=*/false, /*transposed=*/false);
+    // Fold the symmetric-matrix adjoint back to the input's selected storage.
+    return orient(phi(gradient));
+  }
+};
+
+struct AutoDiffCholeskyFwd
+    : AutoDiffOpInterface::ExternalModel<AutoDiffCholeskyFwd, CholeskyOp> {
+  LogicalResult createForwardModeTangent(Operation *orig, OpBuilder &builder,
+                                         MGradientUtils *gutils) const {
+    auto op = cast<CholeskyOp>(orig);
+    if (gutils->isConstantValue(op.getResult()))
+      return success();
+    if (failed(CholeskyDerivative::check(op)))
+      return failure();
+    // The forward visitor's insertion point precedes the cloned primal, whose
+    // factor is needed by the tangent rule.
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfter(gutils->getNewFromOriginal(orig));
+    Value tangent = gutils->invertPointerM(op.getA(), builder);
+    CholeskyDerivative rule(builder, op,
+                            gutils->getNewFromOriginal(op.getResult()),
+                            tangent.getType());
+    gutils->setDiffe(op.getResult(), rule.forward(tangent), builder);
+    return success();
+  }
+};
+
+struct AutoDiffCholeskyRev
+    : ReverseAutoDiffOpInterface::ExternalModel<AutoDiffCholeskyRev,
+                                                CholeskyOp> {
+  LogicalResult createReverseModeAdjoint(Operation *orig, OpBuilder &builder,
+                                         MGradientUtilsReverse *gutils,
+                                         SmallVector<Value> caches) const {
+    auto op = cast<CholeskyOp>(orig);
+    if (gutils->isConstantValue(op.getResult()))
+      return success();
+    if (failed(CholeskyDerivative::check(op)))
+      return failure();
+    Value cotangent = gutils->diffe(op.getResult(), builder);
+    gutils->zeroDiffe(op.getResult(), builder);
+    Value primal = gutils->popCache(caches[0], builder);
+    CholeskyDerivative rule(builder, op, primal, cotangent.getType());
+    if (!gutils->isConstantValue(op.getA()))
+      gutils->addToDiffe(op.getA(), rule.reverse(cotangent), builder);
+    return success();
+  }
+
+  SmallVector<Value> cacheValues(Operation *orig,
+                                 MGradientUtilsReverse *gutils) const {
+    auto op = cast<CholeskyOp>(orig);
+    if (gutils->isConstantValue(op.getResult()))
+      return {};
+    Operation *newOp = gutils->getNewFromOriginal(orig);
+    OpBuilder builder(newOp);
+    builder.setInsertionPointAfter(newOp);
+    return {gutils->initAndPushCache(gutils->getNewFromOriginal(op.getResult()),
+                                     builder)};
+  }
+
+  LogicalResult createShadowValues(Operation *op, OpBuilder &builder,
+                                   MGradientUtilsReverse *gutils) const {
+    return success();
+  }
+};
+
 struct AutoDiffBarrierFwd
     : AutoDiffOpInterface::ExternalModel<AutoDiffBarrierFwd,
                                          OptimizationBarrierOp> {
@@ -5795,6 +5968,8 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
     SortOp::attachInterface<ADDataFlowSortOp>(*context);
     OptimizationBarrierOp::attachInterface<
         ADDataFlowBarrierOp, AutoDiffBarrierFwd, AutoDiffBarrierRev>(*context);
+    CholeskyOp::attachInterface<AutoDiffCholeskyFwd, AutoDiffCholeskyRev>(
+        *context);
     ScatterOp::attachInterface<ADDataFlowScatterOp>(*context);
     ReduceOp::attachInterface<ADDataFlowReduceOp>(*context);
 
