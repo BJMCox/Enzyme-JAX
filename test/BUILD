@@ -102,6 +102,12 @@ py_test(
 )
 
 py_test(
+    name = "test_hlo_linalg_lowering",
+    srcs = ["test_hlo_linalg_lowering.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_slice",
     srcs = ["test_hlo_slice.py"],
     deps = TEST_DEPS,
