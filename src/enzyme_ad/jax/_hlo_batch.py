@@ -19,9 +19,9 @@ _ELEMENTWISE = frozenset(
     "shift_right_logical sign sine sqrt subtract tan tanh xor".split()
 )
 _SHAPED = frozenset(
-    "broadcast_in_dim concatenate constant dot_general dynamic_slice "
+    "broadcast_in_dim cholesky concatenate constant dot_general dynamic_slice "
     "dynamic_update_slice gather get_dimension_size iota optimization_barrier "
-    "pad reshape reverse slice transpose".split()
+    "pad reshape reverse slice transpose triangular_solve".split()
 )
 # CHLO unary operations preserve each lane's shape. Keep their native AD rules
 # instead of differentiating an expanded special-function approximation.

@@ -96,6 +96,12 @@ py_test(
 )
 
 py_test(
+    name = "test_hlo_linalg_batching",
+    srcs = ["test_hlo_linalg_batching.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_slice",
     srcs = ["test_hlo_slice.py"],
     deps = TEST_DEPS,
