@@ -29,6 +29,30 @@ def recurrence(parameter):
 
 
 class HLOLinearize(absltest.TestCase):
+    @absltest.skipUnless(HAS_EFFECT_QUERIES, "requires MLIR memory effect queries")
+    def test_broadcast_residuals_remain_compact(self):
+        parameters = jnp.array([0.2, -0.4, 0.7], dtype=jnp.float32)
+        points = jnp.arange(24, dtype=jnp.float32).reshape(8, 3) / 7
+
+        def function(parameters, points):
+            weights = jnp.broadcast_to(jnp.sin(parameters), points.shape)
+            return weights * points, weights
+
+        imported = import_hlo(function, parameters, points)
+        values, pullback = jax.vjp(
+            jax.jit(lambda x: tuple(imported(parameters, x))), points
+        )
+        expected = function(parameters, points)
+        for value, reference in zip(values, expected):
+            np.testing.assert_allclose(value, reference, rtol=2e-6)
+        seeds = (jnp.ones_like(points), jnp.full_like(points, 2))
+        for scale in (1, 3):
+            result = jax.jit(pullback)(tuple(seed * scale for seed in seeds))[0]
+            np.testing.assert_allclose(result, expected[1] * scale, rtol=2e-6)
+        retained = jax.make_jaxpr(pullback)(seeds).consts
+        # The original points remain available for higher derivatives.
+        self.assertLessEqual(sum(value.shape == points.shape for value in retained), 1)
+
     def test_materialized_pushforward_after_jit(self):
         x = jnp.linspace(-2, 3, 17)
         scale = jnp.float32(2)
