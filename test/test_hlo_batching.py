@@ -40,6 +40,50 @@ def weighted_polynomial(x, scale):
 
 
 class HloBatching(absltest.TestCase):
+    def test_shared_graph_and_outputs_keep_unmapped_inputs(self):
+        source = """
+        module {
+          func.func @main(%x: tensor<f32>, %scale: tensor<f32>)
+              -> (tensor<f32>, tensor<f32>) {
+            %factor = stablehlo.exponential %scale : tensor<f32>
+            %value = stablehlo.multiply %x, %factor : tensor<f32>
+            return %value, %factor : tensor<f32>, tensor<f32>
+          }
+        }
+        """
+        batch_hlo.cache_clear()
+        shared = batch_hlo(source, "", 3, mapped=(True, False))
+        varying = batch_hlo(source, "", 3, mapped=(False, True))
+        self.assertIsNotNone(shared)
+        self.assertIsNotNone(varying)
+        self.assertRegex(shared, r"stablehlo.exponential[^\n]*tensor<f32>")
+        self.assertRegex(varying, r"stablehlo.exponential[^\n]*tensor<3xf32>")
+        self.assertEqual(batch_hlo.cache_info().misses, 2)
+
+        imported = lambda x, s: tuple(hlo_call(x, s, source=source))
+        x = jnp.array([-2, 0.5, 3], dtype=jnp.float32)
+        scale = jnp.float32(0.2)
+        for axes, inputs in (((0, None), (x, scale)), ((None, 0), (scale, x))):
+            mapped = jax.jit(jax.vmap(imported, in_axes=axes))
+            expected = (
+                inputs[0] * np.exp(inputs[1]),
+                np.broadcast_to(np.exp(inputs[1]), (3,)),
+            )
+            for actual, reference in zip(mapped(*inputs), expected):
+                np.testing.assert_allclose(actual, reference, rtol=2e-6)
+
+        def total(x, s):
+            values, factors = jax.vmap(imported, in_axes=(0, None))(x, s)
+            return (values + factors).sum()
+
+        expected = np.exp(scale) * (np.sum(x) + len(x))
+        value, (gx, gs) = jax.jit(jax.value_and_grad(total, argnums=(0, 1)))(x, scale)
+        np.testing.assert_allclose(value, expected, rtol=2e-6)
+        np.testing.assert_allclose(gx, np.full(3, np.exp(scale)), rtol=2e-6)
+        np.testing.assert_allclose(gs, expected, rtol=2e-6)
+        second = jax.jit(jax.grad(jax.grad(total, argnums=1), argnums=1))(x, scale)
+        np.testing.assert_allclose(second, expected, rtol=2e-6)
+
     def test_chlo_lgamma_batches_forward_and_shared_gradient(self):
         source = """
         module {
