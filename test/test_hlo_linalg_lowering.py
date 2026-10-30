@@ -99,6 +99,60 @@ class HloLinalgLowering(absltest.TestCase):
             np.testing.assert_allclose(
                 jax.jit(function)(matrix, rhs), expected, rtol=3e-6, atol=3e-6
             )
+            mapped = jax.jit(jax.vmap(function, in_axes=(None, 0)))
+            batched_rhs = np.stack([rhs, 2 * rhs, -rhs])
+            compiled = mapped.lower(matrix, batched_rhs).compile()
+            np.testing.assert_allclose(
+                compiled(matrix, batched_rhs),
+                np.stack([expected, 2 * expected, -expected]),
+                rtol=3e-6,
+                atol=3e-6,
+            )
+            self.assertNotIn("c64[3,2,2]", compiled.as_text())
+
+    def test_solve_keeps_broadcast_matrix_axes(self):
+        source = """
+        module {
+          func.func @main(%a: tensor<2xf32>, %b: tensor<2x1xf32>)
+              -> tensor<2x1xf32> {
+            %matrix = stablehlo.broadcast_in_dim %a, dims = [1]
+                : (tensor<2xf32>) -> tensor<2x2xf32>
+            %y = "stablehlo.triangular_solve"(%matrix, %b) <{
+              left_side = true, lower = true, unit_diagonal = false,
+              transpose_a = #stablehlo<transpose NO_TRANSPOSE>
+            }> : (tensor<2x2xf32>, tensor<2x1xf32>) -> tensor<2x1xf32>
+            return %y : tensor<2x1xf32>
+          }
+        }
+        """
+        solve = jax.jit(lambda a, b: hlo_call(a, b, source=source)[0])
+        result = solve(np.array([2, 3], np.float32), np.array([[2], [8]], np.float32))
+        np.testing.assert_allclose(result, [[1], [2]], rtol=2e-6)
+
+    def test_nested_shared_solves_preserve_existing_matrix_batches(self):
+        source = """
+        module {
+          func.func @main(%a: tensor<2x2x2xf32>, %b: tensor<2x2x1xf32>)
+              -> tensor<2x2x1xf32> {
+            %y = "stablehlo.triangular_solve"(%a, %b) <{
+              left_side = true, lower = true, unit_diagonal = false,
+              transpose_a = #stablehlo<transpose NO_TRANSPOSE>
+            }> : (tensor<2x2x2xf32>, tensor<2x2x1xf32>) -> tensor<2x2x1xf32>
+            return %y : tensor<2x2x1xf32>
+          }
+        }
+        """
+        matrices = np.array([[[2, 0], [1, 3]], [[1, 0], [-0.5, 2]]], np.float32)
+        rhs = np.arange(60, dtype=np.float32).reshape(3, 5, 2, 2, 1) / 7 + 1
+        function = lambda a, b: hlo_call(a, b, source=source)[0]
+        mapped = jax.jit(
+            jax.vmap(jax.vmap(function, in_axes=(None, 0)), in_axes=(None, 0))
+        )
+        compiled = mapped.lower(matrices, rhs).compile()
+        np.testing.assert_allclose(
+            compiled(matrices, rhs), np.linalg.solve(matrices, rhs), rtol=2e-6
+        )
+        self.assertNotIn("f32[3,5,2,2,2]", compiled.as_text())
 
     def test_nested_call_and_loop(self):
         source = """

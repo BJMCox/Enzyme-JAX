@@ -1161,7 +1161,8 @@ def _lower_native_linalg(ctx, module):
 
     module.operation.walk(collect)
     for op in operations:
-        types = [ir.RankedTensorType(value.type) for value in op.operands]
+        operands = list(op.operands)
+        types = [ir.RankedTensorType(value.type) for value in operands]
         # Keep native lowering for types outside JAX's LAPACK/solver support.
         if any(
             not ty.has_static_shape
@@ -1192,6 +1193,31 @@ def _lower_native_linalg(ctx, module):
                 conjugate_a="ADJOINT" in transpose,
             )
             function = partial(lax.linalg.triangular_solve, **options)
+            # JAX folds mapped right-hand sides into the solve's free dimension
+            # when the matrix is shared. Recover that proof from leading broadcasts.
+            while isinstance(operands[0], ir.OpResult):
+                broadcast = operands[0].owner.operation
+                if broadcast.name != "stablehlo.broadcast_in_dim":
+                    break
+                source = broadcast.operands[0]
+                inner = ir.RankedTensorType(source.type)
+                outer = ir.RankedTensorType(operands[0].type)
+                added = len(outer.shape) - len(inner.shape)
+                dimensions = list(
+                    ir.DenseI64ArrayAttr(broadcast.attributes["broadcast_dimensions"])
+                )
+                if (
+                    added <= 0
+                    or len(inner.shape) < 2
+                    or not inner.has_static_shape
+                    or list(outer.shape[added:]) != list(inner.shape)
+                    or dimensions != list(range(added, len(outer.shape)))
+                ):
+                    break
+                operands[0] = source
+                for _ in range(added):
+                    function = jax.vmap(function, in_axes=(None, 0))
+            types = [ir.RankedTensorType(value.type) for value in operands]
         operation_ctx = ctx.replace(
             avals_in=[to_jax_type(ty) for ty in types],
             avals_out=[to_jax_type(ir.RankedTensorType(v.type)) for v in op.results],
@@ -1199,7 +1225,7 @@ def _lower_native_linalg(ctx, module):
         )
         with ir.InsertionPoint(op), op.location:
             replacement = jax_mlir.lower_fun(function, multiple_results=False)(
-                operation_ctx, *op.operands
+                operation_ctx, *operands
             )
         op.results[0].replace_all_uses_with(replacement[0])
         op.erase()
