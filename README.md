@@ -70,7 +70,7 @@ bazel build :wheel
 
 ### FlatPPL alpha wheels
 
-This fork packages `enzyme-ad==0.0.15+flatppl.11` for macOS ARM64 and
+This fork packages `enzyme-ad==0.0.15+flatppl.12` for macOS ARM64 and
 Linux x86-64 and ARM64. Wheels include the native library and use CPython ABI
 tags. Build each Python minor version separately.
 
@@ -78,6 +78,10 @@ The alpha wheels pin JAX and jaxlib 0.11.2. Imported StableHLO calls support
 `vmap`, including nested maps and derivatives. Supported pure tensor programs
 use Enzyme's native batching pass. Fixed scans keep a scalar time index and
 advance all batch lanes together. Values and pullbacks share forward residuals.
+
+Native float32/float64 Cholesky and triangular solves support differentiation and batching.
+JAX selects target kernels after differentiation. Shared inputs stay unbatched,
+and pullbacks retain compact broadcast operands.
 
 Unsupported operations, data-dependent loops, and explicit random state retain
 pointwise device maps. These preserve per-call behavior but can be slower than
