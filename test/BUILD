@@ -138,6 +138,22 @@ py_test(
 )
 
 py_test(
+    name = "test_wheel_resources",
+    srcs = ["wheel_resources.py"],
+    main = "wheel_resources.py",
+    args = [
+        "--wheel",
+        "$(location //:wheel)",
+        "--headers",
+        "$(locations @llvm-project//clang:builtin_headers_gen)",
+    ],
+    data = [
+        "//:wheel",
+        "@llvm-project//clang:builtin_headers_gen",
+    ],
+)
+
+py_test(
     name = "test_hlo_sharding",
     srcs = ["test_hlo_sharding.py"],
     env = {"JAX_NUM_CPU_DEVICES": "4"},

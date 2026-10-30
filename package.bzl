@@ -6,7 +6,11 @@ def _py_package_impl(ctx):
 
     filtered_files = []
 
-    # TODO: rewrite path
+    # Filegroups retain the owners of their individual generated outputs.
+    for dep in ctx.attr.deps:
+        if str(dep.label) in ctx.attr.packages:
+            filtered_files.extend(dep[DefaultInfo].files.to_list())
+
     for input_file in inputs.to_list():
         if str(input_file.owner) in ctx.attr.packages:
             filtered_files.append(input_file)
