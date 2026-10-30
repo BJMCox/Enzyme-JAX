@@ -1,6 +1,7 @@
 import itertools
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest
 
@@ -21,6 +22,19 @@ def imported_cholesky(dtype, lower, passes=None):
 
 
 class HloLinalgLowering(absltest.TestCase):
+    def test_linearized_forward_uses_target_lowering(self):
+        factor = imported_cholesky("f32", True)
+        score = lambda a: 2 * jnp.log(jnp.diag(factor(a))).sum()
+        matrix = np.array([[4, 1], [1, 9]], np.float32)
+        lowered = jax.jit(jax.value_and_grad(score)).lower(matrix)
+        value, gradient = lowered.compile()(matrix)
+        inverse = np.linalg.inv(matrix)
+        expected = np.tril(inverse) + np.tril(inverse, -1)
+        np.testing.assert_allclose(value, np.linalg.slogdet(matrix)[1], rtol=2e-6)
+        np.testing.assert_allclose(gradient, expected, rtol=2e-6, atol=2e-7)
+        if jax.default_backend() in ("cpu", "gpu"):
+            self.assertNotIn("stablehlo.cholesky", str(lowered.compiler_ir()))
+
     def test_cholesky_target_lowering_and_raw_import(self):
         for scalar, dtype, off_diagonal in (
             ("f32", np.float32, 0.7),

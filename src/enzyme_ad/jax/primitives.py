@@ -1686,7 +1686,8 @@ def primal_partial_eval(trace, *args, **kwargs):
                 | {
                     "source": source,
                     "out_shapes": shapes,
-                    "pipeline_options": JaXPipeline(),
+                    # The saved forward still needs normal import lowering.
+                    "pipeline_options": JaXPipeline(_HLO_IMPORT_PASSES),
                 },
             )
             count = len(kwargs["out_shapes"]) // 2
