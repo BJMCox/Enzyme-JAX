@@ -1372,13 +1372,18 @@ def _enzyme_batch(primitive, args, axes, **params):
             size,
             # Batching exposes new broadcast, gather, and reduction patterns.
             post_pipeline=optimization_passes(enable_loop_raising_passes=False),
+            # Pending AD interleaves primal/tangent operands. Its existing ABI
+            # stays fully batched until partial evaluation separates them.
+            mapped=None if pending_ad else tuple(axis is not None for axis in axes),
         )
         if source is not None:
             operands = tuple(
                 (
-                    jnp.broadcast_to(value, (size, *value.shape))
-                    if axis is None
-                    else jnp.moveaxis(value, axis, 0)
+                    jnp.moveaxis(value, axis, 0)
+                    if axis is not None
+                    else jnp.broadcast_to(value, (size, *value.shape))
+                    if pending_ad
+                    else value
                 )
                 for value, axis in zip(args, axes)
             )

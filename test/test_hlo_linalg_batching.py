@@ -4,6 +4,7 @@ import numpy as np
 from absl.testing import absltest
 
 from enzyme_ad.jax import hlo_call
+from enzyme_ad.jax._hlo_batch import batch_hlo
 
 SOURCE = """
 module {
@@ -20,6 +21,31 @@ module {
 
 
 class HloLinalgBatching(absltest.TestCase):
+    def test_shared_factorization_and_covariance_gradient(self):
+        source = batch_hlo(SOURCE, "", 3, mapped=(False, True))
+        self.assertIsNotNone(source)
+        self.assertRegex(source, r"stablehlo.cholesky[^\n]*tensor<2x2xf32>")
+        self.assertNotRegex(source, r"stablehlo.cholesky[^\n]*tensor<3x2x2xf32>")
+        rhs = jnp.arange(6, dtype=jnp.float32).reshape(3, 2, 1) / 3 + 1
+        parameters = jnp.array([2, 1, 3], dtype=jnp.float32)
+
+        def total(p):
+            factor = jnp.array([[p[0], 0], [p[1], p[2]]])
+            imported = lambda b: hlo_call(factor @ factor.T, b, source=SOURCE)[0]
+            return jax.vmap(imported)(rhs).sum()
+
+        a, b, c = np.asarray(parameters)
+        u, v = np.asarray(rhs).sum(axis=0)[:, 0]
+        expected_value = u / a + v / c - b * u / (a * c)
+        expected_gradient = [
+            -u / a**2 + b * u / (a**2 * c),
+            -u / (a * c),
+            -v / c**2 + b * u / (a * c**2),
+        ]
+        value, gradient = jax.jit(jax.value_and_grad(total))(parameters)
+        np.testing.assert_allclose(value, expected_value, rtol=2e-6)
+        np.testing.assert_allclose(gradient, expected_gradient, rtol=2e-6)
+
     def test_native_matrices_keep_tensor_batches(self):
         factors = np.array(
             [[[2, 0], [1, 3]], [[1, 0], [-0.5, 2]], [[3, 0], [0.2, 1]]],

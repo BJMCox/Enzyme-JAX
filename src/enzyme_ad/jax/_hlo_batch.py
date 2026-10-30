@@ -7,7 +7,7 @@ from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import func
 
 from . import enzyme_call
-from ._hlo_linearize import _external_values, _pure, _tensor, _walk
+from ._hlo_linearize import _external_values, _extract, _pure, _tensor, _walk
 
 # Unknown operations retain pointwise execution. In particular, batching an RNG
 # state is not equivalent to asking one RNG state for a larger output tensor.
@@ -72,16 +72,96 @@ def _batchable(op):
 
 
 @lru_cache(maxsize=32)
-def batch_hlo(source, pipeline, size, post_pipeline=""):
+def batch_hlo(source, pipeline, size, post_pipeline="", mapped=None):
     """Return a tensorized module, or None for the pointwise fallback."""
     try:
-        return _batch_hlo(source, pipeline, size, post_pipeline)
+        return _batch_hlo(source, pipeline, size, post_pipeline, mapped)
     except (ValueError, RuntimeError, ir.MLIRError):
         # Batching support must not narrow the imported program's scalar ABI.
         return None
 
 
-def _batch_hlo(source, pipeline, size, post_pipeline):
+def _shared_batch(function, mapped, size):
+    """Compute the pure graph independent of mapped inputs once per call."""
+    arguments = list(function.entry_block.arguments)
+    known = {v for v, varies in zip(arguments, mapped) if not varies}
+    shared, varying = [], []
+    for op in list(function.entry_block.operations)[:-1]:
+        if _external_values(op.operation) <= known:
+            shared.append(op)
+            known.update(op.results)
+        else:
+            varying.append(op)
+    returned = list(function.entry_block.operations[-1].operands)
+    used = set(returned)
+    for op in varying:
+        used.update(_external_values(op.operation))
+    # Reconstruct constants in the cell, preserving static scan bounds.
+    constants = [op for op in shared if op.operation.name == "stablehlo.constant"]
+    constant_values = {v for op in constants for v in op.results}
+    ordered = arguments + [v for op in shared for v in op.results]
+    needed = (known & used) - constant_values
+    frontier = [v for v in ordered if v in needed]
+    lane_inputs = [v for v, varies in zip(arguments, mapped) if varies]
+    module = ir.Module.parse(
+        _extract(lane_inputs + frontier, constants + varying, returned)
+    )
+    cell = module.body.operations[0]
+    cell.attributes["sym_name"] = ir.StringAttr.get("enzyme_batch_cell")
+    cell.attributes["sym_visibility"] = ir.StringAttr.get("private")
+
+    def batched(ty):
+        return ir.RankedTensorType.get((size, *ty.shape), ty.element_type)
+
+    with ir.InsertionPoint(module.body):
+        wrapper = func.FuncOp(
+            "main",
+            (
+                [
+                    batched(v.type) if varies else v.type
+                    for v, varies in zip(arguments, mapped)
+                ],
+                [batched(v.type) for v in returned],
+            ),
+        )
+        values = dict(zip(arguments, wrapper.add_entry_block().arguments))
+        with ir.InsertionPoint(wrapper.entry_block):
+            for op in shared:
+                clone = op.operation.clone()
+                for child in _walk(clone):
+                    for index, operand in enumerate(child.operands):
+                        if operand in values:
+                            child.operands[index] = values[operand]
+                values.update(zip(op.results, clone.results))
+            operands = [values[v] for v in lane_inputs]
+            for value in frontier:
+                operands.append(
+                    ir.Operation.create(
+                        "stablehlo.broadcast_in_dim",
+                        results=[batched(value.type)],
+                        operands=[values[value]],
+                        attributes={
+                            "broadcast_dimensions": ir.DenseI64ArrayAttr.get(
+                                list(range(1, len(value.type.shape) + 1))
+                            )
+                        },
+                    ).results[0]
+                )
+            call = ir.Operation.create(
+                "enzyme.batch",
+                results=[batched(v.type) for v in returned],
+                operands=operands,
+                attributes={
+                    "fn": ir.FlatSymbolRefAttr.get("enzyme_batch_cell"),
+                    "batch_shape": ir.DenseI64ArrayAttr.get([size]),
+                },
+            )
+            func.ReturnOp(call.results)
+    module.operation.verify()
+    return str(module)
+
+
+def _batch_hlo(source, pipeline, size, post_pipeline, mapped):
     if not size:
         return None
     passes = pipeline + "," if pipeline else ""
@@ -101,33 +181,39 @@ def _batch_hlo(source, pipeline, size, post_pipeline):
         inputs, outputs = list(original.type.inputs), list(original.type.results)
         if not all(_tensor(ty) for ty in inputs + outputs):
             return None
-        names = {f.attributes["sym_name"].value for f in module.body.operations}
-        cell = "enzyme_batch_cell"
-        while cell in names:
-            cell += "_"
-        ir.SymbolTable.replace_all_symbol_uses(name, cell, module.operation)
-        original.attributes["sym_name"] = ir.StringAttr.get(cell)
-        original.attributes["sym_visibility"] = ir.StringAttr.get("private")
+        if mapped is not None and len(mapped) != len(inputs):
+            return None
+        if mapped is not None and not all(mapped):
+            batched_source = _shared_batch(original, mapped, size)
+        else:
+            names = {f.attributes["sym_name"].value for f in module.body.operations}
+            cell = "enzyme_batch_cell"
+            while cell in names:
+                cell += "_"
+            ir.SymbolTable.replace_all_symbol_uses(name, cell, module.operation)
+            original.attributes["sym_name"] = ir.StringAttr.get(cell)
+            original.attributes["sym_visibility"] = ir.StringAttr.get("private")
 
-        def batched(ty):
-            return ir.RankedTensorType.get((size, *ty.shape), ty.element_type)
+            def batched(ty):
+                return ir.RankedTensorType.get((size, *ty.shape), ty.element_type)
 
-        with ir.InsertionPoint(module.body):
-            wrapper = func.FuncOp(
-                "main", ([batched(t) for t in inputs], [batched(t) for t in outputs])
-            )
-            with ir.InsertionPoint(wrapper.add_entry_block()):
-                call = ir.Operation.create(
-                    "enzyme.batch",
-                    results=[batched(t) for t in outputs],
-                    operands=list(wrapper.entry_block.arguments),
-                    attributes={
-                        "fn": ir.FlatSymbolRefAttr.get(cell),
-                        "batch_shape": ir.DenseI64ArrayAttr.get([size]),
-                    },
+            with ir.InsertionPoint(module.body):
+                wrapper = func.FuncOp(
+                    "main",
+                    ([batched(t) for t in inputs], [batched(t) for t in outputs]),
                 )
-                func.ReturnOp(call.results)
-        batched_source = str(module)
+                with ir.InsertionPoint(wrapper.add_entry_block()):
+                    call = ir.Operation.create(
+                        "enzyme.batch",
+                        results=[batched(t) for t in outputs],
+                        operands=list(wrapper.entry_block.arguments),
+                        attributes={
+                            "fn": ir.FlatSymbolRefAttr.get(cell),
+                            "batch_shape": ir.DenseI64ArrayAttr.get([size]),
+                        },
+                    )
+                    func.ReturnOp(call.results)
+            batched_source = str(module)
     name, result = enzyme_call.run_pass_pipeline(
         [],
         batched_source,
