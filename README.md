@@ -41,7 +41,7 @@ state. Reverse mode reads the next row, or the final forward state for the last
 step, avoiding reconstruction of the recurrence.
 
 This optimization requires MLIR memory-effect queries in JAX's Python bindings
-(tested with JAX/jaxlib 0.11.2). Older bindings, effectful programs, retained module
+(tested with JAX/jaxlib 0.12.0.1). Older bindings, effectful programs, retained module
 symbols and unsupported joint derivatives keep the existing differentiation path.
 Symbolically inactive output cotangents also keep the activity-specific path.
 The optimization currently applies to raw StableHLO calls, not callable sources
@@ -74,7 +74,7 @@ This fork packages `enzyme-ad==0.0.15+flatppl.12` for macOS ARM64 and
 Linux x86-64 and ARM64. Wheels include the native library and use CPython ABI
 tags. Build each Python minor version separately.
 
-The alpha wheels pin JAX and jaxlib 0.11.2. Imported StableHLO calls support
+The alpha wheels pin JAX and jaxlib 0.12.0.1. Imported StableHLO calls support
 `vmap`, including nested maps and derivatives. Supported pure tensor programs
 use Enzyme's native batching pass. Fixed scans keep a scalar time index and
 advance all batch lanes together. Values and pullbacks share forward residuals.
