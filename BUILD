@@ -190,8 +190,8 @@ py_wheel(
     python_tag = "cp" + HERMETIC_PYTHON_VERSION.replace(".", ""),
     requires = [
         "absl_py >= 2.0.0",
-        "jax == 0.11.2",
-        "jaxlib == 0.11.2",
+        "jax == 0.12.0.1",
+        "jaxlib == 0.12.0.1",
     ],
     strip_path_prefixes = ["src/"],
     summary = "Enzyme automatic differentiation tool.",
