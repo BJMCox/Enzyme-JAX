@@ -280,3 +280,18 @@ func.func @max_of_large_splats() -> (tensor<i64>, tensor<1048576xi64>) {
 // CHECK-NEXT:    %1 = stablehlo.maximum %c, %c_0 : tensor<i64>
 // CHECK-NEXT:    return %1, %0 : tensor<i64>, tensor<1048576xi64>
 // CHECK-NEXT:  }
+
+// A float sum adds pairwise. In sequence, each 1.0 added to 2^24 rounds
+// back to 2^24 and the first row folds to 16777216; pairwise, the ones meet
+// first and it folds to 16777222 (0x4B800003).
+func.func @pairwise_sum() -> tensor<2xf32> {
+  %c = stablehlo.constant dense<[[16777216.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]]> : tensor<2x8xf32>
+  %init = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+  %0 = stablehlo.reduce(%c init: %init) applies stablehlo.add across dimensions = [1] : (tensor<2x8xf32>, tensor<f32>) -> tensor<2xf32>
+  return %0 : tensor<2xf32>
+}
+
+// CHECK:  func.func @pairwise_sum() -> tensor<2xf32> {
+// CHECK-NEXT:    %cst = stablehlo.constant dense<[0x4B800003, 3.600000e+01]> : tensor<2xf32>
+// CHECK-NEXT:    return %cst : tensor<2xf32>
+// CHECK-NEXT:  }

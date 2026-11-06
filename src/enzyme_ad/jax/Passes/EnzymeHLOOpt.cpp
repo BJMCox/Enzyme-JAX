@@ -20914,6 +20914,17 @@ struct ReduceConstProp final
     return acc < v ? v : acc;
   }
 
+  // the sum of the non-empty `t`, adding neighbours level by level
+  static APFloat pairwiseSum(MutableArrayRef<APFloat> t) {
+    for (size_t n = t.size(); n > 1; n = (n + 1) / 2) {
+      for (size_t k = 0; k < n / 2; ++k)
+        t[k] = t[2 * k] + t[2 * k + 1];
+      if (n % 2)
+        t[n / 2] = t[n - 1];
+    }
+    return t[0];
+  }
+
   // the splat value v folded into init over count elements
   static APInt splat(Operation &fold, IntegerType ty, const APInt &init,
                      const APInt &v, int64_t count) {
@@ -21308,6 +21319,18 @@ struct ReduceConstProp final
       if (input.isSplat()) {
         result = DenseElementsAttr::get(
             outTy, splat(fold, seed, input.getSplatValue<APFloat>(), count));
+      } else if (isa<stablehlo::AddOp>(fold) && count > 1) {
+        // Summed in sequence, the rounding error grows with the number of
+        // terms, well beyond that of the reduce it replaces; summed pairwise
+        // it grows with the logarithm.
+        SmallVector<SmallVector<APFloat>> terms(outTy.getNumElements());
+        int64_t i = 0;
+        for (const APFloat &v : input.getValues<APFloat>())
+          terms[outputIndex(i++, shape, reduced)].push_back(v);
+        SmallVector<APFloat> acc;
+        for (auto &t : terms)
+          acc.push_back(seed + pairwiseSum(t));
+        result = DenseElementsAttr::get(outTy, acc);
       } else {
         SmallVector<APFloat> acc(outTy.getNumElements(), seed);
         int64_t i = 0;
