@@ -262,7 +262,7 @@ def ApplyRoundConstProp : EnzymeHLOOptionalParameterPatternOp<
     "round_const_prop">{
   let patterns = ["UnaryConstProp<stablehlo::RoundOp,stablehlo::roundOp>"];
 }
-def ApplyRoundNearestEvenConstProp : EnzymeHLOPatternOp<
+def ApplyRoundNearestEvenConstProp : EnzymeHLOOptionalParameterPatternOp<
     "round_nearest_even_const_prop">{
   let patterns = [
     "UnaryConstProp<stablehlo::RoundNearestEvenOp,stablehlo::roundNearestEvenOp>"
@@ -280,11 +280,43 @@ def ApplyTanConstProp : EnzymeHLOOptionalParameterPatternOp<
     "tan_const_prop">{
   let patterns = ["UnaryConstProp<stablehlo::TanOp,stablehlo::tanOp>"];
 }
+def ApplyAcosConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "acos_const_prop">{
+  let patterns = ["UnaryConstProp<chlo::AcosOp,acosOp>"];
+}
+def ApplyAcoshConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "acosh_const_prop">{
+  let patterns = ["UnaryConstProp<chlo::AcoshOp,acoshOp>"];
+}
+def ApplyAsinConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "asin_const_prop">{
+  let patterns = ["UnaryConstProp<chlo::AsinOp,asinOp>"];
+}
+def ApplyAsinhConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "asinh_const_prop">{
+  let patterns = ["UnaryConstProp<chlo::AsinhOp,asinhOp>"];
+}
+def ApplyAtanConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "atan_const_prop">{
+  let patterns = ["UnaryConstProp<chlo::AtanOp,atanOp>"];
+}
+def ApplyAtanhConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "atanh_const_prop">{
+  let patterns = ["UnaryConstProp<chlo::AtanhOp,atanhOp>"];
+}
+def ApplyCoshConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "cosh_const_prop">{
+  let patterns = ["UnaryConstProp<chlo::CoshOp,coshOp>"];
+}
+def ApplySinhConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "sinh_const_prop">{
+  let patterns = ["UnaryConstProp<chlo::SinhOp,sinhOp>"];
+}
 def ApplyReluConstProp : EnzymeHLOOptionalParameterPatternOp<
     "relu_const_prop">{
   let patterns = ["UnaryConstProp<enzymexla::ReluOp,reluOp>"];
 }
-def ApplyGeluConstProp : EnzymeHLOPatternOp<
+def ApplyGeluConstProp : EnzymeHLOOptionalParameterPatternOp<
     "gelu_const_prop">{
   let patterns = ["GeluConstProp"];
 }
@@ -303,6 +335,18 @@ def ApplyBinomialProgressConstProp : EnzymeHLOPatternOp<
 def ApplySoftplusConstProp : EnzymeHLOOptionalParameterPatternOp<
     "softplus_const_prop"> {
   let patterns = ["UnaryConstProp<enzymexla::SoftplusOp,softplusOp>"];
+}
+def ApplyEluConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "elu_const_prop"> {
+  let patterns = ["EluConstProp"];
+}
+def ApplySeluConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "selu_const_prop"> {
+  let patterns = ["UnaryConstProp<enzymexla::SeluOp,seluOp>"];
+}
+def ApplyCeluConstProp : EnzymeHLOOptionalParameterPatternOp<
+    "celu_const_prop"> {
+  let patterns = ["CeluConstProp"];
 }
 def SignAbsSimplifyPatterns : EnzymeHLOPatternOp<
     "sign_abs_simplify"> {
@@ -645,6 +689,10 @@ def ApplyConcatReshapeReducePatterns : EnzymeHLOPatternOp<
 def ApplyConcatElementwisePatterns : EnzymeHLOPatternOp<
     "concat_elementwise"> {
   let patterns = ["ConcatElementwise"];
+}
+def ApplyConcatElementwiseSlicePatterns : EnzymeHLOPatternOp<
+    "concat_elementwise_slice"> {
+  let patterns = ["ConcatElementwiseSlice"];
 }
 
 def ApplyConcatReshapeElementwisePatterns : EnzymeHLOPatternOp<
@@ -1995,6 +2043,11 @@ def ApplyGatherOfBroadcastBatchingDimsPatterns : EnzymeHLOPatternOp<
   let patterns = ["GatherOfBroadcastBatchingDims"];
 }
 
+def ApplyGatherOfBroadcastIndexedDimsPatterns : EnzymeHLOPatternOp<
+    "gather_of_broadcast_indexed_dims"> {
+  let patterns = ["GatherOfBroadcastIndexedDims"];
+}
+
 def ApplyReduceTransposeSimplifyPatterns : EnzymeHLOPatternOp<
     "reduce_transpose_simplify"> {
   let patterns = ["ReduceTransposeSimplify"];
@@ -3031,6 +3084,13 @@ def ApplySplitConvolutionIntoReverseConvolution : EnzymeHLOPatternOp<
   "split_convolution_into_reverse_convolution"> {
   let patterns = [
     "SplitConvolutionIntoReverseConvolution"
+  ];
+}
+
+def ApplyConvolutionLhsDilationSwap : EnzymeHLOPatternOp<
+  "convolution_lhs_dilation_swap"> {
+  let patterns = [
+    "ConvolutionLhsDilationSwap"
   ];
 }
 

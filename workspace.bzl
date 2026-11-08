@@ -1,7 +1,7 @@
-JAX_COMMIT = "81ac75636c20014dde4ec79a5c15bb172319d9b5"
+JAX_COMMIT = "bfd185d06481ed9b94a1b79011845d50414ec4e5"
 JAX_SHA256 = ""
 
-ENZYME_COMMIT = "2922ff278865782e3ce665876873f6d4316abe7d"
+ENZYME_COMMIT = "8b7eae13d15f96b419f705eda9eebba3522fa01e"
 ENZYME_SHA256 = ""
 
 ML_TOOLCHAIN_COMMIT = "30ef4a9096f9490e8f198faa5ce5bbddd1b72fdb"
@@ -29,6 +29,9 @@ XLA_PATCHES = [
     # spell it either way depending on how the distribution was reached.
     sed -i.bak1 "s|cxx_builtin_include_directories = _LOCAL_CLANG.include_directories,|cxx_builtin_include_directories = _LOCAL_CLANG.include_directories + [\\\"%package(@local_config_rocm//rocm)%/rocm_dist/lib/llvm/lib/clang/22/include\\\", \\\"%{hipcc_resource_dir}\\\", \\\"%{hipcc_resource_dir_realpath}\\\"],|" third_party/gpus/crosstool/BUILD.rocm.tpl
     perl -0777 -pi -e 's|(tpl_paths\\["crosstool:BUILD.rocm"\\],)|$1\\n        {"%{hipcc_resource_dir}": str(repository_ctx.path("rocm/rocm_dist/lib/llvm/lib/clang/22/include")), "%{hipcc_resource_dir_realpath}": str(repository_ctx.path("rocm/rocm_dist/lib/llvm/lib/clang/22/include").realpath)},|' third_party/gpus/rocm_configure.bzl
+    """,
+    """
+    sed -i.bak0 "s/#include \\"xla\\/mosaic\\/dialect\\/tpu\\/tpu_enums.h.inc/#undef ARG_MAX\\n#include \\"xla\\/mosaic\\/dialect\\/tpu\\/tpu_enums.h.inc/g" xla/mosaic/dialect/tpu/tpu_dialect.h
     """,
     """
     # Fix support for musl stacktrace issue where execinfo.h is otherwise included

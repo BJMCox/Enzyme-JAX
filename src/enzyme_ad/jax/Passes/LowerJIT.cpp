@@ -13,19 +13,42 @@
 
 #include "src/enzyme_ad/jax/Dialect/Ops.h"
 
+#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+#include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
+#include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
+#include "mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h"
+#include "mlir/Conversion/NVVMToLLVM/NVVMToLLVM.h"
+#include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/SCFToOpenMP/SCFToOpenMP.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
+#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/GPU/Pipelines/Passes.h"
+#include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassOptions.h"
+#include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/Passes.h"
+
 #include "src/enzyme_ad/jax/Passes/EnzymeHLOPatterns.h"
 #include "src/enzyme_ad/jax/Utils.h"
+
 #include "stablehlo/dialect/ChloOps.h"
 #include "stablehlo/dialect/StablehloOps.h"
-
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
@@ -39,8 +62,7 @@
 #include "llvm/ExecutionEngine/Orc/TargetProcess/RegisterEHFrames.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
-
-#include "mlir/Target/LLVMIR/Export.h"
+#include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "lower-jit"
 
@@ -636,36 +658,22 @@ struct LowerJITPass
         hasSideEffectAttr = rewriter.getBoolAttr(!isMemoryEffectFree(op));
       }
 
-      Operation *replacement;
-      if (usesStream)
-        replacement = stablehlo::CustomCallOp::create(
-            rewriter, op.getLoc(), op.getResultTypes(), op.getInputs(),
-            hasReturn
-                ? rewriter.getStringAttr("enzymexla_compile_gpu_with_error")
-                : rewriter.getStringAttr("enzymexla_compile_gpu"),
-            /* has_side_effect*/ hasSideEffectAttr,
-            /*backend_config*/ dattr,
-            /* api_version*/
-            CustomCallApiVersionAttr::get(
-                rewriter.getContext(),
-                mlir::stablehlo::CustomCallApiVersion::API_VERSION_TYPED_FFI),
-            /*calledcomputations*/ nullptr, operand_layouts, result_layouts,
-            output_operand_aliases, /*result_tilings*/ nullptr);
-      else
-        replacement = stablehlo::CustomCallOp::create(
-            rewriter, op.getLoc(), op.getResultTypes(), op.getInputs(),
-            hasReturn
-                ? rewriter.getStringAttr("enzymexla_compile_cpu_with_error")
-                : rewriter.getStringAttr("enzymexla_compile_cpu"),
-            /* has_side_effect*/ hasSideEffectAttr,
-            /*backend_config*/ backendstr,
-            /* api_version*/
-            CustomCallApiVersionAttr::get(
-                rewriter.getContext(),
-                mlir::stablehlo::CustomCallApiVersion::
-                    API_VERSION_STATUS_RETURNING_UNIFIED),
-            /*calledcomputations*/ nullptr, operand_layouts, result_layouts,
-            output_operand_aliases, /*result_tilings*/ nullptr);
+      StringRef target = usesStream
+                             ? (hasReturn ? "enzymexla_compile_gpu_with_error"
+                                          : "enzymexla_compile_gpu")
+                             : (hasReturn ? "enzymexla_compile_cpu_with_error"
+                                          : "enzymexla_compile_cpu");
+      Operation *replacement = stablehlo::CustomCallOp::create(
+          rewriter, op.getLoc(), op.getResultTypes(), op.getInputs(),
+          rewriter.getStringAttr(target),
+          /* has_side_effect*/ hasSideEffectAttr,
+          /*backend_config*/ dattr,
+          /* api_version*/
+          CustomCallApiVersionAttr::get(
+              rewriter.getContext(),
+              mlir::stablehlo::CustomCallApiVersion::API_VERSION_TYPED_FFI),
+          /*calledcomputations*/ nullptr, operand_layouts, result_layouts,
+          output_operand_aliases, /*result_tilings*/ nullptr);
 
       op.replaceAllUsesWith(replacement);
       op.erase();

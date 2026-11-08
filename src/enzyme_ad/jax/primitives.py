@@ -1476,7 +1476,9 @@ def enzyme_jvp(arg_primals, arg_tangents, **kwargs):
             if idx in in_idx_map:
                 avals[len(args)] = in_idx_map[idx]
             args.append(v)
-            if type(s) is ad.Zero:
+            # Integer and boolean inputs have only float0 tangents, so they are
+            # constant even when JAX passes an instantiated tangent.
+            if type(s) is ad.Zero or not jnp.issubdtype(v.dtype, jnp.inexact):
                 act_tup.append("enzyme_const")
             else:
                 act_tup.append("enzyme_dup")
