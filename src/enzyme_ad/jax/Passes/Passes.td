@@ -152,6 +152,19 @@ def TensorEmptyOpRaisingPass : Pass<"tensor-empty-raise"> {
   ];
 }
 
+def LowerChloGammaF32Pass : Pass<"lower-chlo-gamma-f32"> {
+  let summary = "Lower float32 chlo.lgamma and chlo.digamma to accurate StableHLO";
+  let description = [{
+    Rewrites float32 chlo.lgamma with the JAX 0.12 float32 algorithm and
+    float32 chlo.digamma with a root-anchored minimax rewrite. Run it after
+    differentiation, because the result has no derivative rule of its own.
+  }];
+  let dependentDialects = [
+    "stablehlo::StablehloDialect",
+    "chlo::ChloDialect"
+  ];
+}
+
 def KernelCastPass : Pass<"kernelcast", "func::FuncOp"> {
   let summary = "Cast GPU kernel floating point type based on enzymexla.float_type attribute";
   let dependentDialects = [
