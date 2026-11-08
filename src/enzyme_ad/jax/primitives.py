@@ -715,15 +715,21 @@ def _enzyme_primal_lowering(
             for f in mod.regions[0].blocks[0]:
                 fns.append(f.sym_name.value)
 
+            # lower-chlo-gamma-f32 runs after AD on every path, including calls
+            # without passes, so a value and its gradient use the same lgamma.
             if len(pass_pipeline) > 0:
                 pass_pipeline = (
-                    pass_pipeline + ",tensor-empty-raise,drop-unsupported-attributes"
+                    pass_pipeline
+                    + ",tensor-empty-raise,lower-chlo-gamma-f32,drop-unsupported-attributes"
                 )
+                run_pipeline = pass_pipeline
+            else:
+                run_pipeline = "lower-chlo-gamma-f32"
 
             try:
-                name, nmod = enzyme_call.run_pass_pipeline(fns, source, pass_pipeline)
+                name, nmod = enzyme_call.run_pass_pipeline(fns, source, run_pipeline)
             except Exception as e:
-                filename = _dump_mlir_to_file(source, pass_pipeline)
+                filename = _dump_mlir_to_file(source, run_pipeline)
                 logging.exception("Enzyme MLIR dumped to %s", filename)
                 raise e
 
