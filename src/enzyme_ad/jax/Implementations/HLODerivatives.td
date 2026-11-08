@@ -1140,7 +1140,7 @@ def : HLODerivative<"DivOp", (Op $x, $y),
                       (CheckedDiv (DiffeRet), $y),
                       (Neg (CheckedMul (CheckedDiv (DiffeRet), $y), (Div $x, $y)))
                     ],
-                    (CheckedDiv (Sub (SelectIfActive $x, (Mul (Shadow $x), $y), (HLOConstantFP<"0">)), (SelectIfActive $y, (Mul (Shadow $y), $x), (HLOConstantFP<"0">))), (Mul $y, $y))
+                    (CheckedDiv (Sub (SelectIfActive $x, (Shadow $x), (HLOConstantFP<"0">)), (SelectIfActive $y, (CheckedMul (Shadow $y), (Div $x, $y)), (HLOConstantFP<"0">))), $y)
                   >;
 
 def DotGeneralBatchedResultType : GlobalExpr</*needsprimal*/0, /*needsshadow*/0, [{
@@ -1259,10 +1259,10 @@ def : HLODerivative<"AbsOp", (Op $x),
                         (CheckedMul (DiffeRet), (Div (Real $x), (Abs $x))),
                         (Neg (CheckedMul (DiffeRet), (Div (Imag $x), (Abs $x))))
                       ),
-                      (Select (Compare $x, (HLOConstantFP<"0"> (Shadow $x)), (GE)), (DiffeRet), (Neg (DiffeRet))))
+                      (Select (Compare $x, (HLOConstantFP<"0"> $x), (GE)), (DiffeRet), (Neg (DiffeRet))))
                   ], (SelectIfComplex $x,
                       (Div (Real (Mul (Shadow $x), (Conj $x))), (Abs $x)),
-                      (Select (Compare $x, (HLOConstantFP<"0"> (Shadow $x)), (GE)), (Shadow $x), (Neg (Shadow $x)))
+                      (Select (Compare $x, (HLOConstantFP<"0"> $x), (GE)), (Shadow $x), (Neg (Shadow $x)))
                     )>;
 
 def : HLODerivative<"RealOp", (Op $x),

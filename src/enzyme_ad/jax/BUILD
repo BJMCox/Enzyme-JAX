@@ -1,5 +1,7 @@
 load("@jax//jaxlib:symlink_files.bzl", "symlink_inputs")
 load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library", "td_library")
+load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
+load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:py_library.bzl", "py_library")
@@ -91,22 +93,14 @@ cc_library(
     name = "gpu",
     srcs = ["gpu.cc"],
     copts = ["-Wno-vla-cxx-extension"],
-    deps = [
-        "@xla//xla/ffi:execution_state",
-        "@xla//xla/ffi:ffi_api",
-        "@xla//xla/ffi/api:c_api_internal",
-        "@xla//xla/ffi/api:ffi",
-        "@xla//xla/stream_executor:stream",
-    ],
+    deps = ["@xla//xla/ffi/api:ffi"],
 )
 
 cc_library(
     name = "cpu",
     srcs = ["cpu.cc"],
-    deps = [
-        "@xla//xla/service:custom_call_status",
-        "@xla//xla/service:custom_call_target_registry",
-    ],
+    copts = ["-Wno-vla-cxx-extension"],
+    deps = ["@xla//xla/ffi/api:ffi"],
 )
 
 cc_library(
@@ -121,6 +115,9 @@ cc_library(
             "xla_ffi/host/register.cc",
             "xla_ffi/host/throw_error.cc",
             "xla_ffi/register.cc",
+            "xla_ffi/rocm/register.cc",
+            "xla_ffi/rocm/runtime_symbols.cc",
+            "xla_ffi/rocm/throw_error.cc",
         ],
     hdrs =
         [
@@ -128,11 +125,9 @@ cc_library(
         ] + glob([
             "xla_ffi/host/**/*.h",
             "xla_ffi/cuda/**/*.h",
+            "xla_ffi/rocm/**/*.h",
         ]),
-    copts = select({
-        "@local_config_cuda//:is_cuda_enabled": ["-DENZYMEJAX_CUDA=1"],
-        "//conditions:default": [],
-    }),
+    copts = if_cuda(["-DENZYMEJAX_CUDA=1"]) + if_rocm(["-DENZYMEJAX_ROCM=1"]),
     visibility = ["//visibility:public"],
     deps = [
         ":EnzymeXLADialect",
@@ -153,16 +148,19 @@ cc_library(
     ] + select({
         "@xla//xla/tsl:windows": [],
         "//conditions:default": ["@mpitrampoline"],
-    }) + select({
-        "@local_config_cuda//:is_cuda_enabled": [
-            "@jax//jaxlib:ffi_helpers",
-            "@jax//jaxlib/cuda:cuda_blas_handle_pool",
-            "@local_config_cuda//cuda:cuda_headers",
-            "@xla//xla/tsl/cuda:cublas",
-            "@xla//xla/tsl/cuda:cudart",
-        ],
-        "//conditions:default": [],
-    }),
+    }) + if_cuda([
+        "@jax//jaxlib:ffi_helpers",
+        "@jax//jaxlib/cuda:cuda_blas_handle_pool",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@xla//xla/tsl/cuda:cublas",
+        "@xla//xla/tsl/cuda:cudart",
+    ]) + if_rocm([
+        "@local_config_rocm//rocm:hip",
+        "@local_config_rocm//rocm:rocm_headers",
+    ]),
+    # registerEnzymeJaXXLAFFI is only looked up by name at runtime, so keep the
+    # registration objects when linking into a shared library.
+    alwayslink = True,
 )
 
 cc_library(
@@ -1167,6 +1165,95 @@ cc_test(
 )
 
 td_library(
+    name = "MosaicExtDialectTdFiles",
+    srcs = [
+        "Dialect/MosaicExt/Dialect.td",
+        "Dialect/MosaicExt/Ops.td",
+    ],
+    deps = [
+        "@llvm-project//mlir:BuiltinDialectTdFiles",
+        "@llvm-project//mlir:CallOpInterfaces",
+        "@llvm-project//mlir:ControlFlowInterfacesTdFiles",
+        "@llvm-project//mlir:FunctionInterfacesTdFiles",
+        "@llvm-project//mlir:InferTypeOpInterfaceTdFiles",
+        "@llvm-project//mlir:OpBaseTdFiles",
+        "@llvm-project//mlir:SideEffectInterfacesTdFiles",
+    ],
+)
+
+gentbl_cc_library(
+    name = "MosaicExtDialectIncGen",
+    tbl_outs = [
+        (
+            [
+                "-gen-dialect-decls",
+                "-dialect=enzymexla_mosaic_ext",
+            ],
+            "Dialect/MosaicExt/MosaicExtDialect.h.inc",
+        ),
+        (
+            [
+                "-gen-dialect-defs",
+                "-dialect=enzymexla_mosaic_ext",
+            ],
+            "Dialect/MosaicExt/MosaicExtDialect.cpp.inc",
+        ),
+    ],
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "Dialect/MosaicExt/Dialect.td",
+    deps = [
+        ":MosaicExtDialectTdFiles",
+    ],
+)
+
+gentbl_cc_library(
+    name = "MosaicExtOpsIncGen",
+    tbl_outs = [
+        (
+            ["-gen-op-decls"],
+            "Dialect/MosaicExt/MosaicExtOps.h.inc",
+        ),
+        (
+            ["-gen-op-defs"],
+            "Dialect/MosaicExt/MosaicExtOps.cpp.inc",
+        ),
+    ],
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "Dialect/MosaicExt/Ops.td",
+    deps = [
+        ":MosaicExtDialectTdFiles",
+    ],
+)
+
+cc_library(
+    name = "MosaicExtDialect",
+    srcs = [
+        "Dialect/MosaicExt/Dialect.cpp",
+        "Dialect/MosaicExt/Ops.cpp",
+    ],
+    hdrs = [
+        "Dialect/MosaicExt/Dialect.h",
+        "Dialect/MosaicExt/Ops.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":EnzymeXLACanonicalizers",
+        ":EnzymeXLADialectUtils",
+        ":MosaicExtDialectIncGen",
+        ":MosaicExtOpsIncGen",
+        "@llvm-project//mlir:CallOpInterfaces",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:MemRefDialect",
+        "@llvm-project//mlir:SideEffectInterfaces",
+        "@llvm-project//mlir:VectorDialect",
+        "@stablehlo//:stablehlo_ops",
+        "@xla//xla/mosaic:tpu_dialect",
+    ],
+)
+
+td_library(
     name = "TritonExtDialectTdFiles",
     srcs = [
         "Dialect/TritonExt/Dialect.td",
@@ -1249,6 +1336,92 @@ cc_library(
         "@llvm-project//mlir:SideEffectInterfaces",
         "@stablehlo//:stablehlo_ops",
         "@triton//:TritonDialects",
+    ],
+)
+
+td_library(
+    name = "CudaTileExtDialectTdFiles",
+    srcs = [
+        "Dialect/CudaTileExt/Dialect.td",
+        "Dialect/CudaTileExt/Ops.td",
+    ],
+    deps = [
+        "@llvm-project//mlir:BuiltinDialectTdFiles",
+        "@llvm-project//mlir:CallOpInterfaces",
+        "@llvm-project//mlir:ControlFlowInterfacesTdFiles",
+        "@llvm-project//mlir:FunctionInterfacesTdFiles",
+        "@llvm-project//mlir:InferTypeOpInterfaceTdFiles",
+        "@llvm-project//mlir:OpBaseTdFiles",
+        "@llvm-project//mlir:SideEffectInterfacesTdFiles",
+    ],
+)
+
+gentbl_cc_library(
+    name = "CudaTileExtDialectIncGen",
+    tbl_outs = [
+        (
+            [
+                "-gen-dialect-decls",
+                "-dialect=enzymexla_ct_ext",
+            ],
+            "Dialect/CudaTileExt/CudaTileExtDialect.h.inc",
+        ),
+        (
+            [
+                "-gen-dialect-defs",
+                "-dialect=enzymexla_ct_ext",
+            ],
+            "Dialect/CudaTileExt/CudaTileExtDialect.cpp.inc",
+        ),
+    ],
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "Dialect/CudaTileExt/Dialect.td",
+    deps = [
+        ":CudaTileExtDialectTdFiles",
+    ],
+)
+
+gentbl_cc_library(
+    name = "CudaTileExtOpsIncGen",
+    tbl_outs = [
+        (
+            ["-gen-op-decls"],
+            "Dialect/CudaTileExt/CudaTileExtOps.h.inc",
+        ),
+        (
+            ["-gen-op-defs"],
+            "Dialect/CudaTileExt/CudaTileExtOps.cpp.inc",
+        ),
+    ],
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "Dialect/CudaTileExt/Ops.td",
+    deps = [
+        ":CudaTileExtDialectTdFiles",
+    ],
+)
+
+cc_library(
+    name = "CudaTileExtDialect",
+    srcs = [
+        "Dialect/CudaTileExt/Dialect.cpp",
+        "Dialect/CudaTileExt/Ops.cpp",
+    ],
+    hdrs = [
+        "Dialect/CudaTileExt/Dialect.h",
+        "Dialect/CudaTileExt/Ops.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":CudaTileExtDialectIncGen",
+        ":CudaTileExtOpsIncGen",
+        ":EnzymeXLACanonicalizers",
+        ":EnzymeXLADialectUtils",
+        "@cuda_tile//:CudaTileDialect",
+        "@llvm-project//mlir:CallOpInterfaces",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:SideEffectInterfaces",
+        "@stablehlo//:stablehlo_ops",
     ],
 )
 
@@ -1428,6 +1601,7 @@ cc_library(
         "@triton//:TritonToTritonGPUPasses",
         "@xla//xla/mlir/utils:type_util",
         "@xla//xla/mlir_hlo",
+        "@xla//xla/mosaic:tpu_dialect",
         "@zlib",
     ],
 )
@@ -1478,6 +1652,7 @@ cc_library(
     deps = [
         ":CheckedRewrite",
         ":CommPassesIncGen",
+        ":CudaTileExtDialect",
         ":DistributedDialectIncGen",
         ":DistributedOpsIncGen",
         ":DistributedTypesIncGen",
@@ -1488,6 +1663,7 @@ cc_library(
         ":EnzymeXLAOpsIncGen",
         ":EnzymeXLAPassesIncGen",
         ":LowerEnzymeXLAMathPatternsIncGen",
+        ":MosaicExtDialect",
         ":Polymer",
         ":RaisingTransformOps",
         ":RaisingTransformOpsImplIncGen",
@@ -1578,6 +1754,7 @@ cc_library(
         "@llvm-project//mlir:MemRefTransforms",
         "@llvm-project//mlir:MemRefUtils",
         "@llvm-project//mlir:MemorySlotInterfaces",
+        "@llvm-project//mlir:MemorySlotUtils",
         "@llvm-project//mlir:NVGPUDialect",
         "@llvm-project//mlir:NVGPUToNVVM",
         "@llvm-project//mlir:NVVMDialect",
@@ -1626,6 +1803,7 @@ cc_library(
     ] + if_triton_passes + [
         "@xla//xla/mlir/utils:type_util",
         "@xla//xla/mlir_hlo",
+        "@xla//xla/mosaic:tpu_dialect",
         "@zlib",
     ] + if_z3,
 )
@@ -1643,6 +1821,7 @@ cc_library(
     deps = [
                ":TransformOps",
                ":XLADerivatives",
+               ":CudaTileExtDialect",
                ":TritonExtDialect",
                ":EnzymeXLAPassesIncGen",
                "@com_google_protobuf//:protobuf",
@@ -1702,6 +1881,8 @@ cc_library(
                "@llvm-project//mlir:ControlFlowDialect",
                "@llvm-project//mlir:DLTIDialect",
                "@llvm-project//mlir:GPUDialect",
+               "@llvm-project//mlir:GPUNVVMTransforms",
+               "@llvm-project//mlir:GPUROCDLTransforms",
                "@llvm-project//mlir:GPUTransforms",
                "@llvm-project//mlir:NVVMDialect",
                "@llvm-project//mlir:ROCDLDialect",
@@ -1738,7 +1919,9 @@ cc_library(
         "@enzyme//:LLVMExtDialect",
 
         # Mosaic
-        # "@jax//jaxlib/mosaic:tpu_dialect",
+        ":MosaicExtDialect",
+        "@xla//xla/mosaic:tpu_dialect",
+        "@xla//xla/mosaic:tpu_serde_pass",
 
         # SHLO
         "@stablehlo//:stablehlo_ops",
@@ -1879,8 +2062,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
 
         # Mosaic
-        # Upstream is broken, re-enable when working
-        # "@jax//jaxlib/mosaic:tpu_dialect",
+        "@xla//xla/mosaic:tpu_dialect",
     ],
 )
 
@@ -2026,13 +2208,17 @@ cc_library(
         ":PerfifyPassesIncGen",
         ":PerfifyTypesIncGen",
         "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:AffineDialect",
         "@llvm-project//mlir:ArithDialect",
         "@llvm-project//mlir:BytecodeOpInterface",
         "@llvm-project//mlir:FuncDialect",
         "@llvm-project//mlir:FunctionInterfaces",
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:LLVMDialect",
+        "@llvm-project//mlir:LoopLikeInterface",
         "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:SCFDialect",
+        "@stablehlo//:stablehlo_ops",
         "@z3//:z3_static",
     ],
 )

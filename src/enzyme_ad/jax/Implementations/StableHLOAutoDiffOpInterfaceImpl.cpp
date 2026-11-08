@@ -25,6 +25,8 @@
 
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/Interfaces/MemorySlotInterfaces.h"
+#include "mlir/Interfaces/Utils/MemorySlotUtils.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/RegionUtils.h"
 
@@ -263,7 +265,7 @@ bool hasSameOperandAndResultTypes(Operation &op) {
          llvm::all_of(op.getResultTypes(), typeMatch);
 }
 
-static bool isEligibleForCompactPrint(ReduceOp op) {
+template <typename OpTy> static bool isEligibleForCompactPrint(OpTy op) {
   // Check E1.
   auto &block = op.getBody().front();
   if (!hasSingleElement(block.without_terminator()))
@@ -485,13 +487,14 @@ public:
   }
 };
 
-static void eraseReductionShadows(ReduceOp op, MGradientUtils *gutils) {
+template <typename OpTy>
+static void eraseReductionShadows(OpTy op, MGradientUtils *gutils) {
   auto result = op.getBody().front().front().getResult(0);
   if (auto shadow = gutils->invertedPointers.lookupOrNull(result)) {
     gutils->invertedPointers.erase(result);
     gutils->erase(shadow.getDefiningOp());
   }
-  auto primal = cast<ReduceOp>(gutils->getNewFromOriginal(op.getOperation()));
+  auto primal = cast<OpTy>(gutils->getNewFromOriginal(op.getOperation()));
   BitVector toErase(primal.getBody().front().getNumArguments());
   for (auto argument : op.getBody().front().getArguments())
     if (auto shadow = gutils->invertedPointers.lookupOrNull(argument)) {
@@ -548,25 +551,30 @@ public:
           resultPositionsToShadow);
     }
 
-    if (isa<MulOp>(innerOp) &&
-        ((red.getDimensions().empty() &&
-          cast<RankedTensorType>(red.getInputs()[0].getType()).hasStaticShape()) ||
-         (hasStaticIdentityProduct(red) &&
-          gutils->isConstantValue(red.getInitValues()[0])))) {
-      Value input = red.getInputs()[0];
-      Value tangent = gutils->isConstantValue(input)
-                          ? makeZero(builder, orig->getLoc(),
-                                     gutils->getShadowType(input.getType()))
-                          : gutils->invertPointerM(input, builder);
-      if (!red.getDimensions().empty()) {
-        ProductReductionTree tree(red, gutils->getNewFromOriginal(input), builder);
-        tangent = tree.forward(tangent, gutils->width);
+    // Product reductions are a ReduceOp rule; reduce_window keeps the generic path.
+    if constexpr (std::is_same_v<OpTy, ReduceOp>) {
+      if (isa<MulOp>(innerOp) &&
+          ((red.getDimensions().empty() &&
+            cast<RankedTensorType>(red.getInputs()[0].getType())
+                .hasStaticShape()) ||
+           (hasStaticIdentityProduct(red) &&
+            gutils->isConstantValue(red.getInitValues()[0])))) {
+        Value input = red.getInputs()[0];
+        Value tangent = gutils->isConstantValue(input)
+                            ? makeZero(builder, orig->getLoc(),
+                                       gutils->getShadowType(input.getType()))
+                            : gutils->invertPointerM(input, builder);
+        if (!red.getDimensions().empty()) {
+          ProductReductionTree tree(red, gutils->getNewFromOriginal(input),
+                                    builder);
+          tangent = tree.forward(tangent, gutils->width);
+        }
+        eraseReductionShadows(red, gutils);
+        if (!gutils->isConstantValue(red.getResult(0)))
+          gutils->setDiffe(red.getResult(0), tangent, builder);
+        gutils->eraseIfUnused(orig);
+        return success();
       }
-      eraseReductionShadows(red, gutils);
-      if (!gutils->isConstantValue(red.getResult(0)))
-        gutils->setDiffe(red.getResult(0), tangent, builder);
-      gutils->eraseIfUnused(orig);
-      return success();
     }
 
     if (!isa<AddOp>(innerOp)) {
@@ -577,14 +585,24 @@ public:
 
     IRMapping map;
     for (auto &operand : orig->getOpOperands()) {
+      bool isInitVal = operand.getOperandNumber() >=
+                       red.getInitValues().getBeginOperandIndex();
       if (!gutils->isConstantValue(operand.get())) {
+        if (gutils->width > 1 && isInitVal) {
+          orig->emitError()
+              << "Unsupported non-constant init arg to batched reduce forward "
+                 "handler(opidx="
+              << operand.getOperandNumber() << ", op=" << operand.get()
+              << ")\n";
+          return failure();
+        }
         map.map(operand.get(), gutils->invertPointerM(operand.get(), builder));
         continue;
       }
       if (auto iface =
               dyn_cast<AutoDiffTypeInterface>(operand.get().getType())) {
         if (!iface.isMutable()) {
-          Type retTy = iface.getShadowType();
+          Type retTy = iface.getShadowType(isInitVal ? 1 : gutils->width);
           auto toret = cast<AutoDiffTypeInterface>(retTy).createNullValue(
               builder, operand.get().getLoc());
           map.map(operand.get(), toret);
@@ -625,19 +643,64 @@ public:
     eraseReductionShadows(red, gutils);
 
     if (gutils->width > 1) { // batched forward mode
-      auto dimsAttr =
-          dyn_cast<DenseI64ArrayAttr>(shadow->getAttr("dimensions"));
-      if (!dimsAttr) {
-        shadow->emitError("Missing 'dimensions' attribute on ReduceOp");
-        return failure();
+      if constexpr (std::is_same_v<OpTy, ReduceOp>) {
+        auto dimsAttr =
+            dyn_cast<DenseI64ArrayAttr>(shadow->getAttr("dimensions"));
+        if (!dimsAttr) {
+          shadow->emitError("Missing 'dimensions' attribute on ReduceOp");
+          return failure();
+        }
+
+        SmallVector<int64_t> dims;
+        for (int64_t d : dimsAttr.asArrayRef())
+          dims.push_back(d + 1);
+
+        shadow->setAttr("dimensions",
+                        DenseI64ArrayAttr::get(builder.getContext(), dims));
+      } else if constexpr (std::is_same_v<OpTy, ReduceWindowOp>) {
+        auto shadowRW = cast<ReduceWindowOp>(shadow);
+        SmallVector<int64_t> windowDims = {1};
+        windowDims.append(shadowRW.getWindowDimensions().begin(),
+                          shadowRW.getWindowDimensions().end());
+        shadowRW.setWindowDimensionsAttr(
+            builder.getDenseI64ArrayAttr(windowDims));
+
+        if (shadowRW.getWindowStrides()) {
+          SmallVector<int64_t> windowStrides = {1};
+          windowStrides.append(shadowRW.getWindowStrides()->begin(),
+                               shadowRW.getWindowStrides()->end());
+          shadowRW.setWindowStridesAttr(
+              builder.getDenseI64ArrayAttr(windowStrides));
+        }
+
+        if (shadowRW.getBaseDilations()) {
+          SmallVector<int64_t> baseDilations = {1};
+          baseDilations.append(shadowRW.getBaseDilations()->begin(),
+                               shadowRW.getBaseDilations()->end());
+          shadowRW.setBaseDilationsAttr(
+              builder.getDenseI64ArrayAttr(baseDilations));
+        }
+
+        if (shadowRW.getWindowDilations()) {
+          SmallVector<int64_t> windowDilations = {1};
+          windowDilations.append(shadowRW.getWindowDilations()->begin(),
+                                 shadowRW.getWindowDilations()->end());
+          shadowRW.setWindowDilationsAttr(
+              builder.getDenseI64ArrayAttr(windowDilations));
+        }
+
+        if (shadowRW.getPadding()) {
+          auto paddingOriginal =
+              llvm::to_vector(shadowRW.getPadding()->getValues<int64_t>());
+          auto paddingType = RankedTensorType::get(
+              {static_cast<int64_t>(1 + paddingOriginal.size() / 2), 2},
+              builder.getI64Type());
+          SmallVector<int64_t> newPadding = {0, 0};
+          newPadding.append(paddingOriginal.begin(), paddingOriginal.end());
+          shadowRW.setPaddingAttr(
+              mlir::DenseIntElementsAttr::get(paddingType, newPadding));
+        }
       }
-
-      SmallVector<int64_t> dims;
-      for (int64_t d : dimsAttr.asArrayRef())
-        dims.push_back(d + 1);
-
-      shadow->setAttr("dimensions",
-                      DenseI64ArrayAttr::get(builder.getContext(), dims));
     }
 
     size_t shadowCnt = 0;
@@ -957,6 +1020,35 @@ class AutoDiffWhileRev
         for (Operation &nested : block)
           forgetNestedBlockArgs(&nested, mapping);
       }
+  }
+
+  // forceAugmentedReturns gives each block nested in the augmented body of
+  // `orig` a shadow argument after each active mutable argument (e.g. the
+  // buffers of a jit_region). Checkpointing copies that body into primal-only
+  // recompute loops and erases it before any reverse rule gets to use the
+  // shadows, so the copies would keep arguments nothing provides. Drop them up
+  // front; reverse rules visiting the replayed body re-create what they need.
+  static void dropNestedShadowArgs(Operation *orig,
+                                   MGradientUtilsReverse *gutils) {
+    orig->walk([&](Block *blk) {
+      Block *nblk = gutils->getNewFromOriginal(blk);
+      if (nblk->getNumArguments() == blk->getNumArguments())
+        return;
+      for (BlockArgument val : llvm::reverse(blk->getArguments())) {
+        if (gutils->isConstantValue(val))
+          continue;
+        auto iface = dyn_cast<AutoDiffTypeInterface>(val.getType());
+        if (!iface || !iface.isMutable())
+          continue;
+        unsigned pos = cast<BlockArgument>(gutils->getNewFromOriginal(val))
+                           .getArgNumber() +
+                       1;
+        if (!nblk->getArgument(pos).use_empty())
+          continue;
+        nblk->eraseArgument(pos);
+        gutils->invertedPointers.erase(val);
+      }
+    });
   }
 
   // arr[index:index+1, :, :, :] = val
@@ -1352,13 +1444,17 @@ public:
                                  MGradientUtilsReverse *gutils, Block *origBody,
                                  Block *revOuterBody,
                                  ArrayRef<bool> operandsActive) {
+    auto isMutable = [](Value val) {
+      return cast<AutoDiffTypeInterface>(val.getType()).isMutable();
+    };
+
     for (auto arg : origBody->getArguments())
-      if (!gutils->isConstantValue(arg))
+      if (!gutils->isConstantValue(arg) && !isMutable(arg))
         gutils->zeroDiffe(arg, builder);
 
     for (auto &it : origBody->getOperations())
       for (auto res : it.getResults())
-        if (!gutils->isConstantValue(res))
+        if (!gutils->isConstantValue(res) && !isMutable(res))
           gutils->zeroDiffe(res, builder);
   }
 
@@ -1734,6 +1830,9 @@ public:
       for (auto &it : oBB->getOperations()) {
         for (auto res : it.getResults()) {
           if (!gutils->isConstantValue(res)) {
+            auto iface = cast<AutoDiffTypeInterface>(res.getType());
+            if (iface.isMutable())
+              continue;
             gutils->zeroDiffe(res, bodyBuilder);
           }
         }
@@ -1813,6 +1912,7 @@ public:
 
         if (needsCheckpointing(whileOp) ||
             needsBinomialCheckpointing(whileOp)) {
+          dropNestedShadowArgs(orig, gutils);
           Operation *scope = newWhile->getParentOp();
           if (auto caches = markScaffoldLoops(
                   scope, [&] { return tryCacheValues(whileOp, orig, gutils); }))
@@ -3016,13 +3116,14 @@ struct ADDataFlowWhileOp
   }
 };
 
+template <typename OpTy>
 struct ADDataFlowReduceOp
-    : public ADDataFlowOpInterface::ExternalModel<ADDataFlowReduceOp,
-                                                  ReduceOp> {
+    : public ADDataFlowOpInterface::ExternalModel<ADDataFlowReduceOp<OpTy>,
+                                                  OpTy> {
 
   SmallVector<Value> getPotentialIncomingValuesRes(Operation *op,
                                                    mlir::OpResult v) const {
-    auto srt = cast<ReduceOp>(op);
+    auto srt = cast<OpTy>(op);
     auto resvals = cast<ReturnOp>(op->getRegion(0).front().back());
     return {
         srt.getInputs()[v.getResultNumber()],
@@ -3032,7 +3133,7 @@ struct ADDataFlowReduceOp
   }
   SmallVector<Value>
   getPotentialIncomingValuesArg(Operation *op, mlir::BlockArgument v) const {
-    auto srt = cast<ReduceOp>(op);
+    auto srt = cast<OpTy>(op);
     auto resvals = cast<ReturnOp>(op->getRegion(0).front().back());
     if (v.getArgNumber() < srt.getInitValues().size())
       return {srt.getInitValues()[v.getArgNumber()],
@@ -3044,11 +3145,12 @@ struct ADDataFlowReduceOp
   }
   SmallVector<Value> getPotentialTerminatorUsers(Operation *op, Operation *term,
                                                  Value v) const {
-    auto srt = cast<ReduceOp>(op);
+    auto srt = cast<OpTy>(op);
     SmallVector<Value> sv;
     for (size_t i = 0; i < srt.getInputs().size(); i++) {
       if (term->getOperands()[i] == v) {
         sv.push_back(srt.getResults()[i]);
+        sv.push_back(op->getRegion(0).front().getArguments()[i]);
         sv.push_back(op->getRegion(0)
                          .front()
                          .getArguments()[srt.getInitValues().size() + i]);
@@ -3987,8 +4089,13 @@ public:
     for (auto &it : *body) {
       Operation *op = &it;
 
-      if (auto setOp = dyn_cast<enzyme::SetOp>(op))
+      if (auto setOp = dyn_cast<enzyme::SetOp>(op)) {
+        if (auto initOp = setOp.getGradient().getDefiningOp<enzyme::InitOp>()) {
+          if (op->isProperAncestor(initOp))
+            continue;
+        }
         updatedGradients.insert(setOp.getGradient());
+      }
 
       if (auto pushOp = dyn_cast<enzyme::PushOp>(op)) {
         CacheInfo info(pushOp.getCache());
@@ -4884,6 +4991,143 @@ struct CaseOpEnzymeOpsRemover
   }
 };
 
+class TokenTypeInterface
+    : public AutoDiffTypeInterface::ExternalModel<TokenTypeInterface,
+                                                  stablehlo::TokenType> {
+public:
+  Attribute createNullAttr(Type self) const { return {}; }
+
+  Value createNullValue(Type self, OpBuilder &builder, Location loc) const {
+    return stablehlo::AfterAllOp::create(builder, loc, ValueRange());
+  }
+
+  Value createAddOp(Type self, OpBuilder &builder, Location loc, Value a,
+                    Value b) const {
+    llvm_unreachable("tokens are never accumulated");
+  }
+
+  Value createConjOp(Type self, OpBuilder &builder, Location loc,
+                     Value a) const {
+    return a;
+  }
+
+  Type getShadowType(Type self, int64_t width) const {
+    assert(width == 1 && "tokens cannot be batched");
+    return self;
+  }
+
+  bool isMutable(Type self) const { return false; }
+
+  LogicalResult zeroInPlace(Type self, OpBuilder &builder, Location loc,
+                            Value val) const {
+    return failure();
+  }
+
+  bool isZero(Type self, Value val) const { return false; }
+  bool isZeroAttr(Type self, Attribute attr) const { return false; }
+};
+
+static bool isHLOValueType(Type type) {
+  return isa<RankedTensorType, stablehlo::TokenType>(type);
+}
+
+struct WhileOpPromotableRegion
+    : public PromotableRegionOpInterface::ExternalModel<WhileOpPromotableRegion,
+                                                        WhileOp> {
+  bool isRegionPromotable(Operation *op, const MemorySlot &slot, Region *region,
+                          bool hasValueStores) const {
+    if (!hasValueStores)
+      return true;
+
+    return region == &cast<WhileOp>(op).getBody() &&
+           isHLOValueType(slot.valueType);
+  }
+
+  void setupPromotion(
+      Operation *op, const MemorySlot &slot, Value reachingDef,
+      bool hasValueStores,
+      llvm::SmallMapVector<Region *, Value, 2> &regionsToProcess) const {
+    auto whileOp = cast<WhileOp>(op);
+    Region &condRegion = whileOp.getCond();
+    Region &bodyRegion = whileOp.getBody();
+    if (!hasValueStores) {
+      regionsToProcess.insert({&condRegion, reachingDef});
+      regionsToProcess.insert({&bodyRegion, reachingDef});
+      return;
+    }
+
+    whileOp.getOperandMutable().append(reachingDef);
+
+    condRegion.addArgument(slot.valueType, slot.ptr.getLoc());
+    regionsToProcess.insert({&condRegion, condRegion.getArguments().back()});
+
+    bodyRegion.addArgument(slot.valueType, slot.ptr.getLoc());
+    regionsToProcess.insert({&bodyRegion, bodyRegion.getArguments().back()});
+  }
+
+  Value
+  finalizePromotion(Operation *op, const MemorySlot &slot, Value reachingDef,
+                    bool hasValueStores,
+                    const llvm::DenseMap<Block *, Value> &reachingAtBlockEnd,
+                    OpBuilder &builder) const {
+    if (!hasValueStores)
+      return reachingDef;
+
+    auto whileOp = cast<WhileOp>(op);
+    Region &bodyRegion = whileOp.getBody();
+    memoryslot::updateTerminator(&bodyRegion.front(),
+                                 bodyRegion.getArguments().back(),
+                                 reachingAtBlockEnd);
+
+    SmallVector<Type> resultTypes(op->getResultTypes());
+    resultTypes.push_back(slot.valueType);
+
+    IRRewriter rewriter(builder);
+    Operation *newOp =
+        memoryslot::replaceWithNewResults(rewriter, op, resultTypes);
+    return newOp->getResults().back();
+  }
+};
+
+template <typename OpTy>
+struct BranchOpPromotableRegion
+    : public PromotableRegionOpInterface::ExternalModel<
+          BranchOpPromotableRegion<OpTy>, OpTy> {
+  bool isRegionPromotable(Operation *op, const MemorySlot &slot, Region *region,
+                          bool hasValueStores) const {
+    return !hasValueStores || isHLOValueType(slot.valueType);
+  }
+
+  void setupPromotion(
+      Operation *op, const MemorySlot &slot, Value reachingDef,
+      bool hasValueStores,
+      llvm::SmallMapVector<Region *, Value, 2> &regionsToProcess) const {
+    for (Region &region : op->getRegions())
+      regionsToProcess.insert({&region, reachingDef});
+  }
+
+  Value
+  finalizePromotion(Operation *op, const MemorySlot &slot, Value reachingDef,
+                    bool hasValueStores,
+                    const llvm::DenseMap<Block *, Value> &reachingAtBlockEnd,
+                    OpBuilder &builder) const {
+    if (!hasValueStores)
+      return reachingDef;
+
+    for (Region &region : op->getRegions())
+      memoryslot::updateTerminator(&region.front(), reachingDef,
+                                   reachingAtBlockEnd);
+
+    SmallVector<Type> resultTypes(op->getResultTypes());
+    resultTypes.push_back(slot.valueType);
+
+    IRRewriter rewriter(builder);
+    Operation *newOp =
+        memoryslot::replaceWithNewResults(rewriter, op, resultTypes);
+    return newOp->getResults().back();
+  }
+};
+
 struct SHLOReduceOpBatchInterface
     : public BatchOpInterface::ExternalModel<SHLOReduceOpBatchInterface,
                                              ReduceOp> {
@@ -5272,45 +5516,6 @@ struct SHLOSliceOpBatchInterface
   }
 };
 
-// Returns true if `batched` provably holds the same value in every batch
-// element, i.e. it was produced by broadcasting an unbatched value along the
-// batch dimensions (which is what the batching machinery emits for operands
-// that are invariant across the batch), or it is a splat constant.
-//
-// When every start index of a dynamic_slice/dynamic_update_slice is batch
-// invariant we can keep using a single dynamic_slice/dynamic_update_slice on
-// the batched operand. Otherwise the op has to be lowered to a gather/scatter,
-// since one (update-)slice cannot express a different offset per batch element.
-static bool isBatchInvariant(Value batched, ArrayRef<int64_t> batchSizes,
-                             DenseMap<Value, bool> &known) {
-  if (auto found = known.find(batched); found != known.end())
-    return found->second;
-  SplatElementsAttr splat;
-  if (matchPattern(batched, m_Constant(&splat)))
-    return true;
-
-  auto bcast = batched.getDefiningOp<stablehlo::BroadcastInDimOp>();
-  if (!bcast) {
-    auto *op = batched.getDefiningOp();
-    // Reverse scans index tapes with expressions such as N - 1 - i. These
-    // remain uniform when i is the broadcast view of a scalar loop counter.
-    bool uniform = op && isa<AddOp, SubtractOp, MulOp, NegOp, ConvertOp>(op) &&
-                   llvm::all_of(op->getOperands(), [&](Value operand) {
-                     return isBatchInvariant(operand, batchSizes, known);
-                   });
-    known[batched] = uniform;
-    return uniform;
-  }
-
-  // `broadcast_dimensions` maps operand dimensions onto result dimensions. If
-  // no batch dimension is mapped onto, every batch dimension is an expanded
-  // (broadcast) dimension and the value does not vary across the batch.
-  for (int64_t dim : bcast.getBroadcastDimensions())
-    if (dim < (int64_t)batchSizes.size())
-      return false;
-  return true;
-}
-
 static bool allStartIndicesBatchInvariant(Operation::operand_range startIndices,
                                           IRMapping &mapper,
                                           ArrayRef<int64_t> batchSizes) {
@@ -5504,23 +5709,10 @@ SmallVector<Value> computeBatchedStartIndices(Operation *op, OpBuilder &builder,
   for (int64_t i = 0; i < batchSizes.size(); i++)
     newStartIndices.push_back(zeroStart);
 
-  SmallVector<int64_t> innerSliceStarts, innerSliceLimits, innerSliceStrides;
-  for (int64_t i = 0; i < batchSizes.size(); i++) {
-    innerSliceStarts.push_back(0);
-    innerSliceLimits.push_back(1);
-    innerSliceStrides.push_back(1);
-  }
-
-  for (auto sIndex : startIndices) {
-    // We need to slice and extract a single element
-    auto newStartIndex = stablehlo::SliceOp::create(
-        builder, op->getLoc(), mapper.lookup(sIndex), innerSliceStarts,
-        innerSliceLimits, innerSliceStrides);
-    auto newStartIndexReshape = stablehlo::ReshapeOp::create(
-        builder, op->getLoc(), RankedTensorType::get({}, startIndicesElemType),
-        newStartIndex);
-    newStartIndices.push_back(newStartIndexReshape.getResult());
-  }
+  for (auto sIndex : startIndices)
+    newStartIndices.push_back(getFirstBatchElement(
+        builder, op->getLoc(), mapper.lookup(sIndex),
+        RankedTensorType::get({}, startIndicesElemType), batchSizes));
 
   return newStartIndices;
 }
@@ -5994,6 +6186,13 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
     stablehlo::IfOp::attachInterface<IfOpEnzymeOpsRemover>(*context);
     stablehlo::CaseOp::attachInterface<CaseOpEnzymeOpsRemover>(*context);
 
+    stablehlo::TokenType::attachInterface<TokenTypeInterface>(*context);
+    WhileOp::attachInterface<WhileOpPromotableRegion>(*context);
+    stablehlo::IfOp::attachInterface<BranchOpPromotableRegion<stablehlo::IfOp>>(
+        *context);
+    stablehlo::CaseOp::attachInterface<
+        BranchOpPromotableRegion<stablehlo::CaseOp>>(*context);
+
     WhileOp::attachInterface<ADDataFlowWhileOp>(*context);
     SortOp::attachInterface<ADDataFlowSortOp>(*context);
     OptimizationBarrierOp::attachInterface<
@@ -6001,7 +6200,9 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
     CholeskyOp::attachInterface<AutoDiffCholeskyFwd, AutoDiffCholeskyRev>(
         *context);
     ScatterOp::attachInterface<ADDataFlowScatterOp>(*context);
-    ReduceOp::attachInterface<ADDataFlowReduceOp>(*context);
+    ReduceOp::attachInterface<ADDataFlowReduceOp<ReduceOp>>(*context);
+    ReduceWindowOp::attachInterface<ADDataFlowReduceOp<ReduceWindowOp>>(
+        *context);
 
     ScatterOp::attachInterface<ScatterActivity>(*context);
     ConvertOp::attachInterface<ConvertActivity>(*context);
@@ -6011,6 +6212,8 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
     ReturnOp::attachInterface<AutoDiffHLOReturn>(*context);
 
     ReduceOp::attachInterface<AutoDiffReduceFwd<ReduceOp>>(*context);
+    ReduceWindowOp::attachInterface<AutoDiffReduceFwd<ReduceWindowOp>>(
+        *context);
     stablehlo::IfOp::attachInterface<AutoDiffIfRev>(*context);
     stablehlo::IfOp::attachInterface<AutoDiffIfFwd>(*context);
     stablehlo::IfOp::attachInterface<AutoDiffIfCF>(*context);
@@ -6024,6 +6227,7 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
     WhileOp::attachInterface<AutoDiffWhileFwd>(*context);
     WhileOp::attachInterface<AutoDiffWhileRev>(*context);
     ReduceOp::attachInterface<AutoDiffReduceCF<ReduceOp>>(*context);
+    ReduceWindowOp::attachInterface<AutoDiffReduceCF<ReduceWindowOp>>(*context);
     WhileOp::attachInterface<AutoDiffReduceCF<WhileOp>>(*context);
     BroadcastInDimOp::attachInterface<AutoDiffBroadcastInDimRev>(*context);
     stablehlo::SliceOp::attachInterface<AutoDiffSliceRev>(*context);

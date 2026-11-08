@@ -10,9 +10,12 @@
 #include "src/enzyme_ad/jax/Implementations/WhileLoopInfo.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
 
 using namespace mlir;
@@ -45,6 +48,60 @@ inline mlir::TensorType applyBatchSizes(mlir::Type Ty,
   shape.append(T.getShape().begin(), T.getShape().end());
   auto T2 = T.clone(shape);
   return T2;
+}
+
+// Returns true if `batched` provably holds the same value in every batch
+// element. `known` memoizes the answer per value, so a deep elementwise DAG,
+// such as the index tape of a reverse scan, is visited once per node.
+inline bool isBatchInvariant(Value batched, ArrayRef<int64_t> batchSizes,
+                             llvm::DenseMap<Value, bool> &known) {
+  if (auto found = known.find(batched); found != known.end())
+    return found->second;
+
+  SplatElementsAttr splat;
+  if (matchPattern(batched, m_Constant(&splat)))
+    return known[batched] = true;
+
+  Operation *def = batched.getDefiningOp();
+  if (def && def->hasTrait<OpTrait::Elementwise>() &&
+      def->getNumResults() == 1 && isMemoryEffectFree(def)) {
+    bool uniform = llvm::all_of(def->getOperands(), [&](Value operand) {
+      return isBatchInvariant(operand, batchSizes, known);
+    });
+    return known[batched] = uniform;
+  }
+
+  auto bcast = dyn_cast_or_null<stablehlo::BroadcastInDimOp>(def);
+  if (!bcast)
+    return known[batched] = false;
+
+  // `broadcast_dimensions` maps operand dimensions onto result dimensions. If
+  // no batch dimension is mapped onto, every batch dimension is an expanded
+  // (broadcast) dimension and the value does not vary across the batch.
+  for (int64_t dim : bcast.getBroadcastDimensions())
+    if (dim < (int64_t)batchSizes.size())
+      return known[batched] = false;
+  return known[batched] = true;
+}
+
+inline bool isBatchInvariant(Value batched, ArrayRef<int64_t> batchSizes) {
+  llvm::DenseMap<Value, bool> known;
+  return isBatchInvariant(batched, batchSizes, known);
+}
+
+// Returns the first element along the batch dimensions of `batched`, as a
+// value of type `ty`. This is the value held by every batch element if
+// `batched` is batch invariant.
+inline Value getFirstBatchElement(OpBuilder &builder, Location loc,
+                                  Value batched, RankedTensorType ty,
+                                  ArrayRef<int64_t> batchSizes) {
+  SmallVector<int64_t> starts(batchSizes.size() + ty.getRank(), 0);
+  SmallVector<int64_t> limits(batchSizes.size(), 1);
+  llvm::append_range(limits, ty.getShape());
+  SmallVector<int64_t> strides(starts.size(), 1);
+  auto slice = stablehlo::SliceOp::create(builder, loc, batched, starts, limits,
+                                          strides);
+  return stablehlo::ReshapeOp::create(builder, loc, ty, slice);
 }
 
 inline void getAllReferences(SmallVector<Value> &refs, Operation *op,

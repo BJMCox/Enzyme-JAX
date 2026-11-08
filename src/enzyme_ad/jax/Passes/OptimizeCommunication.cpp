@@ -26,6 +26,7 @@
 
 #include "src/enzyme_ad/jax/Utils.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <algorithm>
@@ -2208,7 +2209,8 @@ struct RotateSpmdOptimize : public OpRewritePattern<enzymexla::RotateOp> {
       rewriter.replaceUsesWithIf(ccall.getOperands()[0], neutral,
                                  [&](OpOperand &use) {
                                    Operation *user = use.getOwner();
-                                   if (!domInfo.properlyDominates(ccall, user))
+                                   if (isHaloExchangeOp(user) ||
+                                       !domInfo.properlyDominates(ccall, user))
                                      return false;
                                    return true;
                                  });
@@ -2252,7 +2254,8 @@ struct RotateSpmdOptimize : public OpRewritePattern<enzymexla::RotateOp> {
       rewriter.replaceUsesWithIf(ccall.getOperands()[0], neutral,
                                  [&](OpOperand &use) {
                                    Operation *user = use.getOwner();
-                                   if (!domInfo.properlyDominates(ccall, user))
+                                   if (isHaloExchangeOp(user) ||
+                                       !domInfo.properlyDominates(ccall, user))
                                      return false;
                                    return true;
                                  });
@@ -5369,7 +5372,7 @@ struct DUSSinkSlicesComm
     Operation *anchor;
     SmallVector<Operation *> created;
     DenseSet<Operation *> createdSet;
-    DenseMap<std::tuple<Value, int64_t, int64_t, int64_t>, Value> cache;
+    llvm::MapVector<std::tuple<Value, int64_t, int64_t, int64_t>, Value> cache;
     // The other results of a widened multi-result call: reused by later
     // widenings, but their narrow versions keep their other users (the
     // narrow call stays for them, so a redirect would only add a shift).
@@ -5406,6 +5409,9 @@ struct DUSSinkSlicesComm
         rewriter.eraseOp(op);
       created.clear();
       createdSet.clear();
+      cache.clear();
+      aliases.clear();
+      duplicates.clear();
     }
 
     Value track(Value v) {
@@ -5936,7 +5942,7 @@ struct DUSSinkSlicesComm
       // A failed attempt is not cached: a caller may still succeed by other
       // means (the rotate or pad of a source that could not be widened).
       if (res)
-        cache[key] = res;
+        cache.try_emplace(key, res);
       return res;
     }
 
@@ -5982,6 +5988,12 @@ struct DUSSinkSlicesComm
       }
     }
   };
+
+  // A constant (sdy or stablehlo): nothing feeding it to sink.
+  static bool isConstantValue(Value v) {
+    Operation *op = v.getDefiningOp();
+    return op && isa<stablehlo::ConstantOp, sdy::ConstantOp>(op);
+  }
 
   // The sharded dimensions `update` is narrower in than `ty`: only there
   // does the window's position cost communication. Narrow unsharded
@@ -6055,7 +6067,8 @@ struct DUSSinkSlicesComm
       return failure();
     SmallVector<int64_t> dims;
     if (!narrowShardedDims(dus, ty, updTy, sharding, maxExtraPercent, dims) ||
-        isSliceAtDUSWindow(dus, starts, dims))
+        isSliceAtDUSWindow(dus, starts, dims) ||
+        isConstantValue(dus.getUpdate()))
       return failure();
     Value update = sinkUpdate(dus, dus.getUpdate(), ty, starts, dims, rewriter);
     if (!update)
@@ -6103,6 +6116,10 @@ struct PadSinkSlicesComm : public OpRewritePattern<stablehlo::PadOp> {
     auto ty = pad.getType();
     auto updTy = pad.getOperand().getType();
     if (!ty.hasStaticShape() || !updTy.hasStaticShape())
+      return failure();
+    // A pad of a constant has no slice to sink, and the widener would widen
+    // a non-splat constant by padding it: that is this pad again, forever.
+    if (DUSSinkSlicesComm::isConstantValue(pad.getOperand()))
       return failure();
     SmallVector<int64_t> starts(pad.getEdgePaddingLow());
     SmallVector<int64_t> dims;
