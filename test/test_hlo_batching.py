@@ -403,6 +403,25 @@ class HloBatching(absltest.TestCase):
         np.testing.assert_allclose(scalar, scale * x**2)
         np.testing.assert_allclose(vector, jnp.stack((x, x**3), axis=-1))
 
+    def test_singleton_nested_map_keeps_shared_jacobians(self):
+        x = jnp.array([[-2], [0.5]], dtype=jnp.float32)
+        scale = jnp.array([2], dtype=jnp.float32)
+        mapped = jax.vmap(
+            jax.vmap(polynomial, in_axes=(0, None)),
+            in_axes=(1, 0),
+            out_axes=(1, 1),
+        )
+        scalar, vector = jax.jit(mapped)(x, scale)
+        np.testing.assert_allclose(scalar, scale * x**2)
+        np.testing.assert_allclose(vector, jnp.stack((x, x**3), axis=-1))
+        objective = lambda s: mapped(x, s)[0]
+        np.testing.assert_allclose(
+            jax.jit(jax.jacfwd(objective))(scale), x[..., None] ** 2
+        )
+        np.testing.assert_allclose(
+            jax.jit(jax.grad(lambda s: objective(s).sum()))(scale), jnp.sum(x**2)
+        )
+
     def test_both_gradient_orders_and_shared_input_accumulation(self):
         x = jnp.array([-2, 0.5, 3], dtype=jnp.float32)
         scale = jnp.float32(2)
