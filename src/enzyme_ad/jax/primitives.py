@@ -1415,6 +1415,8 @@ def _enzyme_batch(primitive, args, axes, **params):
     pipeline = params["pipeline_options"]
     if (
         primitive is _enzyme_primal_p
+        # Keep a fully mapped singleton scalar; shared inputs still share work.
+        and (size != 1 or len(mapped) != len(args))
         and params["lang"] == LANG_MHLO
         and pipeline.stablehlo_inject()
         and isinstance(params["source"][3], str)
