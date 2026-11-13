@@ -460,7 +460,23 @@ def _enzyme_fwd_abstract_eval(
 
 def absmaketup(ty):
     tystr = ty.dtype.__str__()
-    tystr = {"float32": "float", "float64": "double", "int32": "int32_t"}[tystr]
+    tystr = {
+        "bool": "bool",
+        "int8": "char",
+        "uint8": "uint8_t",
+        "int16": "int16_t",
+        "uint16": "uint16_t",
+        "int32": "int32_t",
+        "uint32": "uint32_t",
+        "int64": "int64_t",
+        "uint64": "uint64_t",
+        "bfloat16": "bfloat16",
+        "float16": "half",
+        "float32": "float",
+        "float64": "double",
+        "complex64": "std::complex<float>",
+        "complex128": "std::complex<double>",
+    }[tystr]
     return (tystr, ty.shape)
 
 
@@ -557,7 +573,11 @@ def maketup(ty):
     tystr = {
         "i1": "bool",
         "i8": "char",
+        "ui8": "uint8_t",
+        "i16": "int16_t",
+        "ui16": "uint16_t",
         "bf16": "bfloat16",
+        "f16": "half",
         "f32": "float",
         "f64": "double",
         "i32": "int32_t",
@@ -713,7 +733,8 @@ def _enzyme_primal_lowering(
             mod = ctx.module_context.module.operation
             fns = []
             for f in mod.regions[0].blocks[0]:
-                fns.append(f.sym_name.value)
+                if hasattr(f, "sym_name"):
+                    fns.append(f.sym_name.value)
 
             # lower-chlo-gamma-f32 runs after AD on every path, including calls
             # without passes, so a value and its gradient use the same lgamma.
@@ -745,11 +766,13 @@ def _enzyme_primal_lowering(
             fn = None
             pushtop = []
             for f in nmod.body:
-                if "top_k_gt" in f.sym_name.value:
+                sym = f.sym_name.value if hasattr(f, "sym_name") else None
+                if sym != name:
                     pushtop.append(f)
                 mod.regions[0].blocks[0].append(f)
-                ctx.module_context.symbol_table.insert(f)
-                if f.sym_name.value == name:
+                if sym is not None:
+                    ctx.module_context.symbol_table.insert(f)
+                if sym == name:
                     fn = f
             if fn is None:
                 raise AssertionError(
@@ -1258,6 +1281,8 @@ def hlo_call(
         func = None
         names = []
         for f in nmod.body:
+            if not hasattr(f, "sym_name"):
+                continue
             names.append(f.sym_name.value)
             if f.sym_name.value == fn:
                 func = f
@@ -1681,10 +1706,10 @@ def primal_partial_eval(trace, *args, **kwargs):
     avals = {}
 
     for idx, v in enumerate(acts):
-        argidx = len(primals) + len(tangents)
-        if argidx in in_idx_map:
-            avals[idx] = in_idx_map[argidx]
-        primals.append(args[len(primals) + len(tangents)])
+        arg_pos = len(primals) + len(tangents)
+        if arg_pos in in_idx_map:
+            avals[idx] = in_idx_map[arg_pos]
+        primals.append(args[arg_pos])
         if v == "enzyme_dup":
             tangents.append(args[len(primals) + len(tangents)])
 
@@ -1817,7 +1842,7 @@ def enzyme_vjp(shadow_rets, *prim_args, **kwargs):
         shadow_rets2 = []
         ret_act = []
         for i, shad in enumerate(shadow_rets):
-            if type(shad) is ad.Zero:
+            if type(shad) is ad.Zero or shad.dtype == jax.dtypes.float0:
                 ret_act.append("enzyme_const")
             else:
                 ret_act.append("enzyme_active")
