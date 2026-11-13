@@ -135,6 +135,29 @@ class HloBatching(absltest.TestCase):
             np.testing.assert_array_equal(np.signbit(actual[0][0]), [False, True])
             self.assertEmpty(re.findall(r"\bwhile\(", compiled.as_text()))
 
+    def test_erfc_gradient_constants_keep_tensor_batches(self):
+        source = """
+        module {
+          func.func @main(%x: tensor<f32>, %shift: tensor<f32>) -> tensor<f32> {
+            %z = stablehlo.add %x, %shift : tensor<f32>
+            %y = chlo.erfc %z : tensor<f32> -> tensor<f32>
+            return %y : tensor<f32>
+          }
+        }
+        """
+        imported = lambda x, shift: hlo_call(x, shift, source=source)[0]
+        x = jnp.array([-0.5, 0.0, 1.0], dtype=jnp.float32)
+        shift = jnp.float32(0.25)
+        function = jax.vmap(jax.value_and_grad(imported), in_axes=(0, None))
+        executable = jax.jit(function).lower(x, shift).compile()
+        values, gradients = executable(x, shift)
+        z = np.asarray(x + shift)
+        np.testing.assert_allclose(values, [math.erfc(v) for v in z], rtol=2e-6)
+        np.testing.assert_allclose(
+            gradients, -2 / math.sqrt(math.pi) * np.exp(-(z**2)), rtol=2e-6
+        )
+        self.assertEmpty(re.findall(r"\bwhile\(", executable.as_text()))
+
     def test_postoptimized_batch_remains_reusable(self):
         source = str(jax.jit(lambda x: x * x).lower(jnp.float32(1)).compiler_ir())
         passes = optimization_passes(enable_loop_raising_passes=False)
