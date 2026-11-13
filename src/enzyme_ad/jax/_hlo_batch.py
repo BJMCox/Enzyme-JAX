@@ -39,6 +39,9 @@ def _batchable(op):
         return False
     if not all(_tensor(v.type) for v in (*op.operands, *op.results)):
         return False
+    # AD rules can leave their literal multipliers in the CHLO dialect.
+    if op.name == "chlo.constant":
+        return True
     if op.name.startswith("chlo."):
         return op.name.removeprefix("chlo.") in _CHLO_UNARY and not op.regions
     if not op.name.startswith("stablehlo."):
@@ -97,7 +100,11 @@ def _shared_batch(function, mapped, size):
     for op in varying:
         used.update(_external_values(op.operation))
     # Reconstruct constants in the cell, preserving static scan bounds.
-    constants = [op for op in shared if op.operation.name == "stablehlo.constant"]
+    constants = [
+        op
+        for op in shared
+        if op.operation.name in ("stablehlo.constant", "chlo.constant")
+    ]
     constant_values = {v for op in constants for v in op.results}
     ordered = arguments + [v for op in shared for v in op.results]
     needed = (known & used) - constant_values
