@@ -122,6 +122,7 @@ def : HLODerivative<"ConjOp", (Op $z), [(Conj (DiffeRet))], (Conj (Shadow $z))>;
 
 def : HLODerivative<"CoshOp", (Op $x), [(CheckedMul (DiffeRet), (Sinh $x))]>;
 
+// chlo.polygamma takes the order n first: polygamma(n, x).
 def : HLODerivative<"DigammaOp", (Op $x),
                     [(CheckedMul (DiffeRet), (Polygamma (HLOConstantFP<"1"> $x), $x))],
                     (Mul (Shadow $x), (Polygamma (HLOConstantFP<"1"> $x), $x))
