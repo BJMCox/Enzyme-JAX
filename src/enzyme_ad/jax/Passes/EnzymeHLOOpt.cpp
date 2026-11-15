@@ -45283,6 +45283,11 @@ private:
 
     // size 1 index can be trivially simplified to a DUS
     if (indices.getType().getNumElements() == 1) {
+      // A single index can still address a window containing multiple values.
+      if (llvm::any_of(op.getUpdates(), [](Value update) {
+            return cast<ShapedType>(update.getType()).getNumElements() != 1;
+          }))
+        return failure();
       // A scatter DROPS an out-of-bounds update while dynamic-slice and
       // dynamic-update-slice CLAMP the start, resurrecting the write at a
       // clamped slot: the conversion is only sound when the index lands in
