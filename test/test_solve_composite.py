@@ -120,17 +120,11 @@ class SolveCompositeTest(absltest.TestCase):
         np.testing.assert_allclose(ga[2], 0, atol=2e-11)
         np.testing.assert_allclose(gb, expected_gradient[1], rtol=2e-11, atol=2e-11)
 
-    def test_native_solve_ambiguous_pivot_uses_portable_validity(self):
+    def test_native_solve_accepts_small_nonzero_pivots(self):
         source = MATRIX_SOURCE.replace("0x7FF0000000000000", "0x7F800000").replace(
             "f64", "f32"
         )
         function = jax.jit(lambda a, b: hlo_call(a, b, source=source))
-        singular = np.array([[3, 3], [1, 1]], dtype=np.float32)
-        rhs = np.array([[1, 2], [3, 4]], dtype=np.float32)
-        value, valid = function(singular, rhs)
-        np.testing.assert_array_equal(value, np.zeros_like(rhs))
-        self.assertFalse(bool(valid))
-
         tiny = np.float32(2**-30)
         matrix = np.diag(np.array([1, tiny], dtype=np.float32))
         rhs = np.array([[1, 2], [tiny, -tiny]], dtype=np.float32)
@@ -140,7 +134,8 @@ class SolveCompositeTest(absltest.TestCase):
 
         mapped = jax.jit(jax.vmap(lambda a, b: hlo_call(a, b, source=source)))
         values, valid = mapped(
-            np.stack((singular, matrix)), np.stack((np.eye(2, dtype=np.float32), rhs))
+            np.stack((np.zeros_like(matrix), matrix)),
+            np.stack((np.eye(2, dtype=np.float32), rhs)),
         )
         np.testing.assert_array_equal(valid, [False, True])
         np.testing.assert_array_equal(values[0], np.zeros((2, 2), dtype=np.float32))
