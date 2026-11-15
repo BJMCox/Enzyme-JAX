@@ -2009,7 +2009,7 @@ def primal_partial_eval(trace, *args, **kwargs):
             passes[end + 1 :].lstrip(","),
         )
         if split is not None:
-            forward, reverse = split
+            forward, reverse, active_outputs = split
             with jax_mlir.make_ir_context():
                 module = ir.Module.parse(forward)
                 shapes = tuple(
@@ -2041,7 +2041,7 @@ def primal_partial_eval(trace, *args, **kwargs):
                 kwargs
                 | {
                     "out_shapes": kwargs["out_shapes"][::2],
-                    "linearization": (reverse, len(residuals)),
+                    "linearization": (reverse, len(residuals), active_outputs),
                 },
             )
             return tuple(v for pair in zip(values[:count], shadows) for v in pair)
@@ -2093,13 +2093,16 @@ pe.custom_partial_eval_rules[_enzyme_primal_p] = primal_partial_eval
 def enzyme_vjp(shadow_rets, *prim_args, **kwargs):
     linearization = kwargs.pop("linearization", None)
     if linearization is not None:
-        reverse, count = linearization
+        reverse, count, active_outputs = linearization
         residuals, original_args = prim_args[:count], prim_args[count:]
-        if any(type(value) is ad.Zero for value in shadow_rets):
+        seeds = tuple(
+            value for value, active in zip(shadow_rets, active_outputs) if active
+        )
+        if any(type(value) is ad.Zero for value in seeds):
             # Preserve activity semantics: a numerical zero can still produce
             # NaN when multiplied by an inactive, nonfinite derivative.
             return (None,) * count + enzyme_vjp(shadow_rets, *original_args, **kwargs)
-        gradients = hlo_call(*residuals, *shadow_rets, source=reverse)
+        gradients = hlo_call(*residuals, *seeds, source=reverse)
         return (None,) * (len(prim_args) - len(gradients)) + tuple(gradients)
 
     pipeline_options = kwargs["pipeline_options"]

@@ -110,6 +110,44 @@ class HLOLinearize(absltest.TestCase):
         )
 
     @absltest.skipUnless(HAS_EFFECT_QUERIES, "requires MLIR memory effect queries")
+    def test_mixed_status_outputs_share_forward_and_keep_second_derivatives(self):
+        def function(x):
+            valid = x > 0
+            return (
+                recurrence(x),
+                jnp.where(valid, jnp.int32(0), jnp.int32(9)),
+                x * x,
+                valid,
+            )
+
+        point = jnp.float32(0.4)
+        imported = import_hlo(function, point)
+
+        def objective(call, x):
+            value, status, square, valid = call(x)
+            return value + square, (status, valid)
+
+        evaluate = jax.jit(
+            jax.value_and_grad(lambda x: objective(imported, x), has_aux=True)
+        )
+        compiled = evaluate.lower(point).compile()
+        for point in (point, -point):
+            actual = compiled(point)
+            expected = jax.value_and_grad(
+                lambda x: objective(function, x), has_aux=True
+            )(point)
+            for value, reference in zip(
+                jax.tree.leaves(actual), jax.tree.leaves(expected)
+            ):
+                np.testing.assert_allclose(value, reference, rtol=3e-6, atol=3e-6)
+        self.assertEqual(len(re.findall(r"\bwhile\(", compiled.as_text())), 2)
+        actual_second = jax.jit(
+            jax.grad(jax.grad(lambda x: objective(imported, x)[0]))
+        )(point)
+        expected_second = jax.grad(jax.grad(lambda x: recurrence(x) + x * x))(point)
+        np.testing.assert_allclose(actual_second, expected_second, rtol=3e-6, atol=3e-6)
+
+    @absltest.skipUnless(HAS_EFFECT_QUERIES, "requires MLIR memory effect queries")
     def test_scaled_scan_keeps_reverse_state_small(self):
         observations = jnp.linspace(-0.3, 0.7, 32)
 
@@ -251,7 +289,7 @@ class HLOLinearize(absltest.TestCase):
 
     def test_inactive_nonfinite_output(self):
         point = jnp.float32(-2)
-        imported = import_hlo(lambda x: (x * x, jnp.sqrt(x)), point)
+        imported = import_hlo(lambda x: (x * x, jnp.int32(9), jnp.sqrt(x)), point)
         np.testing.assert_allclose(
             jax.jit(jax.value_and_grad(lambda x: imported(x)[0]))(point), (4, -4)
         )

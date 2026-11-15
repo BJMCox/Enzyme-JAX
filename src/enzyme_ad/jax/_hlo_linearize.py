@@ -124,10 +124,17 @@ def linearize_hlo(source, activity, before_ad, after_ad):
                 len(inputs) != len(activity)
                 or len(original.regions[0].blocks) != 1
                 or not all(_tensor(ty) for ty in inputs + outputs)
-                or not all(str(ty.element_type) in ("f32", "f64") for ty in outputs)
                 or not all(
                     _pure(op.operation) for op in original.entry_block.operations
                 )
+            ):
+                return None
+            active_outputs = tuple(
+                str(ty.element_type) in ("f32", "f64") for ty in outputs
+            )
+            if not any(active_outputs) or not all(
+                active or isinstance(ty.element_type, ir.IntegerType)
+                for ty, active in zip(outputs, active_outputs)
             ):
                 return None
             names = {
@@ -145,7 +152,8 @@ def linearize_hlo(source, activity, before_ad, after_ad):
             if not all(str(ty.element_type) in ("f32", "f64") for ty in gradients):
                 return None
             with ir.InsertionPoint(module.body):
-                wrapper = func.FuncOp("main", (inputs + outputs, outputs + gradients))
+                seeds = [ty for ty, active in zip(outputs, active_outputs) if active]
+                wrapper = func.FuncOp("main", (inputs + seeds, outputs + gradients))
                 with ir.InsertionPoint(wrapper.add_entry_block()):
                     active = ir.Attribute.parse("#enzyme.activity<enzyme_active>")
                     constant = ir.Attribute.parse("#enzyme.activity<enzyme_const>")
@@ -158,7 +166,9 @@ def linearize_hlo(source, activity, before_ad, after_ad):
                             "activity": ir.ArrayAttr.get(
                                 [active if a else constant for a in activity]
                             ),
-                            "ret_activity": ir.ArrayAttr.get([active] * len(outputs)),
+                            "ret_activity": ir.ArrayAttr.get(
+                                [active if a else constant for a in active_outputs]
+                            ),
                         },
                     )
                     func.ReturnOp(call.results)
@@ -171,7 +181,8 @@ def linearize_hlo(source, activity, before_ad, after_ad):
             + after_ad
             + ",tensor-empty-raise,drop-unsupported-attributes",
         )
-        return _partition(joint, name, len(inputs), len(outputs))
+        split = _partition(joint, name, len(inputs), len(outputs))
+        return (*split, active_outputs) if split is not None else None
     except (ValueError, RuntimeError, ir.MLIRError):
         # The transpose may later mark outputs inactive. Do not make a working
         # activity-specific derivative depend on speculative all-active AD.
