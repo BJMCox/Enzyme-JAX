@@ -1356,7 +1356,10 @@ def _lower_native_linalg(ctx, module):
             def function(a, b, transpose=transpose, confirm_validity=confirm_validity):
                 n = a.shape[-1]
                 identity = jnp.eye(n, dtype=a.dtype)
-                finite = jnp.all(jnp.isfinite(a), axis=(-2, -1))
+                # Keep NaNs out of max reductions that may use fast min/max.
+                magnitude = jnp.where(jnp.isfinite(a), jnp.abs(a), jnp.inf)
+                scale = jnp.max(magnitude, axis=(-2, -1))
+                finite = jnp.isfinite(scale)
                 safe_a = jnp.where(finite[..., None, None], a, identity)
                 factors, pivots, _ = lax.linalg.lu(safe_a)
                 diagonal = jnp.diagonal(factors, axis1=-2, axis2=-1)
@@ -1376,7 +1379,6 @@ def _lower_native_linalg(ctx, module):
                     return result
                 # A tiny pivot may be a rounding artifact of native LU. Let
                 # the portable decomposition decide rather than reject it.
-                scale = jnp.max(jnp.abs(a), axis=(-2, -1))
                 safe_scale = jnp.where(scale != 0, scale, jnp.ones_like(scale))
                 ratio = jnp.min(jnp.abs(diagonal), axis=-1) / safe_scale
                 suspect = valid & (ratio <= jnp.finfo(a.dtype).eps * n)

@@ -104,15 +104,20 @@ class SolveCompositeTest(absltest.TestCase):
         expected = np.einsum("ik,jl->ijkl", np.linalg.inv(a), np.eye(2))
         np.testing.assert_allclose(jacobian, expected, rtol=2e-11, atol=2e-11)
 
-        matrices = np.stack((a, np.zeros_like(a)))
+        nonfinite = a.copy()
+        nonfinite[0, 1] = np.nan
+        matrices = np.stack((a, np.zeros_like(a), nonfinite))
         mapped = jax.vmap(solve, in_axes=(0, None))
         value = jax.jit(mapped)(matrices, b)
-        np.testing.assert_allclose(value, np.stack((x, np.zeros_like(x))), atol=2e-11)
+        np.testing.assert_allclose(
+            value, np.stack((x, np.zeros_like(x), np.zeros_like(x))), atol=2e-11
+        )
         ga, gb = jax.jit(
             jax.grad(lambda aa, bb: jnp.sum(mapped(aa, bb) * weight), argnums=(0, 1))
         )(matrices, b)
         np.testing.assert_allclose(ga[0], expected_gradient[0], rtol=2e-11, atol=2e-11)
         np.testing.assert_allclose(ga[1], 0, atol=2e-11)
+        np.testing.assert_allclose(ga[2], 0, atol=2e-11)
         np.testing.assert_allclose(gb, expected_gradient[1], rtol=2e-11, atol=2e-11)
 
     def test_native_solve_ambiguous_pivot_uses_portable_validity(self):
