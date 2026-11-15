@@ -97,6 +97,12 @@ py_test(
 )
 
 py_test(
+    name = "test_hlo_cpu_primal",
+    srcs = ["test_hlo_cpu_primal.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_linalg_batching",
     srcs = ["test_hlo_linalg_batching.py"],
     deps = TEST_DEPS,

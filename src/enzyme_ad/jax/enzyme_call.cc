@@ -10,6 +10,7 @@
 #include "src/enzyme_ad/jax/TransformOps/TransformOps.h"
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <numeric>
@@ -17,10 +18,14 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/no_destructor.h"
+#include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 #include "clang_compile.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
@@ -63,9 +68,17 @@
 #include "xla/mlir_hlo/transforms/passes.h"
 
 #include "compile_with_xla.h"
+#include "xla/client/client_library.h"
+#include "xla/executable_run_options.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/service/backend.h"
 #include "xla/service/cpu/cpu_executable.h"
+#include "xla/service/custom_call_status.h"
+#include "xla/service/executable.h"
+#include "xla/service/maybe_owning_device_address.h"
+#include "xla/shape_util.h"
+#include "xla/stream_executor/device_address.h"
 
 #include "Enzyme/FunctionUtils.h"
 #include "Enzyme/MLIR/Passes/Passes.h"
@@ -88,11 +101,49 @@ class CpuKernel {
 
   size_t num_out;
   uint64_t addr;
+  std::unique_ptr<xla::LocalExecutable> executable;
+  xla::Backend *backend = nullptr;
+  std::vector<xla::Shape> input_shapes;
+  std::vector<xla::ShapeIndex> output_indices;
+
+  static bool matchesShape(const xla::Shape &shape,
+                           llvm::ArrayRef<int64_t> dimensions,
+                           llvm::StringRef name) {
+    auto type = llvm::StringSwitch<xla::PrimitiveType>(name)
+                    .Case("bool", xla::PRED)
+                    .Case("char", xla::S8)
+                    .Case("uint8_t", xla::U8)
+                    .Case("int16_t", xla::S16)
+                    .Case("uint16_t", xla::U16)
+                    .Case("int32_t", xla::S32)
+                    .Case("uint32_t", xla::U32)
+                    .Case("int64_t", xla::S64)
+                    .Case("uint64_t", xla::U64)
+                    .Case("half", xla::F16)
+                    .Case("bfloat16", xla::BF16)
+                    .Case("float", xla::F32)
+                    .Case("double", xla::F64)
+                    .Case("std::complex<float>", xla::C64)
+                    .Case("std::complex<double>", xla::C128)
+                    .Default(xla::PRIMITIVE_TYPE_INVALID);
+    return type != xla::PRIMITIVE_TYPE_INVALID &&
+           xla::ShapeUtil::Equal(
+               shape, xla::ShapeUtil::MakeShape(
+                          type, absl::Span<const int64_t>(dimensions.data(),
+                                                          dimensions.size())));
+  }
 
 public:
   static constexpr size_t UNKNOWN_PLATFORM = 0x1000000000;
 
   CpuKernel(size_t num_out, uint64_t addr) : num_out(num_out), addr(addr) {}
+
+  CpuKernel(size_t num_out, std::unique_ptr<xla::LocalExecutable> executable,
+            xla::Backend *backend, std::vector<xla::Shape> input_shapes,
+            std::vector<xla::ShapeIndex> output_indices)
+      : num_out(num_out), addr(0), executable(std::move(executable)),
+        backend(backend), input_shapes(std::move(input_shapes)),
+        output_indices(std::move(output_indices)) {}
 
   static std::pair<size_t, size_t>
   tapeAndTempSize(std::string fn, llvm::StringRef source,
@@ -155,6 +206,55 @@ public:
       return std::make_tuple(UNKNOWN_PLATFORM, 0);
     llvm::sys::SmartScopedWriter<true> lock(kernel_mutex);
     size_t identifier = last_identifier++;
+
+    if (mode == ABI::Primal && lang == Language::MHLO && !xla_runtime) {
+      std::string unused_ir;
+      auto compiled = compile_mhlo_to_llvm_with_xla(source, unused_ir,
+                                                    xla_runtime, pass_pipeline);
+      if (!compiled.ok())
+        throw nanobind::value_error(compiled.status().ToString().c_str());
+      auto local = std::move(compiled).value();
+      auto client = xla::ClientLibrary::GetOrCreateLocalClient();
+      if (!client.ok())
+        throw nanobind::value_error(client.status().ToString().c_str());
+      auto *backend = client.value()->mutable_backend();
+      const auto &layout =
+          local->executable()->module().entry_computation_layout();
+      if (layout.parameter_count() != in_shapes.size())
+        throw nanobind::value_error("MHLO input count does not match ABI");
+      std::vector<xla::Shape> inputs;
+      for (size_t i = 0; i < in_shapes.size(); ++i) {
+        const auto &shape = layout.parameter_layout(i).shape();
+        if (!matchesShape(shape, in_shapes[i], in_names[i]))
+          throw nanobind::value_error(
+              "MHLO input shape or layout does not match ABI");
+        inputs.push_back(shape);
+      }
+      std::vector<xla::ShapeIndex> outputs;
+      bool outputs_match = true;
+      xla::ShapeUtil::ForEachSubshape(
+          layout.result_layout().shape(),
+          [&](const xla::Shape &shape, const xla::ShapeIndex &index) {
+            if (!shape.IsArray()) {
+              if (!shape.IsTuple())
+                outputs_match = false;
+              return;
+            }
+            size_t i = outputs.size();
+            if (i >= out_shapes.size() ||
+                !matchesShape(shape, out_shapes[i], out_names[i]))
+              outputs_match = false;
+            outputs.push_back(index);
+          });
+      if (!outputs_match || outputs.size() != out_shapes.size())
+        throw nanobind::value_error(
+            "MHLO output shape or layout does not match ABI");
+      kernels().try_emplace(
+          identifier,
+          std::make_unique<CpuKernel>(outputs.size(), std::move(local), backend,
+                                      std::move(inputs), std::move(outputs)));
+      return std::make_tuple(identifier, 0);
+    }
 
     auto mod_or_err =
         createLLVMMod(fn, source, out_shapes, out_names, in_shapes, in_names,
@@ -219,35 +319,71 @@ public:
     // Cast the entry point address to a function pointer.
     auto Entry = EntrySym->getValue();
 
-    kernels.try_emplace(identifier,
-                        std::make_unique<CpuKernel>(num_out, Entry));
+    kernels().try_emplace(identifier,
+                          std::make_unique<CpuKernel>(num_out, Entry));
     return std::make_tuple(identifier, tmpBuf);
   }
 
   static CpuKernel *get(int64_t identifier) {
     llvm::sys::SmartScopedReader<true> lock(kernel_mutex);
-    auto it = kernels.find(identifier);
-    if (it == kernels.end())
+    auto it = kernels().find(identifier);
+    if (it == kernels().end())
       return nullptr;
     return it->getSecond().get();
   }
 
-  void call(void *out, void **ins) const {
+  absl::Status call(void *out, void **ins) const {
     void **outs = num_out > 1 ? reinterpret_cast<void **>(out) : &out;
+    if (executable) {
+      std::vector<xla::ExecutionInput> arguments;
+      arguments.reserve(input_shapes.size());
+      for (size_t i = 0; i < input_shapes.size(); ++i) {
+        arguments.emplace_back(input_shapes[i]);
+        arguments.back().SetBuffer(
+            {},
+            xla::MaybeOwningDeviceAddress(stream_executor::DeviceAddressBase(
+                ins[i], xla::ShapeUtil::ByteSizeOfElements(input_shapes[i]))));
+      }
+      xla::ExecutableRunOptions options;
+      options.set_device_ordinal(executable->build_options().device_ordinal());
+      options.set_allocator(backend->memory_allocator());
+      options.set_intra_op_thread_pool(
+          backend->eigen_intra_op_thread_pool_device());
+      auto result = executable->Run(std::move(arguments), options);
+      if (!result.ok())
+        return result.status();
+      const auto &buffer = result->Result();
+      for (size_t i = 0; i < output_indices.size(); ++i) {
+        const auto &value = buffer.buffer(output_indices[i]);
+        auto bytes =
+            xla::ShapeUtil::ByteSizeOfElements(xla::ShapeUtil::GetSubshape(
+                buffer.on_device_shape(), output_indices[i]));
+        if (bytes)
+          std::memmove(outs[i], value.opaque(), bytes);
+      }
+      return absl::OkStatus();
+    }
     for (int i = 0; i < num_out; i++) {
       void *data = outs[i];
     }
     auto fn = (void (*)(void **outs, void **ins))addr;
     fn(outs, ins);
+    return absl::OkStatus();
   }
 
 private:
-  static llvm::DenseMap<int64_t, std::unique_ptr<CpuKernel>> kernels;
+  static llvm::DenseMap<int64_t, std::unique_ptr<CpuKernel>> &kernels() {
+    // Cached executables can outlive LLVM's JIT registration listeners.
+    // Keep the registry alive until process exit without late JIT teardown.
+    static absl::NoDestructor<
+        llvm::DenseMap<int64_t, std::unique_ptr<CpuKernel>>>
+        kernels;
+    return *kernels;
+  }
   static size_t last_identifier;
   static llvm::sys::SmartRWMutex<true> kernel_mutex;
 };
 
-llvm::DenseMap<int64_t, std::unique_ptr<CpuKernel>> CpuKernel::kernels;
 size_t CpuKernel::last_identifier = 1;
 llvm::sys::SmartRWMutex<true> CpuKernel::kernel_mutex;
 std::unique_ptr<llvm::DataLayout> CpuKernel::DL;
@@ -268,7 +404,12 @@ void Callback(void *out, void **ins, void *opaque, size_t opaque_len,
     // TODO: find a way to fail more gracefully.
     llvm::report_fatal_error("couldn't find enzyme kernel");
   }
-  kernel->call(out, ins + 1);
+  auto result = kernel->call(out, ins + 1);
+  if (!result.ok()) {
+    auto message = result.ToString();
+    XlaCustomCallStatusSetFailure(static_cast<XlaCustomCallStatus *>(status),
+                                  message.data(), message.size());
+  }
 }
 
 extern "C" void RegisterEnzymeXLAGPUHandler();
