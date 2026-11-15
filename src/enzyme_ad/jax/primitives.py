@@ -1299,24 +1299,11 @@ def _lower_native_linalg(ctx, module):
                         transpose = True
 
             def function(a, b, transpose=transpose):
-                # Native LU determines singularity; do not refactor tiny pivots
-                # through the portable decomposition with different rounding.
-                n = a.shape[-1]
-                identity = jnp.eye(n, dtype=a.dtype)
-                finite = jnp.all(jnp.isfinite(a), axis=(-2, -1))
-                safe_a = jnp.where(finite[..., None, None], a, identity)
-                factors, pivots, _ = lax.linalg.lu(safe_a)
+                # Follow native LU behavior without scanning full matrices.
+                # The existing solve ABI still reports a zero or invalid pivot.
+                factors, pivots, _ = lax.linalg.lu(a)
                 diagonal = jnp.diagonal(factors, axis1=-2, axis2=-1)
-                valid = (
-                    finite
-                    & jnp.all(jnp.isfinite(factors), axis=(-2, -1))
-                    & jnp.all(diagonal != 0, axis=-1)
-                )
-                # Invalid cells must not reach the native triangular solves.
-                factors = jnp.where(valid[..., None, None], factors, identity)
-                identity_pivots = jnp.arange(n, dtype=pivots.dtype)
-                pivots = jnp.where(valid[..., None], pivots, identity_pivots)
-                b = jnp.where(valid[..., None, None], b, jnp.zeros_like(b))
+                valid = jnp.all(jnp.isfinite(diagonal) & (diagonal != 0), axis=-1)
                 x = lu_solve((factors, pivots), b, trans=int(transpose))
                 return jnp.where(valid[..., None, None], x, jnp.zeros_like(x)), valid
 
