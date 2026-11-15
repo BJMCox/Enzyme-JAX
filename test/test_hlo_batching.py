@@ -330,6 +330,85 @@ class HloBatching(absltest.TestCase):
         for value, reference in zip(actual, expected):
             np.testing.assert_array_equal(value, reference)
 
+    def test_fixed_loop_with_reduction_batches_without_lane_loop(self):
+        source = """
+        module {
+          func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> {
+            %zero = stablehlo.constant dense<0> : tensor<i32>
+            %one = stablehlo.constant dense<1> : tensor<i32>
+            %limit = stablehlo.constant dense<3> : tensor<i32>
+            %loop:2 = stablehlo.while(%i = %zero, %y = %x) : tensor<i32>, tensor<4xf32>
+            cond {
+              %more = stablehlo.compare LT, %i, %limit, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+              stablehlo.return %more : tensor<i1>
+            } do {
+              %init = stablehlo.constant dense<0.0> : tensor<f32>
+              %sum = stablehlo.reduce(%y init: %init) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+              %scale = stablehlo.constant dense<0.1> : tensor<f32>
+              %increment = stablehlo.multiply %sum, %scale : tensor<f32>
+              %broadcast = stablehlo.broadcast_in_dim %increment, dims = [] : (tensor<f32>) -> tensor<4xf32>
+              %next_y = stablehlo.add %y, %broadcast : tensor<4xf32>
+              %next_i = stablehlo.add %i, %one : tensor<i32>
+              stablehlo.return %next_i, %next_y : tensor<i32>, tensor<4xf32>
+            }
+            return %loop#1 : tensor<4xf32>
+          }
+        }
+        """
+        batched = batch_hlo(source, "", 3)
+        self.assertIsNotNone(batched)
+        self.assertLen(re.findall(r"stablehlo\.while\(", batched), 1)
+        self.assertRegex(batched, r"stablehlo\.reduce[^\n]*dimensions = \[1\]")
+
+        imported = lambda x: hlo_call(x, source=source)[0]
+        mapped = jax.vmap(imported)
+        x = np.arange(12, dtype=np.float32).reshape(3, 4) / 7 - 0.5
+        seed = np.arange(12, dtype=np.float32).reshape(3, 4) / 9 + 0.2
+        coefficient = (1.4**3 - 1) / 4
+        expected = x + coefficient * x.sum(axis=1, keepdims=True)
+        expected_gradient = seed + coefficient * seed.sum(axis=1, keepdims=True)
+        lowered = jax.jit(mapped).lower(x)
+        self.assertLen(re.findall(r"stablehlo\.while\(", str(lowered.compiler_ir())), 1)
+        np.testing.assert_allclose(lowered.compile()(x), expected, rtol=2e-6, atol=2e-6)
+        gradient = jax.jit(jax.grad(lambda x: jnp.sum(mapped(x) * seed)))(x)
+        np.testing.assert_allclose(gradient, expected_gradient, rtol=2e-6, atol=2e-6)
+        nonleading = jax.jit(jax.vmap(imported, in_axes=1, out_axes=1))
+        np.testing.assert_allclose(nonleading(x.T), expected.T, rtol=2e-6, atol=2e-6)
+
+    def test_fixed_loop_with_runtime_reduction_init_preserves_lanes(self):
+        source = """
+        module {
+          func.func @main(%x: tensor<4xf32>, %parameter: tensor<f32>) -> tensor<4xf32> {
+            %zero = stablehlo.constant dense<0> : tensor<i32>
+            %one = stablehlo.constant dense<1> : tensor<i32>
+            %limit = stablehlo.constant dense<3> : tensor<i32>
+            %loop:2 = stablehlo.while(%i = %zero, %y = %x) : tensor<i32>, tensor<4xf32>
+            cond {
+              %more = stablehlo.compare LT, %i, %limit, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+              stablehlo.return %more : tensor<i1>
+            } do {
+              %sum = stablehlo.reduce(%y init: %parameter) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+              %scale = stablehlo.constant dense<0.1> : tensor<f32>
+              %inc = stablehlo.multiply %sum, %scale : tensor<f32>
+              %broadcast = stablehlo.broadcast_in_dim %inc, dims = [] : (tensor<f32>) -> tensor<4xf32>
+              %next_y = stablehlo.add %y, %broadcast : tensor<4xf32>
+              %next_i = stablehlo.add %i, %one : tensor<i32>
+              stablehlo.return %next_i, %next_y : tensor<i32>, tensor<4xf32>
+            }
+            return %loop#1 : tensor<4xf32>
+          }
+        }
+        """
+        function = lambda x, p: hlo_call(x, p, source=source)[0]
+        x = np.arange(12, dtype=np.float32).reshape(3, 4) / 7 + 0.2
+        # Runtime zero is neutral but is not a compile-time constant.
+        parameter = np.zeros(3, dtype=np.float32)
+        expected = x.copy()
+        for _ in range(3):
+            expected += 0.1 * (expected.sum(axis=1) + parameter)[:, None]
+        actual = jax.jit(jax.vmap(function))(x, parameter)
+        np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+
     def test_varying_loop_counts_stay_in_their_lanes(self):
         def recurrence(count, initial):
             return jax.lax.while_loop(
