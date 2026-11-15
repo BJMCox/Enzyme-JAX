@@ -129,6 +129,54 @@ class HloLinalgLowering(absltest.TestCase):
         result = solve(np.array([2, 3], np.float32), np.array([[2], [8]], np.float32))
         np.testing.assert_allclose(result, [[1], [2]], rtol=2e-6)
 
+    def test_triangular_solve_matrix_rhs_derivative_precision(self):
+        # Dot products in the solve's JVP, VJP and HVP retain f32 precision.
+        n = 32
+        source = f"""
+        module {{
+          func.func @main(%a: tensor<{n}x{n}xf32>, %b: tensor<{n}x{n}xf32>)
+              -> tensor<{n}x{n}xf32> {{
+            %y = "stablehlo.triangular_solve"(%a, %b) <{{
+              left_side = true, lower = true, unit_diagonal = false,
+              transpose_a = #stablehlo<transpose NO_TRANSPOSE>
+            }}> : (tensor<{n}x{n}xf32>, tensor<{n}x{n}xf32>)
+              -> tensor<{n}x{n}xf32>
+            return %y : tensor<{n}x{n}xf32>
+          }}
+        }}
+        """
+        rng = np.random.default_rng(1729)
+        a = np.tril(rng.normal(0, 0.08, (n, n))).astype(np.float32)
+        a += np.eye(n, dtype=np.float32) * 1.5
+        b, da, db, weight = (
+            rng.normal(size=(n, n)).astype(np.float32) for _ in range(4)
+        )
+        da = np.tril(da)
+        # Compute the analytic oracle in f64 from the exact f32 inputs.
+        a64, b64, da64, db64, w64 = (
+            x.astype(np.float64) for x in (a, b, da, db, weight)
+        )
+        x = np.linalg.solve(a64, b64)
+        dx = np.linalg.solve(a64, db64 - da64 @ x)
+        adjoint = np.linalg.solve(a64.T, w64)
+        dadjoint = -np.linalg.solve(a64.T, da64.T @ adjoint)
+        expected_grad = (-np.tril(adjoint @ x.T), adjoint)
+        expected_hvp = (-np.tril(dadjoint @ x.T + adjoint @ dx.T), dadjoint)
+
+        solve = lambda a, b: hlo_call(a, b, source=source)[0]
+        loss = lambda a, b: jnp.sum(solve(a, b) * weight)
+        forward = jax.jit(lambda a, b, da, db: jax.jvp(solve, (a, b), (da, db)))
+        primal, tangent = forward(a, b, da, db)
+        gradient = jax.grad(loss, argnums=(0, 1))
+        grad = jax.jit(gradient)(a, b)
+        hvp = jax.jit(lambda a, b, da, db: jax.jvp(gradient, (a, b), (da, db))[1])(
+            a, b, da, db
+        )
+        for actual, expected in zip(
+            (primal, tangent, *grad, *hvp), (x, dx, *expected_grad, *expected_hvp)
+        ):
+            np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=2e-5)
+
     def test_nested_shared_solves_preserve_existing_matrix_batches(self):
         source = """
         module {
