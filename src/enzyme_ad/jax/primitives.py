@@ -17,6 +17,7 @@ from jax.interpreters import ad, batching
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import stablehlo, func
 import jax.numpy as jnp
+from jax.scipy.linalg import lu_solve
 import jax.extend
 from jax._src.interpreters import partial_eval as pe
 from jax._src import core
@@ -1192,15 +1193,56 @@ def to_jax_type(mlir_type):
 def _lower_native_linalg(ctx, module):
     """Use JAX's target lowering after differentiating portable matrix ops."""
     operations = []
+    solve_prefix = "__enzyme_linalg_solve_v1_"
+    private_functions = {
+        f.sym_name.value: f
+        for f in module.body
+        if f.operation.name == "func.func"
+        and "sym_visibility" in f.attributes
+        and ir.StringAttr(f.attributes["sym_visibility"]).value == "private"
+    }
 
     def collect(op):
-        if op.name in ("stablehlo.cholesky", "stablehlo.triangular_solve"):
+        if op.name in ("stablehlo.cholesky", "stablehlo.triangular_solve") or (
+            op.name == "func.call"
+            and "callee" in op.attributes
+            and ir.FlatSymbolRefAttr(op.attributes["callee"]).value.startswith(
+                solve_prefix
+            )
+        ):
             operations.append(op)
         return ir.WalkResult.ADVANCE
+
+    def recover_shared_matrix(operands, function):
+        while isinstance(operands[0], ir.OpResult):
+            broadcast = operands[0].owner.operation
+            if broadcast.name != "stablehlo.broadcast_in_dim":
+                break
+            source = broadcast.operands[0]
+            inner = ir.RankedTensorType(source.type)
+            outer = ir.RankedTensorType(operands[0].type)
+            added = len(outer.shape) - len(inner.shape)
+            dimensions = list(
+                ir.DenseI64ArrayAttr(broadcast.attributes["broadcast_dimensions"])
+            )
+            if (
+                added <= 0
+                or len(inner.shape) < 2
+                or not inner.has_static_shape
+                or list(outer.shape[added:]) != list(inner.shape)
+                or dimensions != list(range(added, len(outer.shape)))
+            ):
+                break
+            operands[0] = source
+            for _ in range(added):
+                function = jax.vmap(function, in_axes=(None, 0))
+        return function
 
     module.operation.walk(collect)
     for op in operations:
         operands = list(op.operands)
+        if not all(isinstance(value.type, ir.RankedTensorType) for value in operands):
+            continue
         types = [ir.RankedTensorType(value.type) for value in operands]
         # Keep native lowering for types outside JAX's LAPACK/solver support.
         if any(
@@ -1210,7 +1252,74 @@ def _lower_native_linalg(ctx, module):
             for ty in types
         ):
             continue
-        if op.name == "stablehlo.cholesky":
+        multiple_results = False
+        if op.name == "func.call":
+            name = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
+            if (
+                name not in private_functions
+                or len(operands) != 2
+                or len(op.results) != 2
+                or not all(
+                    isinstance(value.type, ir.RankedTensorType) for value in op.results
+                )
+            ):
+                continue
+            a, b = types
+            x = ir.RankedTensorType(op.results[0].type)
+            valid = ir.RankedTensorType(op.results[1].type)
+            if (
+                str(a.element_type) not in ("f32", "f64")
+                or a.element_type != b.element_type
+                or x != b
+                or str(valid.element_type) != "i1"
+                or len(a.shape) < 2
+                or len(b.shape) != len(a.shape)
+                or tuple(a.shape[:-2]) != tuple(b.shape[:-2])
+                or tuple(valid.shape) != tuple(a.shape[:-2])
+                or a.shape[-1] != a.shape[-2]
+                or a.shape[-1] == 0
+                or b.shape[-2] != a.shape[-1]
+                or b.shape[-1] == 0
+                or any(size == 0 for size in a.shape[:-2])
+            ):
+                continue
+            transpose = False
+            # Keep the primal and adjoint on the same matrix factorization.
+            if isinstance(operands[0], ir.OpResult):
+                trans = operands[0].owner.operation
+                if trans.name == "stablehlo.transpose":
+                    rank = len(a.shape)
+                    permutation = list(
+                        ir.DenseI64ArrayAttr(trans.attributes["permutation"])
+                    )
+                    if permutation == [*range(rank - 2), rank - 1, rank - 2]:
+                        operands[0] = trans.operands[0]
+                        transpose = True
+
+            def function(a, b, transpose=transpose):
+                n = a.shape[-1]
+                identity = jnp.eye(n, dtype=a.dtype)
+                finite = jnp.all(jnp.isfinite(a), axis=(-2, -1))
+                safe_a = jnp.where(finite[..., None, None], a, identity)
+                factors, pivots, _ = lax.linalg.lu(safe_a)
+                diagonal = jnp.diagonal(factors, axis1=-2, axis2=-1)
+                valid = (
+                    finite
+                    & jnp.all(jnp.isfinite(factors), axis=(-2, -1))
+                    & jnp.all(diagonal != 0, axis=-1)
+                )
+                # Invalid cells must not reach the native triangular solves.
+                factors = jnp.where(valid[..., None, None], factors, identity)
+                identity_pivots = jnp.arange(n, dtype=pivots.dtype)
+                pivots = jnp.where(valid[..., None], pivots, identity_pivots)
+                b = jnp.where(valid[..., None, None], b, jnp.zeros_like(b))
+                x = lu_solve((factors, pivots), b, trans=int(transpose))
+                return jnp.where(valid[..., None, None], x, jnp.zeros_like(x)), valid
+
+            function = recover_shared_matrix(operands, function)
+            types = [ir.RankedTensorType(value.type) for value in operands]
+            multiple_results = True
+        elif op.name == "stablehlo.cholesky":
             lower = (
                 "lower" in op.attributes and ir.BoolAttr(op.attributes["lower"]).value
             )
@@ -1234,28 +1343,7 @@ def _lower_native_linalg(ctx, module):
             function = partial(lax.linalg.triangular_solve, **options)
             # JAX folds mapped right-hand sides into the solve's free dimension
             # when the matrix is shared. Recover that proof from leading broadcasts.
-            while isinstance(operands[0], ir.OpResult):
-                broadcast = operands[0].owner.operation
-                if broadcast.name != "stablehlo.broadcast_in_dim":
-                    break
-                source = broadcast.operands[0]
-                inner = ir.RankedTensorType(source.type)
-                outer = ir.RankedTensorType(operands[0].type)
-                added = len(outer.shape) - len(inner.shape)
-                dimensions = list(
-                    ir.DenseI64ArrayAttr(broadcast.attributes["broadcast_dimensions"])
-                )
-                if (
-                    added <= 0
-                    or len(inner.shape) < 2
-                    or not inner.has_static_shape
-                    or list(outer.shape[added:]) != list(inner.shape)
-                    or dimensions != list(range(added, len(outer.shape)))
-                ):
-                    break
-                operands[0] = source
-                for _ in range(added):
-                    function = jax.vmap(function, in_axes=(None, 0))
+            function = recover_shared_matrix(operands, function)
             types = [ir.RankedTensorType(value.type) for value in operands]
         operation_ctx = ctx.replace(
             avals_in=[to_jax_type(ty) for ty in types],
@@ -1263,10 +1351,11 @@ def _lower_native_linalg(ctx, module):
             primitive=None,
         )
         with ir.InsertionPoint(op), op.location:
-            replacement = jax_mlir.lower_fun(function, multiple_results=False)(
-                operation_ctx, *operands
-            )
-        op.results[0].replace_all_uses_with(replacement[0])
+            replacement = jax_mlir.lower_fun(
+                function, multiple_results=multiple_results
+            )(operation_ctx, *operands)
+        for result, value in zip(op.results, replacement):
+            result.replace_all_uses_with(value)
         op.erase()
 
 
