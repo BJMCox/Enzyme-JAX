@@ -159,9 +159,21 @@ inline LogicalResult tryToBatchInner(Operation *src, OpBuilder &builder,
             isa<WhileOp, ReturnOp, ConstantOp, ReshapeOp, BroadcastInDimOp,
                 TransposeOp, SliceOp, DynamicSliceOp, DynamicUpdateSliceOp,
                 ConcatenateOp, DotGeneralOp, GatherOp, IotaOp,
-                GetDimensionSizeOp, ReverseOp>(op)) ||
+                GetDimensionSizeOp, ReverseOp, ReduceOp>(op)) ||
           !isMemoryEffectFree(op))
         safe = false;
+      if (auto reduce = dyn_cast<ReduceOp>(op)) {
+        // The batched reduce rule needs a lane-invariant scalar init and
+        // cannot batch reducer regions that capture per-lane values.
+        for (Value init : reduce.getInitValues())
+          if (!init.getDefiningOp<ConstantOp>())
+            safe = false;
+        for (Block &block : reduce.getRegion())
+          for (Operation &nested : block)
+            for (Value operand : nested.getOperands())
+              if (operand.getParentRegion() != &reduce.getRegion())
+                safe = false;
+      }
     });
     if (!safe)
       return failure();
