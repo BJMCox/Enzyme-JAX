@@ -75,16 +75,31 @@ module {
 }
 
 // CHECK: func.func @main(%arg0: tensor<8000x3xf32>, %arg1: tensor<460000x1xi32>, %arg2: tensor<460000x3xf32>, %arg3: tensor<8000x3xf32>) -> (tensor<8000x3xf32>, tensor<460000x1xi32>, tensor<460000x3xf32>) {
-// CHECK-NEXT:   %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-// CHECK-NEXT:   %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<460000x3xf32>
-// CHECK-NEXT:    %cst_1 = arith.constant dense<0> : tensor<460000x1xi32>
-// CHECK-NEXT:    %0 = "stablehlo.scatter"(%arg3, %arg1, %cst_0) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [1], inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
-// CHECK-NEXT:   ^bb0(%arg4: tensor<f32>, %arg5: tensor<f32>):
-// CHECK-NEXT:     stablehlo.return %cst : tensor<f32>
-// CHECK-NEXT:   }) : (tensor<8000x3xf32>, tensor<460000x1xi32>, tensor<460000x3xf32>) -> tensor<8000x3xf32>
-// CHECK-NEXT:    %1 = "stablehlo.gather"(%arg3, %arg1) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 3>}> : (tensor<8000x3xf32>, tensor<460000x1xi32>) -> tensor<460000x3xf32>
-// CHECK-NEXT:    return %0, %cst_1, %1 : tensor<8000x3xf32>, tensor<460000x1xi32>, tensor<460000x3xf32>
-// CHECK-NEXT: }
+// CHECK-DAG: [[ZERO_UPDATES:%.*]] = stablehlo.constant dense<0.000000e+00> : tensor<1380000xf32>
+// CHECK-DAG: [[ZERO_SEED:%.*]] = stablehlo.constant dense<0.000000e+00> : tensor<8000x3xf32>
+// CHECK-DAG: [[ONE:%.*]] = stablehlo.constant dense<1> : tensor<8000x3xi64>
+// CHECK-DAG: [[ONE_UPDATE:%.*]] = stablehlo.constant dense<1> : tensor<460000x3xi64>
+// CHECK-DAG: [[ZERO_IDS:%.*]] = stablehlo.constant dense<0> : tensor<8000x3xi64>
+// CHECK-DAG: [[ZERO_INDEX:%.*]] = arith.constant dense<0> : tensor<460000x1xi32>
+// CHECK: [[IOTA:%.*]] = stablehlo.iota dim = 0 : tensor<1380000xi64>
+// CHECK: [[SHAPED_IDS:%.*]] = stablehlo.reshape [[IOTA]] : (tensor<1380000xi64>) -> tensor<460000x3xi64>
+// CHECK: [[IDS:%.*]] = stablehlo.add [[SHAPED_IDS]], [[ONE_UPDATE]] : tensor<460000x3xi64>
+// CHECK: [[WINNER:%.*]] = "stablehlo.scatter"([[ZERO_IDS]], %arg1, [[IDS]]) {{.*}}unique_indices = false
+// CHECK: ^bb0([[OLD_ID:%.*]]: tensor<i64>, [[NEW_ID:%.*]]: tensor<i64>):
+// CHECK-NEXT: [[MAX:%.*]] = stablehlo.maximum [[OLD_ID]], [[NEW_ID]] : tensor<i64>
+// CHECK-NEXT: stablehlo.return [[MAX]] : tensor<i64>
+// CHECK: [[WRITTEN:%.*]] = stablehlo.compare NE, [[WINNER]], [[ZERO_IDS]]
+// CHECK: [[BASE:%.*]] = stablehlo.select [[WRITTEN]], [[ZERO_SEED]], %arg3
+// CHECK: [[INDEX:%.*]] = stablehlo.subtract [[WINNER]], [[ONE]] : tensor<8000x3xi64>
+// CHECK: [[FLAT_INDEX:%.*]] = stablehlo.reshape [[INDEX]] : (tensor<8000x3xi64>) -> tensor<24000x1xi64>
+// CHECK: [[SEED:%.*]] = stablehlo.select [[WRITTEN]], %arg3, [[ZERO_SEED]]
+// CHECK: [[FLAT_SEED:%.*]] = stablehlo.reshape [[SEED]] : (tensor<8000x3xf32>) -> tensor<24000xf32>
+// CHECK: [[UPDATE:%.*]] = "stablehlo.scatter"([[ZERO_UPDATES]], [[FLAT_INDEX]], [[FLAT_SEED]]) {{.*}}scatter_dims_to_operand_dims = [0], index_vector_dim = 1>{{.*}}unique_indices = false
+// CHECK: ^bb0([[OLD_SEED:%.*]]: tensor<f32>, [[NEW_SEED:%.*]]: tensor<f32>):
+// CHECK-NEXT: [[SUM:%.*]] = stablehlo.add [[OLD_SEED]], [[NEW_SEED]] : tensor<f32>
+// CHECK-NEXT: stablehlo.return [[SUM]] : tensor<f32>
+// CHECK: [[RESULT:%.*]] = stablehlo.reshape [[UPDATE]] : (tensor<1380000xf32>) -> tensor<460000x3xf32>
+// CHECK-NEXT: return [[BASE]], [[ZERO_INDEX]], [[RESULT]] : tensor<8000x3xf32>, tensor<460000x1xi32>, tensor<460000x3xf32>
 
 // -----
 

@@ -3319,6 +3319,87 @@ class AutoDiffScatterRev
     : public ReverseAutoDiffOpInterface::ExternalModel<AutoDiffScatterRev,
                                                        ScatterOp> {
 public:
+  static bool needsWinner(stablehlo::ScatterOp op,
+                          MGradientUtilsReverse *gutils,
+                          const CheckCommonScatterOp &check) {
+    return check.kind == stablehlo::ScatterOpKind::Setindex &&
+           !op.getUniqueIndices() &&
+           !gutils->isConstantValue(op.getUpdates()[0]);
+  }
+
+  static int64_t updateCount(stablehlo::ScatterOp op) {
+    auto input = cast<RankedTensorType>(op.getInputs()[0].getType());
+    auto updates = cast<RankedTensorType>(op.getUpdates()[0].getType());
+    if (!input.hasStaticShape() || !updates.hasStaticShape())
+      return -1;
+    int64_t count = 1;
+    for (int64_t size : updates.getShape()) {
+      if (size && count > std::numeric_limits<int64_t>::max() / size)
+        return -1;
+      count *= size;
+    }
+    return count;
+  }
+
+  static Value updateIds(OpBuilder &builder, Location loc,
+                         RankedTensorType type, int64_t count) {
+    auto idsType = type.clone(builder.getI64Type());
+    Value ids = stablehlo::IotaOp::create(
+        builder, loc, RankedTensorType::get({count}, builder.getI64Type()), 0);
+    ids = stablehlo::ReshapeOp::create(builder, loc, idsType, ids);
+    Value one = stablehlo::ConstantOp::create(
+        builder, loc, cast<ElementsAttr>(makeAttr(idsType, 1)));
+    return stablehlo::AddOp::create(builder, loc, ids, one);
+  }
+
+  static void transposeWinner(stablehlo::ScatterOp op,
+                              MGradientUtilsReverse *gutils, OpBuilder &builder,
+                              Value winner, Value seed) {
+    auto loc = op.getLoc();
+    Value zeroIds = makeZero(builder, loc, winner.getType());
+    Value written = stablehlo::CompareOp::create(
+        builder, loc, winner, zeroIds, stablehlo::ComparisonDirection::NE);
+    Value zeroSeed = makeZero(builder, loc, seed.getType());
+    if (!gutils->isConstantValue(op.getInputs()[0])) {
+      Value inputDiffe =
+          stablehlo::SelectOp::create(builder, loc, written, zeroSeed, seed);
+      gutils->addToDiffe(op.getInputs()[0], inputDiffe, builder);
+    }
+
+    auto updateType = cast<RankedTensorType>(op.getUpdates()[0].getType());
+    auto flatType =
+        RankedTensorType::get({updateCount(op)}, updateType.getElementType());
+    Value updateDiffe = makeZero(builder, loc, flatType);
+    auto idsType = cast<RankedTensorType>(winner.getType());
+    int64_t size = idsType.getNumElements();
+    if (size != 0) {
+      Value one = stablehlo::ConstantOp::create(
+          builder, loc, cast<ElementsAttr>(makeAttr(idsType, 1)));
+      Value indices = stablehlo::SubtractOp::create(builder, loc, winner, one);
+      indices = stablehlo::ReshapeOp::create(
+          builder, loc, RankedTensorType::get({size, 1}, builder.getI64Type()),
+          indices);
+      Value updates =
+          stablehlo::SelectOp::create(builder, loc, written, seed, zeroSeed);
+      updates = stablehlo::ReshapeOp::create(
+          builder, loc,
+          RankedTensorType::get({size}, updateType.getElementType()), updates);
+      // Transpose the actual scalar writer map. Inverting the original window
+      // with gather would clamp partial out-of-bounds windows and lose writes.
+      auto dims = stablehlo::ScatterDimensionNumbersAttr::get(
+          op.getContext(), {}, {0}, {}, {}, {0}, 1);
+      auto scatter = stablehlo::ScatterOp::create(
+          builder, loc, TypeRange{flatType}, ValueRange{updateDiffe}, indices,
+          ValueRange{updates}, dims, builder.getBoolAttr(false),
+          builder.getBoolAttr(false));
+      createAddRegion(scatter);
+      updateDiffe = scatter.getResult(0);
+    }
+    updateDiffe =
+        stablehlo::ReshapeOp::create(builder, loc, updateType, updateDiffe);
+    gutils->addToDiffe(op.getUpdates()[0], updateDiffe, builder);
+  }
+
   LogicalResult createReverseModeAdjoint(Operation *op, OpBuilder &builder,
                                          MGradientUtilsReverse *gutils,
                                          SmallVector<Value> caches) const {
@@ -3328,6 +3409,12 @@ public:
         mlir::stablehlo::CheckCommonScatterOp(scatterOp);
 
     using ScatterOpKind = mlir::stablehlo::ScatterOpKind;
+    if (needsWinner(scatterOp, gutils, checkCommonScatterOp) &&
+        updateCount(scatterOp) != 0 &&
+        (updateCount(scatterOp) < 0 || gutils->width != 1))
+      return op->emitError(
+          "non-unique set scatter differentiation requires static shapes "
+          "and derivative width one");
     switch (checkCommonScatterOp.kind) {
     case stablehlo::ScatterOpKind::Setindex:
     case stablehlo::ScatterOpKind::ConstantSetindex:
@@ -3364,7 +3451,20 @@ public:
       gutils->zeroDiffe(scatterOp.getResult(i), builder);
     }
 
+    // Empty updates leave the input unchanged and have no update cotangent.
+    if (updateCount(scatterOp) == 0) {
+      for (auto [i, input] : llvm::enumerate(scatterOp.getInputs()))
+        if (!gutils->isConstantValue(input))
+          gutils->addToDiffe(input, outputDiffe[i], builder);
+      return success();
+    }
+
     auto scatterIndices = gutils->popCache(caches[0], builder);
+    if (needsWinner(scatterOp, gutils, checkCommonScatterOp)) {
+      Value winner = gutils->popCache(caches[1], builder);
+      transposeWinner(scatterOp, gutils, builder, winner, outputDiffe[0]);
+      return success();
+    }
 
     SmallVector<Value> cachedOperands;
     SmallVector<Value> cachedUpdates;
@@ -3621,6 +3721,9 @@ public:
                                  MGradientUtilsReverse *gutils) const {
     auto scatterOp = cast<ScatterOp>(orig);
 
+    if (updateCount(scatterOp) == 0)
+      return {};
+
     bool anyNonConst = false;
 
     for (auto input : scatterOp.getInputs()) {
@@ -3650,6 +3753,66 @@ public:
 
       auto checkCommonScatterOp =
           mlir::stablehlo::CheckCommonScatterOp(scatterOp);
+
+      if (needsWinner(scatterOp, gutils, checkCommonScatterOp) &&
+          updateCount(scatterOp) > 0 && gutils->width == 1) {
+        auto primal = cast<stablehlo::ScatterOp>(newOp);
+        auto loc = orig->getLoc();
+        auto inputType =
+            cast<RankedTensorType>(primal.getInputs()[0].getType());
+        auto updateType =
+            cast<RankedTensorType>(primal.getUpdates()[0].getType());
+        auto idsType = inputType.clone(cacheBuilder.getI64Type());
+        Value zero = stablehlo::ConstantOp::create(
+            cacheBuilder, loc, cast<ElementsAttr>(makeAttr(idsType, 0)));
+        Value ids =
+            updateIds(cacheBuilder, loc, updateType, updateCount(scatterOp));
+        // MAX chooses one legal set-scatter schedule deterministically. The
+        // primal is reconstructed from these same IDs: a separate data scatter
+        // could choose a different writer at duplicate indices.
+        auto selected = stablehlo::ScatterOp::create(
+            cacheBuilder, loc, TypeRange{idsType}, ValueRange{zero},
+            primal.getScatterIndices(), ValueRange{ids},
+            primal.getScatterDimensionNumbersAttr(),
+            primal.getIndicesAreSortedAttr(), primal.getUniqueIndicesAttr());
+        auto *body = cacheBuilder.createBlock(&selected.getUpdateComputation());
+        auto scalar = RankedTensorType::get({}, cacheBuilder.getI64Type());
+        body->addArgument(scalar, loc);
+        body->addArgument(scalar, loc);
+        {
+          OpBuilder::InsertionGuard guard(cacheBuilder);
+          cacheBuilder.setInsertionPointToStart(body);
+          Value winner = stablehlo::MaxOp::create(
+              cacheBuilder, loc, body->getArgument(0), body->getArgument(1));
+          stablehlo::ReturnOp::create(cacheBuilder, loc, winner);
+        }
+        cacheBuilder.setInsertionPointAfter(selected);
+        Value winner = selected.getResult(0);
+        caches.push_back(gutils->initAndPushCache(winner, cacheBuilder));
+        Value one = stablehlo::ConstantOp::create(
+            cacheBuilder, loc, cast<ElementsAttr>(makeAttr(idsType, 1)));
+        Value index =
+            stablehlo::SubtractOp::create(cacheBuilder, loc, winner, one);
+        Value flat = stablehlo::ReshapeOp::create(
+            cacheBuilder, loc,
+            RankedTensorType::get({updateCount(scatterOp)},
+                                  updateType.getElementType()),
+            primal.getUpdates()[0]);
+        auto dims = stablehlo::GatherDimensionNumbersAttr::get(
+            orig->getContext(), {}, {0}, {}, {}, {0}, inputType.getRank());
+        Value values = stablehlo::GatherOp::create(
+            cacheBuilder, loc, flat, index, dims,
+            cacheBuilder.getDenseI64ArrayAttr({1}), false);
+        Value written =
+            stablehlo::CompareOp::create(cacheBuilder, loc, winner, zero,
+                                         stablehlo::ComparisonDirection::NE);
+        Value result = stablehlo::SelectOp::create(
+            cacheBuilder, loc, written, values, primal.getInputs()[0]);
+        gutils->replaceOrigOpWith(orig, {result});
+        gutils->erase(newOp);
+        gutils->originalToNewFn.map(orig, result.getDefiningOp());
+        return caches;
+      }
 
       bool needsOperandCached = needsOperandsCached(checkCommonScatterOp);
       bool needsUpdateCached = needsUpdatesCached(checkCommonScatterOp);
