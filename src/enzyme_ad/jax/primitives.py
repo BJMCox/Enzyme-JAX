@@ -26,6 +26,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from . import enzyme_call
 from ._hlo_linearize import linearize_hlo
 from ._hlo_batch import batch_hlo
+from ._hlo_solve import recognize_solve
 
 from .utils import default_nowheel_resource, default_linux_cflags
 
@@ -193,7 +194,15 @@ def optimization_passes(
         ]
     )
 
-    func_passes = ",".join(["canonicalize", "cse", "canonicalize", transform_passes])
+    func_passes = ",".join(
+        [
+            "func.func(stablehlo-legalize-composite-to-call{except=enzyme.linalg.solve})",
+            "canonicalize",
+            "cse",
+            "canonicalize",
+            transform_passes,
+        ]
+    )
 
     if inline:
         func_passes = (
@@ -747,6 +756,7 @@ def _enzyme_primal_lowering(
             else:
                 run_pipeline = "lower-chlo-gamma-f32"
 
+            run_pipeline += ",func.func(stablehlo-legalize-composite-to-call)"
             try:
                 name, nmod = enzyme_call.run_pass_pipeline(fns, source, run_pipeline)
             except Exception as e:
@@ -1274,6 +1284,7 @@ def hlo_call(
     argv: tuple[str] = (),
     passes: str = _HLO_IMPORT_PASSES,
 ):
+    source = recognize_solve(source)
     fn = "main"
     with jax_mlir.make_ir_context():
         nmod = ir.Module.parse(source)

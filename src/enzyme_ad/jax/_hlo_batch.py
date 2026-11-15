@@ -8,6 +8,7 @@ from jaxlib.mlir.dialects import func
 
 from . import enzyme_call
 from ._hlo_linearize import _external_values, _extract, _pure, _tensor, _walk
+from ._hlo_solve import pure_function
 
 # Unknown operations retain pointwise execution. In particular, batching an RNG
 # state is not equivalent to asking one RNG state for a larger output tensor.
@@ -31,10 +32,16 @@ _CHLO_UNARY = frozenset(
 )
 
 
-def _batchable(op):
+def _batchable(op, functions):
     name = op.name.removeprefix("stablehlo.")
     if op.name == "func.return" or name == "return":
         return True
+    if op.name == "stablehlo.composite":
+        if ir.StringAttr(op.attributes["name"]).value != "enzyme.linalg.solve":
+            return False
+        symbol = ir.FlatSymbolRefAttr(op.attributes["decomposition"]).value
+        function = functions.get(symbol)
+        return function is not None and pure_function(function, functions)
     if not _pure(op):
         return False
     if not all(_tensor(v.type) for v in (*op.operands, *op.results)):
@@ -67,7 +74,7 @@ def _batchable(op):
     elif name != "while":
         return False
     return all(
-        _batchable(child.operation)
+        _batchable(child.operation, functions)
         for region in op.regions
         for block in region.blocks
         for child in block.operations
@@ -84,7 +91,7 @@ def batch_hlo(source, pipeline, size, post_pipeline="", mapped=None):
         return None
 
 
-def _shared_batch(function, mapped, size):
+def _shared_batch(function, functions, mapped, size):
     """Compute the pure graph independent of mapped inputs once per call."""
     arguments = list(function.entry_block.arguments)
     known = {v for v, varies in zip(arguments, mapped) if not varies}
@@ -110,11 +117,43 @@ def _shared_batch(function, mapped, size):
     needed = (known & used) - constant_values
     frontier = [v for v in ordered if v in needed]
     lane_inputs = [v for v, varies in zip(arguments, mapped) if varies]
+    # Keep the transitive closure of symbols used by the shared and lane
+    # graphs, including composite decompositions and their calls.
+    symbols = {}
+    pending = [function.operation]
+    while pending:
+        for op in _walk(pending.pop()):
+            key = (
+                "callee"
+                if op.name == "func.call"
+                else "decomposition"
+                if op.name == "stablehlo.composite"
+                else None
+            )
+            if key is None:
+                continue
+            name = ir.FlatSymbolRefAttr(op.attributes[key]).value
+            if name in symbols:
+                continue
+            target = functions.get(name)
+            if target is None or name == "main":
+                raise ValueError("batch extraction cannot retain symbol")
+            symbols[name] = target
+            pending.append(target.operation)
+
+    cell_name = "enzyme_batch_cell"
+    while cell_name in symbols or cell_name == "main":
+        cell_name += "_"
     module = ir.Module.parse(
-        _extract(lane_inputs + frontier, constants + varying, returned)
+        _extract(
+            lane_inputs + frontier,
+            constants + varying,
+            returned,
+            functions=symbols.values(),
+            name=cell_name,
+        )
     )
-    cell = module.body.operations[0]
-    cell.attributes["sym_name"] = ir.StringAttr.get("enzyme_batch_cell")
+    cell = next(f for f in module.body.operations if f.name.value == cell_name)
     cell.attributes["sym_visibility"] = ir.StringAttr.get("private")
 
     def batched(ty):
@@ -159,7 +198,7 @@ def _shared_batch(function, mapped, size):
                 results=[batched(v.type) for v in returned],
                 operands=operands,
                 attributes={
-                    "fn": ir.FlatSymbolRefAttr.get("enzyme_batch_cell"),
+                    "fn": ir.FlatSymbolRefAttr.get(cell_name),
                     "batch_shape": ir.DenseI64ArrayAttr.get([size]),
                 },
             )
@@ -183,7 +222,15 @@ def _batch_hlo(source, pipeline, size, post_pipeline, mapped):
             for f in module.body.operations
             if f.operation.name == "func.func" and f.name.value == name
         )
-        if not all(_batchable(op.operation) for op in original.entry_block.operations):
+        functions = {
+            f.name.value: f
+            for f in module.body.operations
+            if f.operation.name == "func.func"
+        }
+        if not all(
+            _batchable(op.operation, functions)
+            for op in original.entry_block.operations
+        ):
             return None
         inputs, outputs = list(original.type.inputs), list(original.type.results)
         if not all(_tensor(ty) for ty in inputs + outputs):
@@ -191,7 +238,7 @@ def _batch_hlo(source, pipeline, size, post_pipeline, mapped):
         if mapped is not None and len(mapped) != len(inputs):
             return None
         if mapped is not None and not all(mapped):
-            batched_source = _shared_batch(original, mapped, size)
+            batched_source = _shared_batch(original, functions, mapped, size)
         else:
             names = {f.attributes["sym_name"].value for f in module.body.operations}
             cell = "enzyme_batch_cell"

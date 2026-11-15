@@ -210,6 +210,7 @@ py_library(
         "__init__.py",
         "_hlo_batch.py",
         "_hlo_linearize.py",
+        "_hlo_solve.py",
         "primitives.py",
         "utils.py",
     ],

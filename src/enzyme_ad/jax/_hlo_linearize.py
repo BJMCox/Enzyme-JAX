@@ -47,11 +47,13 @@ def _tensor(ty):
     return isinstance(ty, ir.RankedTensorType) and ty.has_static_shape
 
 
-def _extract(arguments, operations, results):
+def _extract(arguments, operations, results, *, functions=(), name="main"):
     module = ir.Module.create()
     with ir.InsertionPoint(module.body):
+        for function in functions:
+            function.operation.clone()
         function = func.FuncOp(
-            "main", ([v.type for v in arguments], [v.type for v in results])
+            name, ([v.type for v in arguments], [v.type for v in results])
         )
         block = function.add_entry_block()
         mapped = dict(zip(arguments, block.arguments))
