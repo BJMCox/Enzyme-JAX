@@ -5163,6 +5163,56 @@ public:
   }
 };
 
+// Minimize each branch's tape before promoting its caches to branch results.
+// Otherwise an inactive branch still materializes every dummy cache tensor.
+static void
+minimizeBranchCaches(Operation *op, ArrayRef<Block *> blocks,
+                     ArrayRef<const IRMapping *> mappings,
+                     llvm::MapVector<Value, CacheInfo> &pushedCaches,
+                     PatternRewriter &rewriter) {
+  if (pushedCaches.empty() || op->hasAttr(kPreserveCacheAttrName) ||
+      !hasMinCut(op))
+    return;
+
+  Operation *reverse = nullptr;
+  for (auto &[_, info] : pushedCaches) {
+    Operation *parent = info.popOp->getParentOp();
+    while (parent && parent->getName() != op->getName())
+      parent = parent->getParentOp();
+    if (!parent)
+      return;
+    if (!reverse || parent->isProperAncestor(reverse))
+      reverse = parent;
+  }
+  if (reverse == op || op->isProperAncestor(reverse) ||
+      reverse->isProperAncestor(op) ||
+      reverse->getNumRegions() != blocks.size())
+    return;
+
+  SmallVector<SmallVector<CacheInfo>> branchCaches(blocks.size());
+  for (auto &[value, info] : pushedCaches) {
+    auto branch = llvm::find(blocks, value.getParentBlock());
+    if (branch == blocks.end())
+      return;
+    size_t index = branch - blocks.begin();
+    // Nested branches can have their own reverse op. Do not cut across it.
+    if (!reverse->getRegion(index).isAncestor(info.popOp->getParentRegion()))
+      return;
+    branchCaches[index].push_back(info);
+  }
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  pushedCaches.clear();
+  for (size_t index = 0; index < blocks.size(); ++index) {
+    Block *reverseBlock = &reverse->getRegion(index).front();
+    rewriter.setInsertionPointToStart(reverseBlock);
+    minCutCache(blocks[index], reverseBlock, branchCaches[index], rewriter,
+                *mappings[index]);
+    for (auto &info : branchCaches[index])
+      pushedCaches[info.pushedValue()] = info;
+  }
+}
+
 struct IfOpEnzymeOpsRemover
     : public EnzymeOpsRemoverOpInterface::ExternalModel<IfOpEnzymeOpsRemover,
                                                         stablehlo::IfOp> {
@@ -5218,6 +5268,9 @@ struct IfOpEnzymeOpsRemover
 
     if (gradients.empty() && pushedCaches.empty())
       return success();
+
+    minimizeBranchCaches(op, {trueBlock, falseBlock},
+                         {&trueMapping, &falseMapping}, pushedCaches, rewriter);
 
     Operation *trueTerm = trueBlock->getTerminator();
     Operation *falseTerm = falseBlock->getTerminator();
@@ -5317,6 +5370,11 @@ struct CaseOpEnzymeOpsRemover
 
     if (gradients.empty() && pushedCaches.empty())
       return success();
+
+    SmallVector<const IRMapping *> branchMappings;
+    for (auto &mapping : mappings)
+      branchMappings.push_back(&mapping);
+    minimizeBranchCaches(op, blocks, branchMappings, pushedCaches, rewriter);
 
     SmallVector<Operation *> terminators;
     for (Block *bb : blocks) {
