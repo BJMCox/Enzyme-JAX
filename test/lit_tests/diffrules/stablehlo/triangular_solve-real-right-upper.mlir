@@ -12,7 +12,7 @@ func.func @triangular_solve_real_right_upper(%A : tensor<2x2xf32>, %b : tensor<2
 // FORWARD:   %cst = stablehlo.constant dense<0.000000e+00> : tensor<2x2xf32>
 // FORWARD:   %0 = "stablehlo.triangular_solve"(%arg0, %arg2) <{left_side = false, lower = false, transpose_a = #stablehlo<transpose NO_TRANSPOSE>, unit_diagonal = false}> : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
 // FORWARD:   %1 = stablehlo.select %c, %arg1, %cst : tensor<2x2xi1>, tensor<2x2xf32>
-// FORWARD:   %2 = stablehlo.dot_general %0, %1, contracting_dims = [1] x [0] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+// FORWARD:   %2 = stablehlo.dot_general %0, %1, contracting_dims = [1] x [0], precision = [HIGHEST, HIGHEST] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
 // FORWARD:   %3 = stablehlo.subtract %arg3, %2 : tensor<2x2xf32>
 // FORWARD:   %4 = "stablehlo.triangular_solve"(%arg0, %3) <{left_side = false, lower = false, transpose_a = #stablehlo<transpose NO_TRANSPOSE>, unit_diagonal = false}> : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
 // FORWARD:   return %0, %4 : tensor<2x2xf32>, tensor<2x2xf32>
@@ -23,7 +23,7 @@ func.func @triangular_solve_real_right_upper(%A : tensor<2x2xf32>, %b : tensor<2
 // REVERSE:   %c = stablehlo.constant dense<{{\[\[}}true, true], [false, true]]> : tensor<2x2xi1>
 // REVERSE:   %0 = "stablehlo.triangular_solve"(%arg0, %arg2) <{left_side = false, lower = false, transpose_a = #stablehlo<transpose TRANSPOSE>, unit_diagonal = false}> : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
 // REVERSE:   %1 = "stablehlo.triangular_solve"(%arg0, %arg1) <{left_side = false, lower = false, transpose_a = #stablehlo<transpose NO_TRANSPOSE>, unit_diagonal = false}> : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
-// REVERSE:   %2 = stablehlo.dot_general %1, %0, contracting_dims = [0] x [0] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+// REVERSE:   %2 = stablehlo.dot_general %1, %0, contracting_dims = [0] x [0], precision = [HIGHEST, HIGHEST] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
 // REVERSE:   %3 = stablehlo.negate %2 : tensor<2x2xf32>
 // REVERSE:   %4 = stablehlo.select %c, %3, %cst : tensor<2x2xi1>, tensor<2x2xf32>
 // REVERSE:   return %4, %0 : tensor<2x2xf32>, tensor<2x2xf32>

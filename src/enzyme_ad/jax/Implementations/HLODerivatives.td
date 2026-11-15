@@ -1581,7 +1581,13 @@ def TriangularSolveAdjointLike : SubRoutine<(Op $A, $diffret),
     (TriangularSolveGetAdjointTransposeA)
   )>;
 
-def TriangularSolveDotPrec : GlobalExpr</*needsprimal*/0, /*needsshadow*/0, [{ArrayAttr();}]>;
+// The solve has no reduced-precision setting. Its derivative products must
+// retain the scalar precision of its inputs on accelerators.
+def TriangularSolveDotPrec : GlobalExpr</*needsprimal*/0, /*needsshadow*/0, [{
+  builder.getArrayAttr(
+      {PrecisionAttr::get(builder.getContext(), Precision::HIGHEST),
+       PrecisionAttr::get(builder.getContext(), Precision::HIGHEST)});
+}]>;
 
 // `bar(b)` goes first in the contraction for (left, NO_TRANSPOSE) and (right, TRANSPOSE)
 def SelectIfTriangularSolveDiffFirst : StaticSelect<
