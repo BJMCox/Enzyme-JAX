@@ -21977,6 +21977,8 @@ static bool extractGridIotasFromAttr(DenseElementsAttr constAttr,
   if (!isa<IntegerType>(elemType)) {
     return false;
   }
+  if (tensorType.getNumElements() == 0)
+    return false;
   if (constAttr.isSplat()) {
     TypedAttr zeroScale = IntegerAttr::get(elemType, 0);
     IotaLikeTensor constIota;
