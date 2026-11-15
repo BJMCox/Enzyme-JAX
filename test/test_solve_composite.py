@@ -115,6 +115,69 @@ class SolveCompositeTest(absltest.TestCase):
         np.testing.assert_allclose(ga[1], 0, atol=2e-11)
         np.testing.assert_allclose(gb, expected_gradient[1], rtol=2e-11, atol=2e-11)
 
+    def test_native_solve_ambiguous_pivot_uses_portable_validity(self):
+        source = MATRIX_SOURCE.replace("0x7FF0000000000000", "0x7F800000").replace(
+            "f64", "f32"
+        )
+        function = jax.jit(lambda a, b: hlo_call(a, b, source=source))
+        singular = np.array([[3, 3], [1, 1]], dtype=np.float32)
+        rhs = np.array([[1, 2], [3, 4]], dtype=np.float32)
+        value, valid = function(singular, rhs)
+        np.testing.assert_array_equal(value, np.zeros_like(rhs))
+        self.assertFalse(bool(valid))
+
+        tiny = np.float32(2**-30)
+        matrix = np.diag(np.array([1, tiny], dtype=np.float32))
+        rhs = np.array([[1, 2], [tiny, -tiny]], dtype=np.float32)
+        value, valid = function(matrix, rhs)
+        self.assertTrue(bool(valid))
+        np.testing.assert_allclose(value, [[1, 2], [1, -1]], rtol=1e-6, atol=1e-6)
+
+        mapped = jax.jit(jax.vmap(lambda a, b: hlo_call(a, b, source=source)))
+        values, valid = mapped(
+            np.stack((singular, matrix)), np.stack((np.eye(2, dtype=np.float32), rhs))
+        )
+        np.testing.assert_array_equal(valid, [False, True])
+        np.testing.assert_array_equal(values[0], np.zeros((2, 2), dtype=np.float32))
+        np.testing.assert_allclose(values[1], [[1, 2], [1, -1]], rtol=1e-6, atol=1e-6)
+
+    def test_native_adjoint_keeps_the_primal_validity(self):
+        source = MATRIX_SOURCE.replace("0x7FF0000000000000", "0x7F800000").replace(
+            "f64", "f32"
+        )
+        # A rounded LU pivot can vanish only after transposing the matrix.
+        source = source.replace(
+            "%nonzero = stablehlo.compare NE, %det, %zero, FLOAT",
+            """%abs00 = stablehlo.abs %a00 : tensor<f32>
+    %abs10 = stablehlo.abs %a10 : tensor<f32>
+    %swap = stablehlo.compare GT, %abs10, %abs00, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+    %pivot = stablehlo.select %swap, %a10, %a00 : tensor<i1>, tensor<f32>
+    %upper = stablehlo.select %swap, %a11, %a01 : tensor<i1>, tensor<f32>
+    %lower = stablehlo.select %swap, %a00, %a10 : tensor<i1>, tensor<f32>
+    %last = stablehlo.select %swap, %a01, %a11 : tensor<i1>, tensor<f32>
+    %multiplier = stablehlo.divide %lower, %pivot : tensor<f32>
+    %product = stablehlo.multiply %multiplier, %upper : tensor<f32>
+    %rounded = stablehlo.optimization_barrier %product : tensor<f32>
+    %trailing = stablehlo.subtract %last, %rounded : tensor<f32>
+    %nonzero = stablehlo.compare NE, %trailing, %zero, FLOAT""",
+        )
+        matrix = np.array(
+            [[1, 7], [np.nextafter(np.float32(3), np.float32(np.inf)), 21]],
+            dtype=np.float32,
+        )
+        rhs = np.eye(2, dtype=np.float32)
+        function = jax.jit(lambda a, b: hlo_call(a, b, source=source))
+        _, valid = function(matrix, rhs)
+        self.assertTrue(bool(valid))
+        gradient = jax.jit(
+            jax.grad(lambda a, b: jnp.trace(function(a, b)[0]), argnums=1)
+        )(matrix, rhs)
+        a = matrix.astype(np.float64)
+        g = np.asarray(gradient, dtype=np.float64)
+        residual = np.linalg.norm(a.T @ g - rhs, ord=np.inf)
+        scale = np.linalg.norm(a.T, ord=np.inf) * np.linalg.norm(g, ord=np.inf) + 1
+        self.assertLess(residual / scale, 8 * np.finfo(np.float32).eps)
+
     def test_unrelated_composite_uses_its_decomposition(self):
         source = """
         module {

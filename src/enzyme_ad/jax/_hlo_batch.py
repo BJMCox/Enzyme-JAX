@@ -7,7 +7,14 @@ from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import func
 
 from . import enzyme_call
-from ._hlo_linearize import _external_values, _extract, _pure, _tensor, _walk
+from ._hlo_linearize import (
+    _external_values,
+    _extract,
+    _pure,
+    _referenced_functions,
+    _tensor,
+    _walk,
+)
 from ._hlo_solve import pure_function
 
 # Unknown operations retain pointwise execution. In particular, batching an RNG
@@ -119,27 +126,7 @@ def _shared_batch(function, functions, mapped, size):
     lane_inputs = [v for v, varies in zip(arguments, mapped) if varies]
     # Keep the transitive closure of symbols used by the shared and lane
     # graphs, including composite decompositions and their calls.
-    symbols = {}
-    pending = [function.operation]
-    while pending:
-        for op in _walk(pending.pop()):
-            key = (
-                "callee"
-                if op.name == "func.call"
-                else "decomposition"
-                if op.name == "stablehlo.composite"
-                else None
-            )
-            if key is None:
-                continue
-            name = ir.FlatSymbolRefAttr(op.attributes[key]).value
-            if name in symbols:
-                continue
-            target = functions.get(name)
-            if target is None or name == "main":
-                raise ValueError("batch extraction cannot retain symbol")
-            symbols[name] = target
-            pending.append(target.operation)
+    symbols = _referenced_functions(function, functions)
 
     cell_name = "enzyme_batch_cell"
     while cell_name in symbols or cell_name == "main":

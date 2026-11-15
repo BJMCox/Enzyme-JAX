@@ -25,6 +25,7 @@
 
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/MemorySlotInterfaces.h"
 #include "mlir/Interfaces/Utils/MemorySlotUtils.h"
 #include "mlir/Support/LogicalResult.h"
@@ -3013,12 +3014,39 @@ public:
                                 precision, stablehlo::DotAlgorithmAttr());
   }
 
+  StringRef derivativeDecomposition() {
+    // Derivative solves already mask by primal validity. Native lowering must
+    // not make a second, differently rounded pivot decision for the adjoint.
+    constexpr StringLiteral role = "enzyme.linalg.derivative_of";
+    auto function = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+        op, op.getDecompositionAttr());
+    assert(function && "solve decomposition must exist");
+    if (function->hasAttr(role))
+      return function.getName();
+
+    auto parent = function->getParentWithTrait<OpTrait::SymbolTable>();
+    auto originalName = function.getSymNameAttr();
+    for (auto candidate : parent->getRegion(0).front().getOps<func::FuncOp>())
+      if (candidate.getFunctionType() == function.getFunctionType() &&
+          candidate->getAttrOfType<StringAttr>(role) == originalName)
+        return candidate.getName();
+
+    auto clone = cast<func::FuncOp>(function->clone());
+    clone.setSymName(function.getName().str() + "_derivative");
+    clone.setPrivate();
+    clone->setAttr(role, originalName);
+    SymbolTable table(parent);
+    table.insert(clone);
+    return clone.getName();
+  }
+
   Value solve(Value a, Value rhs, Value valid) {
     // The solve decomposition handles invalid matrices before native kernels.
     rhs = mask(rhs, valid);
     auto result = CompositeOp::create(
         builder, loc, op->getResultTypes(), ValueRange{a, rhs}, op.getName(),
-        op.getCompositeAttributes(), op.getDecomposition(), op.getVersion());
+        op.getCompositeAttributes(), derivativeDecomposition(),
+        op.getVersion());
     return mask(result->getResult(0), valid);
   }
 };
