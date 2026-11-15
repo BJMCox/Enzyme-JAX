@@ -47,6 +47,31 @@ def _tensor(ty):
     return isinstance(ty, ir.RankedTensorType) and ty.has_static_shape
 
 
+def _referenced_functions(function, functions):
+    symbols = {}
+    pending = [function.operation]
+    while pending:
+        for op in _walk(pending.pop()):
+            key = (
+                "callee"
+                if op.name == "func.call"
+                else "decomposition"
+                if op.name == "stablehlo.composite"
+                else None
+            )
+            if key is None:
+                continue
+            name = ir.FlatSymbolRefAttr(op.attributes[key]).value
+            if name in symbols:
+                continue
+            target = functions.get(name)
+            if target is None or name == "main":
+                raise ValueError("extraction cannot retain symbol")
+            symbols[name] = target
+            pending.append(target.operation)
+    return symbols
+
+
 def _extract(arguments, operations, results, *, functions=(), name="main"):
     module = ir.Module.create()
     with ir.InsertionPoint(module.body):

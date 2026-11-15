@@ -25,7 +25,7 @@ from jax._src.mesh import get_abstract_mesh
 from jax.sharding import NamedSharding, PartitionSpec
 
 from . import enzyme_call
-from ._hlo_linearize import linearize_hlo
+from ._hlo_linearize import _extract, _referenced_functions, linearize_hlo
 from ._hlo_batch import batch_hlo
 from ._hlo_solve import recognize_solve
 
@@ -1190,17 +1190,68 @@ def to_jax_type(mlir_type):
     assert False
 
 
+def _small_lower_triangular_solve(a, b, *, unit_diagonal):
+    n = a.shape[-1]
+    if n == 1:
+        return b if unit_diagonal else b / a[..., :1, :1]
+    mid = n // 2
+    first = _small_lower_triangular_solve(
+        a[..., :mid, :mid], b[..., :mid, :], unit_diagonal=unit_diagonal
+    )
+    residual = b[..., mid:, :] - jnp.matmul(
+        a[..., mid:, :mid], first, precision=lax.Precision.HIGHEST
+    )
+    second = _small_lower_triangular_solve(
+        a[..., mid:, mid:], residual, unit_diagonal=unit_diagonal
+    )
+    return jnp.concatenate((first, second), axis=-2)
+
+
 def _lower_native_linalg(ctx, module):
     """Use JAX's target lowering after differentiating portable matrix ops."""
     operations = []
     solve_prefix = "__enzyme_linalg_solve_v1_"
+    functions = {
+        f.sym_name.value: f for f in module.body if f.operation.name == "func.func"
+    }
     private_functions = {
-        f.sym_name.value: f
-        for f in module.body
-        if f.operation.name == "func.func"
-        and "sym_visibility" in f.attributes
+        name: f
+        for name, f in functions.items()
+        if "sym_visibility" in f.attributes
         and ir.StringAttr(f.attributes["sym_visibility"]).value == "private"
     }
+    portable_sources = {}
+    if "cpu" in ctx.module_context.platforms:
+        for name, function in private_functions.items():
+            if (
+                name.startswith(solve_prefix)
+                and "enzyme.linalg.derivative_of" not in function.attributes
+            ):
+                block = function.entry_block
+                portable_sources[name] = _extract(
+                    block.arguments,
+                    list(block.operations)[:-1],
+                    [block.operations[-1].operands[1]],
+                    functions=_referenced_functions(function, functions).values(),
+                )
+
+    # A validity-only fallback otherwise lets GPU fusion duplicate the
+    # unrolled factorization into large reduction kernels.
+    if "cuda" in ctx.module_context.platforms:
+        reductions = []
+
+        def collect_reductions(op):
+            if op.name == "stablehlo.reduce":
+                reductions.append(op)
+            return ir.WalkResult.ADVANCE
+
+        for name, function in private_functions.items():
+            if name.startswith(solve_prefix):
+                function.operation.walk(collect_reductions)
+        for reduction in reductions:
+            with ir.InsertionPoint(reduction), reduction.location:
+                barrier = stablehlo.OptimizationBarrierOp([reduction.operands[0]])
+                reduction.operands[0] = barrier.results[0]
 
     def collect(op):
         if op.name in ("stablehlo.cholesky", "stablehlo.triangular_solve") or (
@@ -1253,7 +1304,9 @@ def _lower_native_linalg(ctx, module):
         ):
             continue
         multiple_results = False
+        confirm_validity = False
         if op.name == "func.call":
+            original_operands = list(operands)
             name = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
             if (
                 name not in private_functions
@@ -1296,7 +1349,11 @@ def _lower_native_linalg(ctx, module):
                         operands[0] = trans.operands[0]
                         transpose = True
 
-            def function(a, b, transpose=transpose):
+            confirm_validity = (
+                "enzyme.linalg.derivative_of" not in private_functions[name].attributes
+            )
+
+            def function(a, b, transpose=transpose, confirm_validity=confirm_validity):
                 n = a.shape[-1]
                 identity = jnp.eye(n, dtype=a.dtype)
                 finite = jnp.all(jnp.isfinite(a), axis=(-2, -1))
@@ -1314,9 +1371,25 @@ def _lower_native_linalg(ctx, module):
                 pivots = jnp.where(valid[..., None], pivots, identity_pivots)
                 b = jnp.where(valid[..., None, None], b, jnp.zeros_like(b))
                 x = lu_solve((factors, pivots), b, trans=int(transpose))
-                return jnp.where(valid[..., None, None], x, jnp.zeros_like(x)), valid
+                result = jnp.where(valid[..., None, None], x, jnp.zeros_like(x)), valid
+                if not confirm_validity:
+                    return result
+                # A tiny pivot may be a rounding artifact of native LU. Let
+                # the portable decomposition decide rather than reject it.
+                scale = jnp.max(jnp.abs(a), axis=(-2, -1))
+                safe_scale = jnp.where(scale != 0, scale, jnp.ones_like(scale))
+                ratio = jnp.min(jnp.abs(diagonal), axis=-1) / safe_scale
+                suspect = valid & (ratio <= jnp.finfo(a.dtype).eps * n)
+                return *result, suspect
 
             function = recover_shared_matrix(operands, function)
+            if confirm_validity:
+                native_function = function
+
+                def function(a, b):
+                    x, valid, suspect = native_function(a, b)
+                    return x, valid, jnp.any(suspect), suspect
+
             types = [ir.RankedTensorType(value.type) for value in operands]
             multiple_results = True
         elif op.name == "stablehlo.cholesky":
@@ -1341,19 +1414,121 @@ def _lower_native_linalg(ctx, module):
                 conjugate_a="ADJOINT" in transpose,
             )
             function = partial(lax.linalg.triangular_solve, **options)
+            parent = op.parent
+            while parent is not None and parent.name != "func.func":
+                parent = parent.parent
+            helper = (
+                parent is not None
+                and "sym_name" in parent.attributes
+                and ir.StringAttr(parent.attributes["sym_name"]).value
+                in private_functions
+                and ir.StringAttr(parent.attributes["sym_name"]).value.startswith(
+                    solve_prefix
+                )
+            )
+            if (
+                "cuda" in ctx.module_context.platforms
+                and helper
+                and options["left_side"]
+                and options["lower"]
+                and not options["transpose_a"]
+                # Batched substitutions can round away a zero trailing pivot.
+                # Keep their original triangular-solve lowering for validity.
+                and len(types[0].shape) == 2
+                and str(types[0].element_type) in ("f32", "f64")
+                and 0 < types[0].shape[-1] <= 16
+            ):
+                function = partial(
+                    _small_lower_triangular_solve,
+                    unit_diagonal=options["unit_diagonal"],
+                )
             # JAX folds mapped right-hand sides into the solve's free dimension
             # when the matrix is shared. Recover that proof from leading broadcasts.
             function = recover_shared_matrix(operands, function)
             types = [ir.RankedTensorType(value.type) for value in operands]
+        output_avals = [to_jax_type(ir.RankedTensorType(v.type)) for v in op.results]
+        if confirm_validity:
+            output_avals.append(jax.core.ShapedArray((), jnp.bool_))
+            output_avals.append(to_jax_type(ir.RankedTensorType(op.results[1].type)))
         operation_ctx = ctx.replace(
             avals_in=[to_jax_type(ty) for ty in types],
-            avals_out=[to_jax_type(ir.RankedTensorType(v.type)) for v in op.results],
+            avals_out=output_avals,
             primitive=None,
         )
         with ir.InsertionPoint(op), op.location:
             replacement = jax_mlir.lower_fun(
                 function, multiple_results=multiple_results
             )(operation_ctx, *operands)
+            if confirm_validity:
+                conditional = stablehlo.IfOp([op.results[1].type], replacement[2])
+                conditional.true_branch.blocks.append()
+                conditional.false_branch.blocks.append()
+                with ir.InsertionPoint(conditional.true_branch.blocks[0]):
+                    if name in portable_sources:
+                        result_aval = to_jax_type(
+                            ir.RankedTensorType(op.results[1].type)
+                        )
+                        source = (
+                            None,
+                            tuple((i, i) for i in range(len(original_operands))),
+                            ((0, -1),),
+                            portable_sources[name],
+                            (),
+                        )
+
+                        def portable_function(*values):
+                            return ffi_call(
+                                *values,
+                                source=source,
+                                fn="main",
+                                out_shapes=(result_aval,),
+                                lang=LANG_MHLO,
+                                pipeline_options=DefaultCPPPipeline,
+                            )
+
+                        portable_ctx = ctx.replace(
+                            avals_in=[
+                                to_jax_type(ir.RankedTensorType(value.type))
+                                for value in original_operands
+                            ],
+                            avals_out=[result_aval],
+                            primitive=None,
+                        )
+                        portable_valid = jax_mlir.lower_fun(
+                            portable_function, multiple_results=True
+                        )(portable_ctx, *original_operands)[0]
+                    else:
+                        portable = func.CallOp(
+                            private_functions[name], original_operands
+                        )
+                        portable_valid = portable.results[1]
+                    checked = stablehlo.SelectOp(
+                        replacement[3], portable_valid, replacement[1]
+                    )
+                    stablehlo.ReturnOp([checked.result])
+                with ir.InsertionPoint(conditional.false_branch.blocks[0]):
+                    stablehlo.ReturnOp([replacement[1]])
+                valid = conditional.results[0]
+                mask = stablehlo.BroadcastInDimOp(
+                    ir.RankedTensorType.get(
+                        ir.RankedTensorType(op.results[0].type).shape,
+                        ir.IntegerType.get_signless(1),
+                    ),
+                    valid,
+                    ir.DenseI64ArrayAttr.get(
+                        range(len(ir.RankedTensorType(valid.type).shape))
+                    ),
+                )
+                zero = stablehlo.ConstantOp(
+                    ir.DenseElementsAttr.get_splat(
+                        ir.RankedTensorType(op.results[0].type),
+                        ir.FloatAttr.get(
+                            ir.RankedTensorType(op.results[0].type).element_type, 0.0
+                        ),
+                    )
+                )
+                x = stablehlo.SelectOp(mask.result, replacement[0], zero.result)
+                replacement = [x.result, valid]
         for result, value in zip(op.results, replacement):
             result.replace_all_uses_with(value)
         op.erase()
