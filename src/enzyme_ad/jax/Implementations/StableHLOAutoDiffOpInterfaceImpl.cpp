@@ -2941,6 +2941,211 @@ struct AutoDiffCholeskyRev
   }
 };
 
+// The decomposition defines the primal; this rule applies only to the
+// versioned real matrix-solve contract.
+class CompositeSolveDerivative {
+  CompositeOp op;
+  OpBuilder &builder;
+  Location loc;
+
+public:
+  CompositeSolveDerivative(CompositeOp op, OpBuilder &builder)
+      : op(op), builder(builder), loc(op.getLoc()) {}
+
+  static LogicalResult check(CompositeOp op, int64_t width) {
+    if (op.getName() != "enzyme.linalg.solve" || op.getVersion() != 1 ||
+        !op.getCompositeAttributes().empty() || !op->getRegions().empty() ||
+        op->getNumOperands() != 2 || op->getNumResults() != 2 || width != 1)
+      return op.emitOpError("unsupported solve composite contract");
+    auto a = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto b = dyn_cast<RankedTensorType>(op->getOperand(1).getType());
+    auto valid = dyn_cast<RankedTensorType>(op->getResult(1).getType());
+    if (!a || !b || !valid || !a.hasStaticShape() || !b.hasStaticShape() ||
+        !valid.hasStaticShape() || a.getRank() < 2 ||
+        b.getRank() != a.getRank() || valid.getRank() != a.getRank() - 2 ||
+        !valid.getElementType().isInteger(1) ||
+        !(a.getElementType().isF32() || a.getElementType().isF64()) ||
+        a.getElementType() != b.getElementType() ||
+        a.getDimSize(a.getRank() - 2) == 0 ||
+        a.getDimSize(a.getRank() - 1) != a.getDimSize(a.getRank() - 2) ||
+        b.getDimSize(b.getRank() - 2) != a.getDimSize(a.getRank() - 1) ||
+        op->getResult(0).getType() != b)
+      return op.emitOpError("expected real matrix solve with batch validity");
+    for (int64_t i = 0; i < valid.getRank(); ++i)
+      if (a.getDimSize(i) != b.getDimSize(i) ||
+          a.getDimSize(i) != valid.getDimSize(i))
+        return op.emitOpError("solve batch dimensions must match");
+    return success();
+  }
+
+  Value transpose(Value value) {
+    int64_t rank = cast<RankedTensorType>(value.getType()).getRank();
+    SmallVector<int64_t> axes;
+    for (int64_t i = 0; i < rank; ++i)
+      axes.push_back(i);
+    std::swap(axes[rank - 2], axes[rank - 1]);
+    return TransposeOp::create(builder, loc, value, axes);
+  }
+
+  Value mask(Value value, Value valid) {
+    auto type = cast<RankedTensorType>(value.getType());
+    auto predType = RankedTensorType::get(type.getShape(), builder.getI1Type());
+    SmallVector<int64_t> axes;
+    for (int64_t i = 0; i < type.getRank() - 2; ++i)
+      axes.push_back(i);
+    Value pred = BroadcastInDimOp::create(builder, loc, predType, valid,
+                                          builder.getDenseI64ArrayAttr(axes));
+    return SelectOp::create(builder, loc, pred, value,
+                            makeZero(builder, loc, type));
+  }
+
+  Value multiply(Value lhs, Value rhs, Type resultType) {
+    int64_t rank = cast<RankedTensorType>(lhs.getType()).getRank();
+    SmallVector<int64_t> batch;
+    for (int64_t i = 0; i < rank - 2; ++i)
+      batch.push_back(i);
+    auto dims = DotDimensionNumbersAttr::get(builder.getContext(), batch, batch,
+                                             {rank - 1}, {rank - 2});
+    auto precision = builder.getArrayAttr(
+        {PrecisionAttr::get(builder.getContext(), Precision::HIGHEST),
+         PrecisionAttr::get(builder.getContext(), Precision::HIGHEST)});
+    return DotGeneralOp::create(builder, loc, resultType, lhs, rhs, dims,
+                                precision, stablehlo::DotAlgorithmAttr());
+  }
+
+  Value solve(Value a, Value rhs, Value valid) {
+    // The solve decomposition handles invalid matrices before native kernels.
+    rhs = mask(rhs, valid);
+    auto result = CompositeOp::create(
+        builder, loc, op->getResultTypes(), ValueRange{a, rhs}, op.getName(),
+        op.getCompositeAttributes(), op.getDecomposition(), op.getVersion());
+    return mask(result->getResult(0), valid);
+  }
+};
+
+struct AutoDiffCompositeSolveFwd
+    : AutoDiffOpInterface::ExternalModel<AutoDiffCompositeSolveFwd,
+                                         CompositeOp> {
+  LogicalResult createForwardModeTangent(Operation *orig, OpBuilder &builder,
+                                         MGradientUtils *gutils) const {
+    auto op = cast<CompositeOp>(orig);
+    if (failed(CompositeSolveDerivative::check(op, gutils->width)))
+      return failure();
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfter(gutils->getNewFromOriginal(orig));
+    if (!gutils->isConstantValue(op->getResult(1)))
+      gutils->setDiffe(
+          op->getResult(1),
+          makeZero(builder, op.getLoc(), op->getResult(1).getType()), builder);
+    if (gutils->isConstantValue(op->getResult(0)))
+      return success();
+    CompositeSolveDerivative rule(op, builder);
+    Value a = gutils->getNewFromOriginal(op->getOperand(0));
+    Value x = gutils->getNewFromOriginal(op->getResult(0));
+    Value valid = gutils->getNewFromOriginal(op->getResult(1));
+    Value da = gutils->isConstantValue(op->getOperand(0))
+                   ? makeZero(builder, op.getLoc(), a.getType())
+                   : gutils->invertPointerM(op->getOperand(0), builder);
+    Value db = gutils->isConstantValue(op->getOperand(1))
+                   ? makeZero(builder, op.getLoc(), x.getType())
+                   : gutils->invertPointerM(op->getOperand(1), builder);
+    da = rule.mask(da, valid);
+    x = rule.mask(x, valid);
+    db = rule.mask(db, valid);
+    Value rhs = SubtractOp::create(builder, op.getLoc(), db,
+                                   rule.multiply(da, x, x.getType()));
+    gutils->setDiffe(op->getResult(0), rule.solve(a, rhs, valid), builder);
+    return success();
+  }
+};
+
+struct AutoDiffCompositeSolveRev
+    : ReverseAutoDiffOpInterface::ExternalModel<AutoDiffCompositeSolveRev,
+                                                CompositeOp> {
+  LogicalResult createReverseModeAdjoint(Operation *orig, OpBuilder &builder,
+                                         MGradientUtilsReverse *gutils,
+                                         SmallVector<Value> caches) const {
+    auto op = cast<CompositeOp>(orig);
+    if (failed(CompositeSolveDerivative::check(op, gutils->width)))
+      return failure();
+    if (gutils->isConstantValue(op->getResult(0)))
+      return success();
+    Value cotangent = gutils->diffe(op->getResult(0), builder);
+    gutils->zeroDiffe(op->getResult(0), builder);
+    Value a = gutils->popCache(caches[0], builder);
+    Value x = gutils->popCache(caches[1], builder);
+    Value valid = gutils->popCache(caches[2], builder);
+    CompositeSolveDerivative rule(op, builder);
+    Value lambda = rule.solve(rule.transpose(a), cotangent, valid);
+    if (!gutils->isConstantValue(op->getOperand(1)))
+      gutils->addToDiffe(op->getOperand(1), lambda, builder);
+    if (!gutils->isConstantValue(op->getOperand(0))) {
+      x = rule.mask(x, valid);
+      Value gradient = rule.multiply(lambda, rule.transpose(x), a.getType());
+      gradient = NegOp::create(builder, op.getLoc(), gradient);
+      gutils->addToDiffe(op->getOperand(0), gradient, builder);
+    }
+    return success();
+  }
+
+  SmallVector<Value> cacheValues(Operation *orig,
+                                 MGradientUtilsReverse *gutils) const {
+    auto op = cast<CompositeOp>(orig);
+    if (gutils->isConstantValue(op->getResult(0)))
+      return {};
+    Operation *newOp = gutils->getNewFromOriginal(orig);
+    OpBuilder builder(newOp);
+    builder.setInsertionPointAfter(newOp);
+    return {gutils->initAndPushCache(
+                gutils->getNewFromOriginal(op->getOperand(0)), builder),
+            gutils->initAndPushCache(
+                gutils->getNewFromOriginal(op->getResult(0)), builder),
+            gutils->initAndPushCache(
+                gutils->getNewFromOriginal(op->getResult(1)), builder)};
+  }
+
+  LogicalResult createShadowValues(Operation *, OpBuilder &,
+                                   MGradientUtilsReverse *) const {
+    return success();
+  }
+};
+
+struct SHLOCompositeSolveBatch
+    : BatchOpInterface::ExternalModel<SHLOCompositeSolveBatch, CompositeOp> {
+  LogicalResult createBatch(Operation *src, OpBuilder &builder,
+                            IRMapping &mapper,
+                            ArrayRef<int64_t> batchSizes) const {
+    auto op = cast<CompositeOp>(src);
+    if (op.getName() != "enzyme.linalg.solve")
+      return failure();
+    if (failed(CompositeSolveDerivative::check(op, 1)))
+      return failure();
+    auto function = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+        op, op.getDecompositionAttr());
+    if (!function)
+      return op.emitOpError("solve decomposition is missing");
+    std::map<enzyme::batchutils::BatchCacheKey, FunctionOpInterface> cache;
+    auto batched = enzyme::batchutils::batchCloneFunction(
+        builder, cast<FunctionOpInterface>(function.getOperation()),
+        function.getName().str() + "_batched", batchSizes, cache);
+    if (!batched)
+      return failure();
+    SmallVector<Value> operands;
+    for (Value operand : op->getOperands())
+      operands.push_back(mapper.lookup(operand));
+    SmallVector<Type> results;
+    for (Type type : op->getResultTypes())
+      results.push_back(enzyme::batchutils::applyBatchSizes(type, batchSizes));
+    auto result = CompositeOp::create(builder, op.getLoc(), results, operands,
+                                      op.getName(), op.getCompositeAttributes(),
+                                      batched.getName(), op.getVersion());
+    for (auto [oldValue, newValue] :
+         llvm::zip_equal(op->getResults(), result->getResults()))
+      mapper.map(oldValue, newValue);
+    return success();
+  }
+};
+
 struct AutoDiffBarrierFwd
     : AutoDiffOpInterface::ExternalModel<AutoDiffBarrierFwd,
                                          OptimizationBarrierOp> {
@@ -6360,6 +6565,9 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
         ADDataFlowBarrierOp, AutoDiffBarrierFwd, AutoDiffBarrierRev>(*context);
     CholeskyOp::attachInterface<AutoDiffCholeskyFwd, AutoDiffCholeskyRev>(
         *context);
+    CompositeOp::attachInterface<AutoDiffCompositeSolveFwd,
+                                 AutoDiffCompositeSolveRev>(*context);
+    CompositeOp::attachInterface<SHLOCompositeSolveBatch>(*context);
     ScatterOp::attachInterface<ADDataFlowScatterOp>(*context);
     ReduceOp::attachInterface<ADDataFlowReduceOp<ReduceOp>>(*context);
     ReduceWindowOp::attachInterface<ADDataFlowReduceOp<ReduceWindowOp>>(

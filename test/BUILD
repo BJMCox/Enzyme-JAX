@@ -109,6 +109,13 @@ py_test(
 )
 
 py_test(
+    name = "test_solve_composite",
+    srcs = ["test_solve_composite.py"],
+    data = ["solve_composite.mlir", "solve_composite_2x2.mlir"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_slice",
     srcs = ["test_hlo_slice.py"],
     deps = TEST_DEPS,
