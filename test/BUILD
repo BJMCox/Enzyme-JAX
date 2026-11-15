@@ -127,6 +127,12 @@ py_test(
 )
 
 py_test(
+    name = "test_hlo_scatter_winner",
+    srcs = ["test_hlo_scatter_winner.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_scatter_padding",
     srcs = ["test_hlo_scatter_padding.py"],
     deps = TEST_DEPS,
