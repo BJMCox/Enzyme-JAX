@@ -129,7 +129,7 @@ py_test(
 py_test(
     name = "test_solve_composite",
     srcs = ["test_solve_composite.py"],
-    data = ["solve_composite.mlir", "solve_composite_2x2.mlir"],
+    data = ["solve_composite.mlir", "solve_composite_2x2.mlir", "solve_scan.mlir"],
     deps = TEST_DEPS,
 )
 

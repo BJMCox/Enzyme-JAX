@@ -1,18 +1,141 @@
+import re
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from absl.testing import absltest
+from absl.testing import absltest, parameterized
+from jax.interpreters import mlir
+from jaxlib.mlir import ir
 
 from enzyme_ad.jax import hlo_call
 
 jax.config.update("jax_enable_x64", True)
 SOURCE = Path(__file__).with_name("solve_composite.mlir").read_text()
 MATRIX_SOURCE = Path(__file__).with_name("solve_composite_2x2.mlir").read_text()
+SCAN_SOURCE = Path(__file__).with_name("solve_scan.mlir").read_text()
 
 
-class SolveCompositeTest(absltest.TestCase):
+class SolveCompositeTest(parameterized.TestCase):
+    @parameterized.named_parameters(("jax", False), ("stablehlo", True))
+    def test_scan_reuses_factors_and_preserves_higher_derivatives(self, internal_scan):
+        for precision in ("f32", "f64"):
+            dtype = np.float32 if precision == "f32" else np.float64
+            tolerance = 2e-5 if precision == "f32" else 2e-11
+            source = (
+                MATRIX_SOURCE.replace("0x7FF0000000000000", "0x7F800000")
+                if precision == "f32"
+                else MATRIX_SOURCE
+            )
+            source = source.replace("f64", precision)
+            a = np.array([[0.3, 2.0], [1.0, 3.0]], dtype=dtype)
+            b = np.array([[1.0, 2.0], [-2.0, 3.0]], dtype=dtype)
+            da = np.array([[0.3, -0.4], [0.7, 0.2]], dtype=dtype)
+            db = np.array([[0.1, 0.8], [-0.5, 0.6]], dtype=dtype)
+            weight = np.array([[0.2, -0.3], [0.9, 0.5]], dtype=dtype)
+            for transpose in (False, True):
+                program = source
+                if transpose:
+                    program = source.replace(
+                        "    %x, %valid = func.call",
+                        f"    %at = stablehlo.transpose %a, dims = [1, 0] : (tensor<2x2x{precision}>) -> tensor<2x2x{precision}>\n    %x, %valid = func.call",
+                        1,
+                    ).replace(
+                        "@__enzyme_linalg_solve_v1_matrix(%a, %b)",
+                        "@__enzyme_linalg_solve_v1_matrix(%at, %b)",
+                        1,
+                    )
+
+                def loss(a, b):
+                    def step(total, i):
+                        x, _ = hlo_call(
+                            a + i * 0.001 * jnp.eye(2, dtype=a.dtype), b, source=program
+                        )
+                        return total + jnp.sum(x * weight), None
+
+                    return jax.lax.scan(
+                        step,
+                        jnp.zeros((), dtype=a.dtype),
+                        jnp.arange(32, dtype=a.dtype),
+                    )[0]
+
+                if internal_scan:
+                    with mlir.make_ir_context(), ir.Location.unknown():
+                        module = ir.Module.parse(program)
+                        single = module.body.operations[0]
+                        single.attributes["sym_name"] = ir.StringAttr.get("single")
+                        single.attributes["sym_visibility"] = ir.StringAttr.get(
+                            "private"
+                        )
+                        wrapper = ir.Module.parse(SCAN_SOURCE.replace("f64", precision))
+                        module.body.append(wrapper.body.operations[1].operation.clone())
+                        module.operation.verify()
+                        wrapped = str(module)
+                    loss = lambda a, b: hlo_call(
+                        a, b, jnp.asarray(weight), source=wrapped
+                    )[0]
+
+                value = 0.0
+                grad = [np.zeros((2, 2)), np.zeros((2, 2))]
+                hvp = [np.zeros((2, 2)), np.zeros((2, 2))]
+                for i in range(32):
+                    matrix = a.astype(float) + i * 0.001 * np.eye(2)
+                    delta = da.astype(float)
+                    if transpose:
+                        matrix, delta = matrix.T, delta.T
+                    x = np.linalg.solve(matrix, b.astype(float))
+                    dx = np.linalg.solve(matrix, db.astype(float) - delta @ x)
+                    adjoint = np.linalg.solve(matrix.T, weight.astype(float))
+                    dadjoint = -np.linalg.solve(matrix.T, delta.T @ adjoint)
+                    ga = -adjoint @ x.T
+                    ha = -dadjoint @ x.T - adjoint @ dx.T
+                    value += np.sum(x * weight)
+                    grad[0] += ga.T if transpose else ga
+                    grad[1] += adjoint
+                    hvp[0] += ha.T if transpose else ha
+                    hvp[1] += dadjoint
+                compiled = (
+                    jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))
+                    .lower(a, b)
+                    .compile()
+                )
+                actual = compiled(a, b)
+                gradient = jax.grad(loss, argnums=(0, 1))
+                actual_hvp = jax.jit(
+                    lambda a, b: jax.jvp(gradient, (a, b), (da, db))[1]
+                )(a, b)
+                reverse_hvp = jax.jit(
+                    jax.grad(
+                        lambda a, b: sum(
+                            jnp.sum(g * direction)
+                            for g, direction in zip(gradient(a, b), (da, db))
+                        ),
+                        argnums=(0, 1),
+                    )
+                )(a, b)
+                for actual, expected in zip(
+                    jax.tree.leaves((actual, actual_hvp, reverse_hvp)),
+                    [value, *grad, *hvp, *hvp],
+                ):
+                    np.testing.assert_allclose(
+                        actual, expected, rtol=tolerance, atol=tolerance
+                    )
+                if (
+                    jax.default_backend() in ("cpu", "gpu")
+                    and hasattr(
+                        getattr(ir, "MemoryEffectsOpInterface", None), "get_effects"
+                    )
+                    and hasattr(ir.Operation, "has_trait")
+                    and hasattr(ir, "RecursiveMemoryEffectsTrait")
+                ):
+                    self.assertLen(
+                        re.findall(
+                            r'custom_call_target="[^"\n]*getrf[^"\n]*"',
+                            compiled.as_text(),
+                        ),
+                        1,
+                    )
+
     def test_solve_composite(self):
         @jax.jit
         def solve(a, b):

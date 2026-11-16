@@ -22,10 +22,11 @@ import jax.extend
 from jax._src.interpreters import partial_eval as pe
 from jax._src import core
 from jax._src.mesh import get_abstract_mesh
+from jax._src.lax.linalg import _lu_solve
 from jax.sharding import NamedSharding, PartitionSpec
 
 from . import enzyme_call
-from ._hlo_linearize import linearize_hlo
+from ._hlo_linearize import _walk, linearize_hlo
 from ._hlo_batch import batch_hlo
 from ._hlo_solve import recognize_solve
 
@@ -1236,6 +1237,8 @@ def to_jax_type(mlir_type):
 
 def _lower_native_linalg(ctx, module):
     """Use JAX's target lowering after differentiating portable matrix ops."""
+    from ._hlo_solve import _CACHED_PREFIX, _FACTOR
+
     operations = []
     solve_prefix = "__enzyme_linalg_solve_v1_"
     functions = {
@@ -1249,11 +1252,18 @@ def _lower_native_linalg(ctx, module):
     }
 
     def collect(op):
-        if op.name in ("stablehlo.cholesky", "stablehlo.triangular_solve") or (
-            op.name == "func.call"
-            and "callee" in op.attributes
-            and ir.FlatSymbolRefAttr(op.attributes["callee"]).value.startswith(
-                solve_prefix
+        if (
+            op.name in ("stablehlo.cholesky", "stablehlo.triangular_solve")
+            or (
+                op.name == "func.call"
+                and "callee" in op.attributes
+                and ir.FlatSymbolRefAttr(op.attributes["callee"]).value.startswith(
+                    (solve_prefix, _CACHED_PREFIX)
+                )
+            )
+            or (
+                op.name == "stablehlo.custom_call"
+                and ir.StringAttr(op.attributes["call_target_name"]).value == _FACTOR
             )
         ):
             operations.append(op)
@@ -1286,20 +1296,125 @@ def _lower_native_linalg(ctx, module):
 
     module.operation.walk(collect)
     for op in operations:
+        factor_cache = op.name == "stablehlo.custom_call"
+        cached_solve = op.name == "func.call" and ir.FlatSymbolRefAttr(
+            op.attributes["callee"]
+        ).value.startswith(_CACHED_PREFIX)
         operands = list(op.operands)
         if not all(isinstance(value.type, ir.RankedTensorType) for value in operands):
+            if factor_cache or cached_solve:
+                raise ValueError("internal solve caches require tensor operands")
             continue
         types = [ir.RankedTensorType(value.type) for value in operands]
         # Keep native lowering for types outside JAX's LAPACK/solver support.
         if any(
             not ty.has_static_shape
-            or str(ty.element_type)
+            or not (factor_cache or cached_solve)
+            and str(ty.element_type)
             not in ("f32", "f64", "complex<f32>", "complex<f64>")
             for ty in types
         ):
+            if factor_cache or cached_solve:
+                raise ValueError("internal solve caches require static tensors")
             continue
         multiple_results = False
-        if op.name == "func.call":
+        if factor_cache:
+            if (
+                len(types) != 1
+                or len(op.results) != 3
+                or (
+                    "has_side_effect" in op.attributes
+                    and ir.BoolAttr(op.attributes["has_side_effect"]).value
+                )
+            ):
+                raise ValueError("invalid internal solve factor cache")
+            a = types[0]
+            n = a.shape[-1] if len(a.shape) >= 2 else 0
+            bits = "i32" if str(a.element_type) == "f32" else "i64"
+            results = [ir.RankedTensorType(v.type) for v in op.results]
+            if (
+                len(types) != 1
+                or n == 0
+                or a.shape[-2] != n
+                or str(a.element_type) not in ("f32", "f64")
+                or len(results) != 3
+                or tuple(results[0].shape) != tuple(a.shape)
+                or str(results[0].element_type) != bits
+                or tuple(results[1].shape) != tuple(a.shape[:-1])
+                or str(results[1].element_type) != "i32"
+                or tuple(results[2].shape) != tuple(a.shape[:-2])
+                or str(results[2].element_type) != "i1"
+            ):
+                raise ValueError("invalid internal solve factor cache")
+
+            def function(a):
+                factors, _, permutation = lax.linalg.lu(a)
+                diagonal = jnp.diagonal(factors, axis1=-2, axis2=-1)
+                valid = jnp.all(jnp.isfinite(diagonal) & (diagonal != 0), axis=-1)
+                bits = jnp.int32 if a.dtype == jnp.float32 else jnp.int64
+                return lax.bitcast_convert_type(factors, bits), permutation, valid
+
+            multiple_results = True
+        elif cached_solve:
+            name = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
+            if name not in private_functions or len(types) != 6 or len(op.results) != 2:
+                raise ValueError("invalid internal cached solve")
+            a, b, factors, permutation, valid, transpose = types
+            bits = "i32" if str(a.element_type) == "f32" else "i64"
+            if (
+                len(a.shape) < 2
+                or len(b.shape) != len(a.shape)
+                or str(a.element_type) not in ("f32", "f64")
+                or a.element_type != b.element_type
+                or a.shape[-1] == 0
+                or a.shape[-1] != a.shape[-2]
+                or b.shape[-2] != a.shape[-1]
+                or tuple(a.shape[:-2]) != tuple(b.shape[:-2])
+                or tuple(factors.shape) != tuple(a.shape)
+                or str(factors.element_type) != bits
+                or tuple(permutation.shape) != tuple(a.shape[:-1])
+                or str(permutation.element_type) != "i32"
+                or tuple(valid.shape) != tuple(a.shape[:-2])
+                or str(valid.element_type) != "i1"
+                or transpose != valid
+                or op.results[0].type != b
+                or op.results[1].type != valid
+            ):
+                raise ValueError("invalid internal cached solve signature")
+
+            def function(a, b, bits, permutation, valid, transpose):
+                factors = lax.bitcast_convert_type(bits, a.dtype)
+                normal = _lu_solve(factors, permutation, b, trans=0)
+                transposed = lax.linalg.triangular_solve(
+                    factors, b, left_side=True, lower=False, transpose_a=True
+                )
+                transposed = lax.linalg.triangular_solve(
+                    factors,
+                    transposed,
+                    left_side=True,
+                    lower=True,
+                    unit_diagonal=True,
+                    transpose_a=True,
+                )
+
+                # PA = LU, so the transposed solve ends with X[P, :] = Z.
+                # LU guarantees that P is unique and in bounds.
+                def undo_rows(x, rows):
+                    return (
+                        jnp.zeros_like(x)
+                        .at[rows, :]
+                        .set(x, unique_indices=True, mode="promise_in_bounds")
+                    )
+
+                undo = undo_rows
+                for _ in permutation.shape[:-1]:
+                    undo = jax.vmap(undo)
+                transposed = undo(transposed, permutation)
+                x = jnp.where(transpose[..., None, None], transposed, normal)
+                return jnp.where(valid[..., None, None], x, 0), valid
+
+            multiple_results = True
+        elif op.name == "func.call":
             name = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
             if (
                 name not in private_functions
@@ -1409,10 +1524,26 @@ def hlo_call(
     argv: tuple[str] = (),
     passes: str = _HLO_IMPORT_PASSES,
 ):
+    from ._hlo_solve import _CACHED_PREFIX, _FACTOR
+
     source = recognize_solve(source)
     fn = "main"
     with jax_mlir.make_ir_context():
         nmod = ir.Module.parse(source)
+        if not passes and any(
+            (
+                op.name == "func.func"
+                and ir.StringAttr(op.attributes["sym_name"]).value.startswith(
+                    _CACHED_PREFIX
+                )
+            )
+            or (
+                op.name == "stablehlo.custom_call"
+                and ir.StringAttr(op.attributes["call_target_name"]).value == _FACTOR
+            )
+            for op in _walk(nmod.operation)
+        ):
+            raise ValueError("internal solve caches require target lowering")
         _check_local_hlo(nmod)
         func = None
         names = []
