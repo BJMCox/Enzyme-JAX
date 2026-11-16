@@ -184,10 +184,11 @@ struct Scatter : OpRewritePattern<stablehlo::ScatterOp> {
     auto result = scf::IfOp::create(
         rewriter, loc, valid,
         [&](OpBuilder &, Location) {
+          Value lower = constant(0);
+          Value upper = constant(updatesType.getNumElements());
+          Value step = constant(1);
           auto loop = scf::ForOp::create(
-              rewriter, loc, constant(0),
-              constant(updatesType.getNumElements()), constant(1),
-              ValueRange{input},
+              rewriter, loc, lower, upper, step, ValueRange{input},
               [&](OpBuilder &, Location, Value iv, ValueRange carried) {
                 Value remaining = iv;
                 SmallVector<Value> updateCoords(updatesType.getRank());

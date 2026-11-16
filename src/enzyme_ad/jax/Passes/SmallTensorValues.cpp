@@ -192,8 +192,11 @@ struct Values : ConversionPattern {
                 insert(value, carried[i], mappedIndex(inputCount + i)));
           return result;
         }
+        Value lower = index(0);
+        Value upper = index(bounds[depth]);
+        Value step = index(1);
         auto forOp = scf::ForOp::create(
-            rewriter, loc, index(0), index(bounds[depth]), index(1), carried,
+            rewriter, loc, lower, upper, step, carried,
             [&](OpBuilder &, Location, Value iv, ValueRange iterArgs) {
               indices.push_back(iv);
               auto next = loop(depth + 1, iterArgs);
@@ -230,8 +233,11 @@ struct Values : ConversionPattern {
       int64_t count = 1;
       for (int64_t size : sizes.asArrayRef())
         count *= size;
+      Value lower = index(0);
+      Value upper = index(count);
+      Value step = index(1);
       auto forOp = scf::ForOp::create(
-          rewriter, loc, index(0), index(count), index(1), ValueRange{output},
+          rewriter, loc, lower, upper, step, ValueRange{output},
           [&](OpBuilder &, Location, Value iv, ValueRange iterArgs) {
             Value remaining = iv;
             SmallVector<Value> coords(sizes.size());
@@ -272,9 +278,11 @@ struct Values : ConversionPattern {
       Value output = vector::BroadcastOp::create(rewriter, loc,
                                                  flatType(outputType), padding);
       auto low = pad.getStaticLow();
+      Value lower = index(0);
+      Value upper = index(inputType.getNumElements());
+      Value step = index(1);
       auto forOp = scf::ForOp::create(
-          rewriter, loc, index(0), index(inputType.getNumElements()), index(1),
-          ValueRange{output},
+          rewriter, loc, lower, upper, step, ValueRange{output},
           [&](OpBuilder &, Location, Value iv, ValueRange iterArgs) {
             Value remaining = iv;
             SmallVector<Value> coords(inputType.getRank());
@@ -286,8 +294,9 @@ struct Values : ConversionPattern {
               coords[i] =
                   arith::AddIOp::create(rewriter, loc, coord, index(low[i]));
             }
-            Value next = insert(extract(operands[0], iv), iterArgs[0],
-                                linearIndex(coords, outputType.getShape()));
+            Value scalar = extract(operands[0], iv);
+            Value position = linearIndex(coords, outputType.getShape());
+            Value next = insert(scalar, iterArgs[0], position);
             scf::YieldOp::create(rewriter, loc, next);
           });
       rewriter.replaceOp(op, forOp.getResults());

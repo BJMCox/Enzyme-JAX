@@ -66,11 +66,15 @@ class SmallGpu(absltest.TestCase):
             np.testing.assert_array_equal(a, b)
 
         def matrix(value):
-            return value.T + 2 * value.T
+            padded = jnp.pad(value, ((1, 0), (0, 1)), constant_values=0.125)
+            return padded.T + 2 * padded.T
 
         batch = jnp.stack([values, values + 7])
         actual = jax.jit(jax.vmap(self.compile(matrix)))(batch)
-        np.testing.assert_array_equal(actual, 3 * np.asarray(batch).transpose(0, 2, 1))
+        padded = np.pad(
+            np.asarray(batch), ((0, 0), (1, 0), (0, 1)), constant_values=0.125
+        )
+        np.testing.assert_array_equal(actual, 3 * padded.transpose(0, 2, 1))
 
     def test_checked_error_survives_fusion(self):
         def function(value):
