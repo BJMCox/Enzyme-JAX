@@ -1,7 +1,6 @@
 name: Python-Black
 
 on:
-  workflow_dispatch:
   push:
     paths:
       - '.github/workflows/python_format.yml'
