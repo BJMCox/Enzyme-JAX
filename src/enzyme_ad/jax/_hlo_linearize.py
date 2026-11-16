@@ -28,7 +28,7 @@ def _external_values(op):
     return {v for child in _walk(op) for v in child.operands} - internal
 
 
-def _pure(op):
+def _pure(op, check=None):
     try:
         if ir.MemoryEffectsOpInterface(op).get_effects():
             return False
@@ -36,7 +36,7 @@ def _pure(op):
         if not op.has_trait(ir.RecursiveMemoryEffectsTrait):
             return False
     return all(
-        _pure(child.operation)
+        (check or _pure)(child.operation)
         for region in op.regions
         for block in region.blocks
         for child in block.operations
@@ -73,8 +73,6 @@ def _referenced_functions(function, functions):
 def _extract(arguments, operations, results, *, functions=(), name="main"):
     module = ir.Module.create()
     with ir.InsertionPoint(module.body):
-        for function in functions:
-            function.operation.clone()
         function = func.FuncOp(
             name, ([v.type for v in arguments], [v.type for v in results])
         )
@@ -89,6 +87,8 @@ def _extract(arguments, operations, results, *, functions=(), name="main"):
                             child.operands[index] = mapped[operand]
                 mapped.update(zip(op.results, clone.results))
             func.ReturnOp([mapped[v] for v in results])
+        for definition in functions:
+            definition.operation.clone()
     module.operation.verify()
     return str(module)
 
@@ -108,6 +108,8 @@ def linearize_hlo(source, activity, before_ad, after_ad):
     ):
         return None
     try:
+        from ._hlo_solve import cache_solve_factors, pure_function
+
         name, optimized = enzyme_call.run_pass_pipeline([], source, before_ad)
         with mlir.make_ir_context() as context, ir.Location.unknown():
             context.allow_unregistered_dialects = True
@@ -118,13 +120,16 @@ def linearize_hlo(source, activity, before_ad, after_ad):
                 if f.operation.name == "func.func" and f.name.value == name
             )
             inputs, outputs = list(original.type.inputs), list(original.type.results)
+            functions = {
+                f.name.value: f
+                for f in module.body.operations
+                if f.operation.name == "func.func"
+            }
             if (
                 len(inputs) != len(activity)
                 or len(original.regions[0].blocks) != 1
                 or not all(_tensor(ty) for ty in inputs + outputs)
-                or not all(
-                    _pure(op.operation) for op in original.entry_block.operations
-                )
+                or not pure_function(original, functions)
             ):
                 return None
             active_outputs = tuple(
@@ -149,6 +154,7 @@ def linearize_hlo(source, activity, before_ad, after_ad):
             gradients = [ty for ty, active in zip(inputs, activity) if active]
             if not all(str(ty.element_type) in ("f32", "f64") for ty in gradients):
                 return None
+            cache_solve_factors(module, original)
             with ir.InsertionPoint(module.body):
                 seeds = [ty for ty, active in zip(outputs, active_outputs) if active]
                 wrapper = func.FuncOp("main", (inputs + seeds, outputs + gradients))
@@ -188,18 +194,24 @@ def linearize_hlo(source, activity, before_ad, after_ad):
 
 
 def _partition(joint, name, input_count, output_count):
+    from ._hlo_solve import pure_function
+
     with mlir.make_ir_context(), ir.Location.unknown():
         module = ir.Module.parse(joint)
-        # Extraction must remain self-contained. Retain the established path
-        # when inlining leaves another function or module-level symbol.
-        if len(module.body.operations) != 1:
+        functions = {
+            f.name.value: f
+            for f in module.body.operations
+            if f.operation.name == "func.func"
+        }
+        if len(functions) != len(module.body.operations) or name not in functions:
             return None
-        function = module.body.operations[0]
+        function = functions[name]
         if function.name.value != name or len(function.regions[0].blocks) != 1:
             return None
         block = function.entry_block
-        if not all(_pure(op.operation) for op in block.operations):
+        if not pure_function(function, functions):
             return None
+        definitions = _referenced_functions(function, functions).values()
         arguments = list(block.arguments)
         known = set(arguments[:input_count])
         forward, reverse = [], []
@@ -232,10 +244,16 @@ def _partition(joint, name, input_count, output_count):
         if not all(_tensor(v.type) for v in residuals):
             return None
         return (
-            _extract(arguments[:input_count], forward, values + residuals),
+            _extract(
+                arguments[:input_count],
+                forward,
+                values + residuals,
+                functions=definitions,
+            ),
             _extract(
                 residuals + arguments[input_count:],
                 list(reversed(reconstructed)) + reverse,
                 gradients,
+                functions=definitions,
             ),
         )

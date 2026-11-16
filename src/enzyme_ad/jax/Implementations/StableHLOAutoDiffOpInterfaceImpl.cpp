@@ -2942,6 +2942,72 @@ struct AutoDiffCholeskyRev
   }
 };
 
+static bool isSolveFactorCache(CustomCallOp op) {
+  if (op.getCallTargetName() != "__enzyme_linalg_factor_v1" ||
+      op.getHasSideEffect() || op->getNumOperands() != 1 ||
+      op->getNumResults() != 3)
+    return false;
+  auto a = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+  auto factors = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  auto permutation = dyn_cast<RankedTensorType>(op->getResult(1).getType());
+  auto valid = dyn_cast<RankedTensorType>(op->getResult(2).getType());
+  if (!a || !factors || !permutation || !valid || !a.hasStaticShape() ||
+      a.getRank() < 2 || a.getDimSize(a.getRank() - 1) == 0 ||
+      a.getDimSize(a.getRank() - 1) != a.getDimSize(a.getRank() - 2) ||
+      !(a.getElementType().isF32() || a.getElementType().isF64()) ||
+      factors.getShape() != a.getShape() ||
+      !factors.getElementType().isInteger(
+          a.getElementType().getIntOrFloatBitWidth()) ||
+      permutation.getShape() != a.getShape().drop_back() ||
+      !permutation.getElementType().isInteger(32) ||
+      valid.getShape() != a.getShape().drop_back(2) ||
+      !valid.getElementType().isInteger(1))
+    return false;
+  return true;
+}
+
+// Integer caches are implementation data. All matrix derivatives pass through
+// the explicit matrix operand of the cached solve below.
+struct SolveFactorActivity
+    : ActivityOpInterface::ExternalModel<SolveFactorActivity, CustomCallOp> {
+  bool isInactive(Operation *op) const {
+    return isSolveFactorCache(cast<CustomCallOp>(op));
+  }
+  bool isArgInactive(Operation *op, size_t) const { return isInactive(op); }
+};
+
+struct AutoDiffSolveFactorFwd
+    : AutoDiffOpInterface::ExternalModel<AutoDiffSolveFactorFwd, CustomCallOp> {
+  LogicalResult createForwardModeTangent(Operation *orig, OpBuilder &builder,
+                                         MGradientUtils *gutils) const {
+    auto op = cast<CustomCallOp>(orig);
+    if (!isSolveFactorCache(op))
+      return failure();
+    for (Value result : op->getResults())
+      if (!gutils->isConstantValue(result))
+        gutils->setDiffe(
+            result, makeZero(builder, op.getLoc(), result.getType()), builder);
+    return success();
+  }
+};
+
+struct AutoDiffSolveFactorRev
+    : ReverseAutoDiffOpInterface::ExternalModel<AutoDiffSolveFactorRev,
+                                                CustomCallOp> {
+  LogicalResult createReverseModeAdjoint(Operation *orig, OpBuilder &,
+                                         MGradientUtilsReverse *,
+                                         SmallVector<Value>) const {
+    return success(isSolveFactorCache(cast<CustomCallOp>(orig)));
+  }
+  SmallVector<Value> cacheValues(Operation *, MGradientUtilsReverse *) const {
+    return {};
+  }
+  LogicalResult createShadowValues(Operation *, OpBuilder &,
+                                   MGradientUtilsReverse *) const {
+    return success();
+  }
+};
+
 // The decomposition defines the primal; this rule applies only to the
 // versioned real matrix-solve contract.
 class CompositeSolveDerivative {
@@ -2954,9 +3020,12 @@ public:
       : op(op), builder(builder), loc(op.getLoc()) {}
 
   static LogicalResult check(CompositeOp op, int64_t width) {
-    if (op.getName() != "enzyme.linalg.solve" || op.getVersion() != 1 ||
+    bool cached = op.getVersion() == 2;
+    if (op.getName() != "enzyme.linalg.solve" ||
+        (op.getVersion() != 1 && !cached) ||
         !op.getCompositeAttributes().empty() || !op->getRegions().empty() ||
-        op->getNumOperands() != 2 || op->getNumResults() != 2 || width != 1)
+        op->getNumOperands() != (cached ? 6 : 2) || op->getNumResults() != 2 ||
+        width != 1)
       return op.emitOpError("unsupported solve composite contract");
     auto a = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
     auto b = dyn_cast<RankedTensorType>(op->getOperand(1).getType());
@@ -2976,6 +3045,19 @@ public:
       if (a.getDimSize(i) != b.getDimSize(i) ||
           a.getDimSize(i) != valid.getDimSize(i))
         return op.emitOpError("solve batch dimensions must match");
+    if (cached) {
+      auto factors = dyn_cast<RankedTensorType>(op->getOperand(2).getType());
+      auto permutation =
+          dyn_cast<RankedTensorType>(op->getOperand(3).getType());
+      if (!factors || !permutation || factors.getShape() != a.getShape() ||
+          !factors.getElementType().isInteger(
+              a.getElementType().getIntOrFloatBitWidth()) ||
+          permutation.getShape() != a.getShape().drop_back() ||
+          !permutation.getElementType().isInteger(32) ||
+          op->getOperand(4).getType() != valid ||
+          op->getOperand(5).getType() != valid)
+        return op.emitOpError("expected solve factor cache and transpose flag");
+    }
     return success();
   }
 
@@ -3040,14 +3122,45 @@ public:
     return clone.getName();
   }
 
-  Value solve(Value a, Value rhs, Value valid) {
+  Value solve(Value a, Value rhs, Value valid, ValueRange cache = {},
+              bool transpose = false) {
     // The solve decomposition handles invalid matrices before native kernels.
     rhs = mask(rhs, valid);
-    auto result = CompositeOp::create(
-        builder, loc, op->getResultTypes(), ValueRange{a, rhs}, op.getName(),
-        op.getCompositeAttributes(), derivativeDecomposition(),
-        op.getVersion());
+    SmallVector<Value> operands{a, rhs};
+    operands.append(cache.begin(), cache.end());
+    if (!cache.empty() && transpose)
+      operands.back() = NotOp::create(builder, loc, operands.back());
+    auto result =
+        CompositeOp::create(builder, loc, op->getResultTypes(), operands,
+                            op.getName(), op.getCompositeAttributes(),
+                            derivativeDecomposition(), op.getVersion());
     return mask(result->getResult(0), valid);
+  }
+};
+
+struct SolveDataFlow
+    : ADDataFlowOpInterface::ExternalModel<SolveDataFlow, CompositeOp> {
+  SmallVector<Value> getPotentialIncomingValuesRes(Operation *orig,
+                                                   OpResult result) const {
+    auto op = cast<CompositeOp>(orig);
+    if (op.getName() == "enzyme.linalg.solve" &&
+        (op.getVersion() == 1 || op.getVersion() == 2) &&
+        op.getCompositeAttributes().empty() && op->getNumResults() == 2 &&
+        op->getNumOperands() == (op.getVersion() == 2 ? 6 : 2) &&
+        getElementTypeOrSelf(op->getResult(1).getType()).isInteger(1)) {
+      if (result.getResultNumber() == 1)
+        return {}; // Validity is discrete, not a differentiable value.
+      return {op->getOperand(0), op->getOperand(1)};
+    }
+    return SmallVector<Value>(op->getOperands());
+  }
+  SmallVector<Value> getPotentialIncomingValuesArg(Operation *,
+                                                   BlockArgument) const {
+    return {};
+  }
+  SmallVector<Value> getPotentialTerminatorUsers(Operation *, Operation *,
+                                                 Value) const {
+    return {};
   }
 };
 
@@ -3082,7 +3195,11 @@ struct AutoDiffCompositeSolveFwd
     db = rule.mask(db, valid);
     Value rhs = SubtractOp::create(builder, op.getLoc(), db,
                                    rule.multiply(da, x, x.getType()));
-    gutils->setDiffe(op->getResult(0), rule.solve(a, rhs, valid), builder);
+    SmallVector<Value> cache;
+    for (Value operand : op->getOperands().drop_front(2))
+      cache.push_back(gutils->getNewFromOriginal(operand));
+    gutils->setDiffe(op->getResult(0), rule.solve(a, rhs, valid, cache),
+                     builder);
     return success();
   }
 };
@@ -3104,7 +3221,14 @@ struct AutoDiffCompositeSolveRev
     Value x = gutils->popCache(caches[1], builder);
     Value valid = gutils->popCache(caches[2], builder);
     CompositeSolveDerivative rule(op, builder);
-    Value lambda = rule.solve(rule.transpose(a), cotangent, valid);
+    SmallVector<Value> cache;
+    if (op.getVersion() == 2) {
+      cache.push_back(gutils->popCache(caches[3], builder));
+      cache.push_back(gutils->popCache(caches[4], builder));
+      cache.push_back(valid);
+      cache.push_back(gutils->popCache(caches[5], builder));
+    }
+    Value lambda = rule.solve(rule.transpose(a), cotangent, valid, cache, true);
     if (!gutils->isConstantValue(op->getOperand(1)))
       gutils->addToDiffe(op->getOperand(1), lambda, builder);
     if (!gutils->isConstantValue(op->getOperand(0))) {
@@ -3124,12 +3248,18 @@ struct AutoDiffCompositeSolveRev
     Operation *newOp = gutils->getNewFromOriginal(orig);
     OpBuilder builder(newOp);
     builder.setInsertionPointAfter(newOp);
-    return {gutils->initAndPushCache(
-                gutils->getNewFromOriginal(op->getOperand(0)), builder),
-            gutils->initAndPushCache(
-                gutils->getNewFromOriginal(op->getResult(0)), builder),
-            gutils->initAndPushCache(
-                gutils->getNewFromOriginal(op->getResult(1)), builder)};
+    SmallVector<Value> caches{
+        gutils->initAndPushCache(gutils->getNewFromOriginal(op->getOperand(0)),
+                                 builder),
+        gutils->initAndPushCache(gutils->getNewFromOriginal(op->getResult(0)),
+                                 builder),
+        gutils->initAndPushCache(gutils->getNewFromOriginal(op->getResult(1)),
+                                 builder)};
+    if (op.getVersion() == 2)
+      for (unsigned i : {2u, 3u, 5u})
+        caches.push_back(gutils->initAndPushCache(
+            gutils->getNewFromOriginal(op->getOperand(i)), builder));
+    return caches;
   }
 
   LogicalResult createShadowValues(Operation *, OpBuilder &,
@@ -6715,6 +6845,10 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
         SHLODynamicUpdateSliceOpBatchInterface>(*context);
     CustomCallOp::attachInterface<SHLOGenericBatchOpInterface<CustomCallOp>>(
         *context);
+    CustomCallOp::attachInterface<SolveFactorActivity>(*context);
+    CustomCallOp::attachInterface<AutoDiffSolveFactorFwd>(*context);
+    CustomCallOp::attachInterface<AutoDiffSolveFactorRev>(*context);
+    CompositeOp::attachInterface<SolveDataFlow>(*context);
     RngBitGeneratorOp::attachInterface<SHLORngBitGeneratorOpBatchInterface>(
         *context);
     IotaOp::attachInterface<SHLOIotaOpBatchInterface>(*context);
