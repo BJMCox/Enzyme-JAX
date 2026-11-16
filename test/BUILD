@@ -61,6 +61,12 @@ TEST_DEPS = [
 })
 
 py_test(
+    name = "test_small_gpu",
+    srcs = ["test_small_gpu.py"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_batching",
     srcs = ["test_hlo_batching.py"],
     deps = TEST_DEPS,
