@@ -109,8 +109,6 @@ JAX selects target kernels after differentiation. Shared inputs stay unbatched,
 and pullbacks retain compact broadcast operands.
 Implicit solve derivatives preserve matrix dependence through higher orders.
 Differentiated scans save LU factors and row permutations for reverse solves.
-Implicit solve derivatives preserve matrix dependence through higher orders.
-Differentiated scans save LU factors and row permutations for reverse solves.
 
 Unsupported operations, data-dependent loops, and explicit random state retain
 pointwise device maps. These preserve per-call behavior but can be slower than
