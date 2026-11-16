@@ -89,6 +89,7 @@
 #include "nanobind/stl/tuple.h"
 #include "nanobind/stl/vector.h"
 
+#include "stablehlo/conversions/linalg/transforms/Passes.h"
 #include "stablehlo/transforms/Passes.h"
 
 #include "Integrations/c/EnzymeXLA.h"
@@ -448,6 +449,7 @@ NB_MODULE(enzyme_call, m) {
   mlir::enzyme::registerGenerateApplyPatternsPass();
   mlir::enzyme::registerRemoveTransformPass();
   mlir::stablehlo::registerPasses();
+  mlir::stablehlo::registerStablehloLegalizeToLinalgPass();
 
   nanobind::enum_<Language>(m, "Language")
       .value("CPP", Language::CPP)

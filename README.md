@@ -47,6 +47,31 @@ Symbolically inactive output cotangents also keep the activity-specific path.
 The optimization currently applies to raw StableHLO calls, not callable sources
 passed to `enzyme_jax_ir`.
 
+## Small CUDA programs
+
+`SmallGPUPipeline` is an explicit experimental profile for small static programs
+with dynamic control flow. Each invocation runs on one GPU thread in one kernel.
+Apply it to a sampler transition and keep the draw scan outside the compiled
+function. Apply automatic differentiation to the density before lowering the
+transition.
+
+```python
+from enzyme_ad.jax import SmallGPUPipeline, enzyme_jax_ir
+
+compiled_step = enzyme_jax_ir(
+    pipeline_options=SmallGPUPipeline("sm_90", toolkit_path="/usr/local/cuda")
+)(step)
+```
+
+Select the CUDA architecture for the target device. This profile requires a CUDA
+toolkit and a CUDA JAX backend. CPU compilation and unsupported operations fail.
+Each tensor must have a static, nonempty shape with at most 128 elements by
+default. Set `max_tensor_elements` explicitly to change this limit. Entry buffers
+must total at most 64 KiB. Larger states can increase compilation cost and register
+pressure. Other pipeline choices retain their existing CPU and GPU lowerings.
+Outer batching currently runs invocations pointwise. Benchmark large batches
+against the standard GPU pipeline.
+
 # Installation
 
 The easiest way to install is using pip.

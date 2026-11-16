@@ -635,6 +635,46 @@ def DelinearizeIndexingPass : Pass<"delinearize-indexing"> {
 }
 
 
+def LowerSmallProgramControlPass : Pass<"lower-small-program-control", "mlir::ModuleOp"> {
+  let summary = "Lower StableHLO control flow and single indexed windows to SCF";
+  let dependentDialects = [
+    "arith::ArithDialect", "scf::SCFDialect", "tensor::TensorDialect",
+    "stablehlo::StablehloDialect"
+  ];
+}
+
+def LowerSmallTensorValuesPass : Pass<"lower-small-tensor-values", "mlir::ModuleOp"> {
+  let summary = "Lower small static tensor values to flat vectors";
+  let description = [{
+    Preserve array value semantics across structured control flow without
+    device heap allocation. Keep scalar arithmetic in standard MLIR operations.
+    Reject dynamic, empty, encoded, or unsupported tensor types and tensors
+    exceeding max-elements. Save the entry's tensor signature for GPU outlining.
+  }];
+  let dependentDialects = [
+    "arith::ArithDialect", "func::FuncDialect", "scf::SCFDialect",
+    "vector::VectorDialect", "ub::UBDialect"
+  ];
+  let options = [
+    Option<"maxElements", "max-elements", "int64_t", "128",
+           "Maximum number of elements in each tensor value">,
+    Option<"entryFunction", "entry", "std::string", [{"main"}],
+           "Entry whose tensor signature is saved for GPU outlining">
+  ];
+}
+
+def OutlineSmallGPUProgramPass : Pass<"outline-small-gpu-program", "mlir::ModuleOp"> {
+  let summary = "Outline a small value program as a single-thread GPU kernel";
+  let dependentDialects = [
+    "arith::ArithDialect", "func::FuncDialect", "LLVM::LLVMDialect", "scf::SCFDialect",
+    "enzymexla::EnzymeXLADialect", "stablehlo::StablehloDialect"
+  ];
+  let options = [
+    Option<"entryFunction", "entry", "std::string", [{"main"}],
+           "Vector entry produced by lower-small-tensor-values">
+  ];
+}
+
 def LowerKernelPass : Pass<"lower-kernel"> {
   let summary = "Lower kernel to custom call";
   let dependentDialects = [

@@ -133,6 +133,32 @@ class JaXPipeline:
         return self.passes.count("enzyme-wrap")
 
 
+class SmallGPUPipeline(JaXPipeline):
+    """Compile a small static JAX program into one CUDA kernel.
+
+    Apply this explicit profile to a transition or another small computation.
+    CPU compilation, unsupported operations, and tensors above the configured
+    element limit fail. Keep larger scans outside the fused computation.
+    Batched invocations retain pointwise execution.
+    """
+
+    def __init__(
+        self, chip, *, toolkit_path=None, max_tensor_elements=128, features="+ptx80"
+    ):
+        from ._small_gpu import pipeline
+
+        passes, self._toolkit = pipeline(
+            chip, toolkit_path, max_tensor_elements, features
+        )
+        super().__init__(passes)
+
+    def pass_pipeline(self):
+        from ._small_gpu import load_runtime
+
+        load_runtime(self._toolkit)
+        return super().pass_pipeline()
+
+
 def optimization_passes(
     *,
     inline: bool = True,
@@ -681,7 +707,15 @@ def _enzyme_primal_lowering(
 
     in_args = (*args_flat,)
 
+    if isinstance(pipeline_options, SmallGPUPipeline) and tuple(
+        ctx.module_context.platforms
+    ) != ("cuda",):
+        raise NotImplementedError("SmallGPUPipeline requires the CUDA backend")
     pass_pipeline = pipeline_options.pass_pipeline()
+    if "outline-small-gpu-program" in pass_pipeline and tuple(
+        ctx.module_context.platforms
+    ) != ("cuda",):
+        raise NotImplementedError("SmallGPUPipeline requires the CUDA backend")
 
     out_idx_map = {i: -1 for i in range(len(out_shapes))}
 
@@ -2108,6 +2142,11 @@ def enzyme_jax_ir(
             def zero_like(arg):
                 if arg.dtype == jax.float0:
                     return arg
+                if jax.dtypes.issubdtype(arg.dtype, jax.dtypes.prng_key):
+                    return jax.random.wrap_key_data(
+                        jnp.zeros_like(jax.random.key_data(arg)),
+                        impl=jax.random.key_impl(arg),
+                    )
                 else:
                     return jnp.zeros(arg.shape, dtype=arg.dtype)
 
