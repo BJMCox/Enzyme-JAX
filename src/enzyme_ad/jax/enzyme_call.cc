@@ -413,6 +413,7 @@ void Callback(void *out, void **ins, void *opaque, size_t opaque_len,
 }
 
 extern "C" void RegisterEnzymeXLAGPUHandler();
+extern "C" void *GetEnzymeXLAGPUHandler(bool withError);
 extern "C" void RegisterEnzymeXLACPUHandler();
 extern "C" void registerEnzymeJaXXLAFFI();
 
@@ -639,6 +640,10 @@ NB_MODULE(enzyme_call, m) {
 
   m.def("register_enzymexla_gpu_handler",
         []() { RegisterEnzymeXLAGPUHandler(); });
+  m.def("enzymexla_gpu_handler", [](bool withError) {
+    return nanobind::capsule(GetEnzymeXLAGPUHandler(withError),
+                             "xla._CUSTOM_CALL_TARGET");
+  });
 
   m.def("register_enzymexla_xla_ffi", []() { registerEnzymeJaXXLAFFI(); });
 

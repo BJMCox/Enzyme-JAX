@@ -75,6 +75,10 @@ XLA_FFI_DEFINE_HANDLER(kExecuteWithError, execute<true>,
                            .RemainingArgs()
                            .RemainingRets());
 
+extern "C" MLIR_CAPI_EXPORTED void *GetEnzymeXLAGPUHandler(bool withError) {
+  return reinterpret_cast<void *>(withError ? kExecuteWithError : kExecute);
+}
+
 extern "C" MLIR_CAPI_EXPORTED void RegisterEnzymeXLAGPUHandler() {
   XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "enzymexla_compile_gpu", "CUDA",
                            kExecute);

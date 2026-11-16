@@ -47,6 +47,16 @@ except AttributeError:
 if hasattr(enzyme_call, "register_enzymexla_xla_ffi"):
     enzyme_call.register_enzymexla_xla_ffi()
 
+if hasattr(enzyme_call, "enzymexla_gpu_handler"):
+    for platform in ("CUDA", "ROCM"):
+        for name, with_error in (
+            ("enzymexla_compile_gpu", False),
+            ("enzymexla_compile_gpu_with_error", True),
+        ):
+            jax.ffi.register_ffi_target(
+                name, enzyme_call.enzymexla_gpu_handler(with_error), platform=platform
+            )
+
 
 _aval_to_ir_types_impl: Any = jax_mlir.aval_to_ir_types
 _aval_to_ir_types_takes_module_context = (
@@ -1532,9 +1542,11 @@ def _enzyme_batch(primitive, args, axes, **params):
                 (
                     jnp.moveaxis(value, axis, 0)
                     if axis is not None
-                    else jnp.broadcast_to(value, (size, *value.shape))
-                    if pending_ad
-                    else value
+                    else (
+                        jnp.broadcast_to(value, (size, *value.shape))
+                        if pending_ad
+                        else value
+                    )
                 )
                 for value, axis in zip(args, axes)
             )
