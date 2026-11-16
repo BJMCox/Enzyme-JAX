@@ -4,7 +4,6 @@ on:
   pull_request:
     branches: [main, flatppl-main]
   push:
-    branches: [main, flatppl-main]
   workflow_dispatch:
 
 permissions:
