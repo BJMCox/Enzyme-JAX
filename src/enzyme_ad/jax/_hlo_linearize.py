@@ -55,9 +55,7 @@ def _referenced_functions(function, functions):
             key = (
                 "callee"
                 if op.name == "func.call"
-                else "decomposition"
-                if op.name == "stablehlo.composite"
-                else None
+                else "decomposition" if op.name == "stablehlo.composite" else None
             )
             if key is None:
                 continue
