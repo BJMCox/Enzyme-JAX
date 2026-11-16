@@ -41,7 +41,7 @@ state. Reverse mode reads the next row, or the final forward state for the last
 step, avoiding reconstruction of the recurrence.
 
 This optimization requires MLIR memory-effect queries in JAX's Python bindings
-(tested with JAX/jaxlib 0.12.0.1). Older bindings, effectful programs, retained module
+(tested with JAX/jaxlib 0.12.0.1). Older bindings, effectful programs, unsupported module
 symbols and unsupported joint derivatives keep the existing differentiation path.
 Symbolically inactive output cotangents also keep the activity-specific path.
 The optimization currently applies to raw StableHLO calls, not callable sources
@@ -95,7 +95,7 @@ bazel build :wheel
 
 ### FlatPPL alpha wheels
 
-This fork packages `enzyme-ad==0.0.15+flatppl.15` for macOS ARM64 and
+This fork packages `enzyme-ad==0.0.15+flatppl.16` for macOS ARM64 and
 Linux x86-64 and ARM64. Wheels include the native library and use CPython ABI
 tags. Build each Python minor version separately.
 
@@ -107,6 +107,8 @@ advance all batch lanes together. Values and pullbacks share forward residuals.
 Native float32/float64 Cholesky and triangular solves support differentiation and batching.
 JAX selects target kernels after differentiation. Shared inputs stay unbatched,
 and pullbacks retain compact broadcast operands.
+Implicit solve derivatives preserve matrix dependence through higher orders.
+Differentiated scans save LU factors and row permutations for reverse solves.
 
 Unsupported operations, data-dependent loops, and explicit random state retain
 pointwise device maps. These preserve per-call behavior but can be slower than
