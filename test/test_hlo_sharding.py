@@ -1,4 +1,5 @@
 from absl.testing import absltest
+from pathlib import Path
 import jax
 import jax.numpy as jnp
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
@@ -34,6 +35,39 @@ class HloSharding(absltest.TestCase):
             in_specs=(P("devices"), P()),
             out_specs=P("devices"),
         )
+
+    def test_native_solve_partitions_matrix_batches(self):
+        source = Path(__file__).with_name("solve_composite_2x2.mlir").read_text()
+        source = source.replace("0x7FF0000000000000", "0x7F800000").replace(
+            "f64", "f32"
+        )
+        matrices = np.tile(
+            np.array([[0, 2], [1, 3]], np.float32), (jax.device_count(), 1, 1)
+        )
+        matrices[-1] = 0
+        rhs = np.array([[1, 2], [-2, 3]], np.float32)
+        sharded = NamedSharding(self.mesh, P("devices", None, None))
+        replicated = NamedSharding(self.mesh, P())
+        solve = jax.vmap(lambda a, b: hlo_call(a, b, source=source), in_axes=(0, None))
+
+        def loss(a, b):
+            values, valid = solve(a, b)
+            return values.sum(), valid
+
+        (value, valid), (ga, gb) = jax.jit(
+            jax.value_and_grad(loss, argnums=(0, 1), has_aux=True),
+            in_shardings=(sharded, replicated),
+        )(matrices, rhs)
+        x = np.linalg.solve(matrices[0].astype(np.float64), rhs)
+        adjoint = np.linalg.solve(matrices[0].T.astype(np.float64), np.ones_like(rhs))
+        np.testing.assert_allclose(value, (len(matrices) - 1) * x.sum(), rtol=3e-6)
+        np.testing.assert_array_equal(
+            valid, np.arange(len(matrices)) != len(matrices) - 1
+        )
+        expected = np.tile(-adjoint @ x.T, (len(matrices), 1, 1))
+        expected[-1] = 0
+        np.testing.assert_allclose(ga, expected, rtol=3e-6, atol=3e-6)
+        np.testing.assert_allclose(gb, (len(matrices) - 1) * adjoint, rtol=3e-6)
 
     def test_shared_parameter_gradient_sums_across_devices(self):
         mapped = self.mapped(imported)

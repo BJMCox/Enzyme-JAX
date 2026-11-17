@@ -23,7 +23,8 @@ import jax.extend
 from jax._src.interpreters import partial_eval as pe
 from jax._src import core
 from jax._src.mesh import get_abstract_mesh
-from jax._src.lax.linalg import _lu_solve
+from jax._src.lax.linalg import _linalg_ffi_lowering, _lu_solve
+from jaxlib import lapack
 from jax.sharding import NamedSharding, PartitionSpec
 
 from . import enzyme_call
@@ -1366,7 +1367,9 @@ def _lower_native_linalg(ctx, module):
             operations.append(op)
         return ir.WalkResult.ADVANCE
 
-    def recover_shared_matrix(operands, function):
+    def recover_shared_matrix(
+        operands, function: Callable[..., Any]
+    ) -> Callable[..., Any]:
         while isinstance(operands[0], ir.OpResult):
             broadcast = operands[0].owner.operation
             if broadcast.name != "stablehlo.broadcast_in_dim":
@@ -1391,8 +1394,34 @@ def _lower_native_linalg(ctx, module):
                 function = jax.vmap(function, in_axes=(None, 0))
         return function
 
+    def protected_solve_result(op):
+        value, valid = op.results
+        shape = ir.RankedTensorType(value.type).shape
+        rank = len(ir.RankedTensorType(valid.type).shape)
+        uses = list(value.uses)
+        for use in uses:
+            owner = use.owner
+            if owner.name != "stablehlo.select" or use.operand_number != 1:
+                return False
+            predicate = owner.operands[0]
+            if not isinstance(predicate, ir.OpResult):
+                return False
+            broadcast = predicate.owner.operation
+            if (
+                broadcast.name != "stablehlo.broadcast_in_dim"
+                or broadcast.operands[0] != valid
+                or list(
+                    ir.DenseI64ArrayAttr(broadcast.attributes["broadcast_dimensions"])
+                )
+                != list(range(rank))
+                or list(ir.RankedTensorType(predicate.type).shape) != list(shape)
+            ):
+                return False
+        return bool(uses)
+
     module.operation.walk(collect)
     for op in operations:
+        cpu_solve = False
         factor_cache = op.name == "stablehlo.custom_call"
         cached_solve = op.name == "func.call" and ir.FlatSymbolRefAttr(
             op.attributes["callee"]
@@ -1586,16 +1615,30 @@ def _lower_native_linalg(ctx, module):
                         operands[0] = trans.operands[0]
                         transpose = True
 
-            def function(a, b, transpose=transpose):
+            cpu_solve = tuple(ctx.module_context.platforms) == ("cpu",)
+            mask_result = not cpu_solve or not protected_solve_result(op)
+
+            def solve_function(
+                a, b, transpose=transpose, cpu_solve=cpu_solve, mask_result=mask_result
+            ):
                 # Follow native LU behavior without scanning full matrices.
                 # The existing solve ABI still reports a zero or invalid pivot.
-                factors, pivots, _ = lax.linalg.lu(a)
+                if cpu_solve:
+                    factors, pivots, info = a
+                    pivots = pivots - 1
+                else:
+                    factors, pivots, info = lax.linalg.lu(a)
                 diagonal = jnp.diagonal(factors, axis1=-2, axis2=-1)
                 valid = jnp.all(jnp.isfinite(diagonal) & (diagonal != 0), axis=-1)
+                if cpu_solve:
+                    valid &= info >= 0
                 x = lu_solve((factors, pivots), b, trans=int(transpose))
-                return jnp.where(valid[..., None, None], x, jnp.zeros_like(x)), valid
+                # A caller masking every use cannot observe the invalid zero.
+                if mask_result:
+                    x = jnp.where(valid[..., None, None], x, jnp.zeros_like(x))
+                return x, valid
 
-            function = recover_shared_matrix(operands, function)
+            function = recover_shared_matrix(operands, solve_function)
             types = [ir.RankedTensorType(value.type) for value in operands]
             multiple_results = True
         elif op.name == "stablehlo.cholesky":
@@ -1624,6 +1667,28 @@ def _lower_native_linalg(ctx, module):
             # when the matrix is shared. Recover that proof from leading broadcasts.
             function = recover_shared_matrix(operands, function)
             types = [ir.RankedTensorType(value.type) for value in operands]
+        lowered_function: Callable[..., Any] = function
+        if cpu_solve:
+            aval = to_jax_type(types[0])
+            pivot = aval.update(shape=aval.shape[:-1], dtype=jnp.dtype(jnp.int32))
+            info = aval.update(shape=aval.shape[:-2], dtype=jnp.dtype(jnp.int32))
+            lu_ctx = ctx.replace(
+                avals_in=[aval], avals_out=[aval, pivot, info], primitive=None
+            )
+            target = lapack.prepare_lapack_call("getrf_ffi", aval.dtype)
+            with ir.InsertionPoint(op), op.location:
+                factors = _linalg_ffi_lowering(target, operand_output_aliases={0: 0})(
+                    lu_ctx, operands[0]
+                )
+
+            def solve_from_factors(
+                factors, pivots, info, b, solve: Callable[..., Any] = function
+            ):
+                return solve((factors, pivots, info), b)
+
+            lowered_function = solve_from_factors
+            operands = [*factors, operands[1]]
+            types = [ir.RankedTensorType(value.type) for value in operands]
         output_avals = [to_jax_type(ir.RankedTensorType(v.type)) for v in op.results]
         operation_ctx = ctx.replace(
             avals_in=[to_jax_type(ty) for ty in types],
@@ -1632,7 +1697,7 @@ def _lower_native_linalg(ctx, module):
         )
         with ir.InsertionPoint(op), op.location:
             replacement = jax_mlir.lower_fun(
-                function, multiple_results=multiple_results
+                lowered_function, multiple_results=multiple_results
             )(operation_ctx, *operands)
         for result, value in zip(op.results, replacement):
             result.replace_all_uses_with(value)

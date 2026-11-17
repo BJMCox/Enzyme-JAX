@@ -331,6 +331,62 @@ class SolveCompositeTest(parameterized.TestCase):
         np.testing.assert_array_equal(values[0], np.zeros((2, 2), dtype=np.float32))
         np.testing.assert_allclose(values[1], [[1, 2], [1, -1]], rtol=1e-6, atol=1e-6)
 
+    @parameterized.named_parameters(
+        ("protected", False, False, False),
+        ("unprotected_use", True, False, False),
+        ("false_arm", False, True, False),
+        ("unrelated_predicate", False, False, True),
+    )
+    def test_solve_result_masks_preserve_invalid_values(
+        self, expose_raw, false_arm, unrelated_predicate
+    ):
+        source = MATRIX_SOURCE
+        outputs = "tensor<2x2xf64>, tensor<i1>"
+        if expose_raw:
+            source = source.replace(
+                f"-> ({outputs}) {{", f"-> (tensor<2x2xf64>, {outputs}) {{", 1
+            )
+        arms = "%fallback, %x" if false_arm else "%x, %fallback"
+        returned = "%masked, %x, %valid" if expose_raw else "%masked, %valid"
+        result_types = f"tensor<2x2xf64>, {outputs}" if expose_raw else outputs
+        source = source.replace(
+            f"return %x, %valid : {outputs}",
+            f"""%pred = stablehlo.broadcast_in_dim %valid, dims = []
+                : (tensor<i1>) -> tensor<2x2xi1>
+            %fallback = stablehlo.constant dense<-7.0> : tensor<2x2xf64>
+            %masked = stablehlo.select %pred, {arms}
+                : tensor<2x2xi1>, tensor<2x2xf64>
+            return {returned} : {result_types}""",
+            1,
+        )
+        if unrelated_predicate:
+            source = source.replace(
+                "%pred = stablehlo.broadcast_in_dim %valid, dims = []",
+                "%other = stablehlo.not %valid : tensor<i1>\n"
+                "    %pred = stablehlo.broadcast_in_dim %other, dims = []",
+                1,
+            )
+        matrix = np.array([[0.0, 2.0], [1.0, 3.0]])
+        invalid = matrix.copy()
+        invalid[0, 1] = np.nan
+        matrices = np.stack((matrix, np.zeros_like(matrix), invalid))
+        rhs = np.array([[1.0, 2.0], [-2.0, 3.0]])
+        solve = jax.jit(jax.vmap(lambda a: hlo_call(a, rhs, source=source)))
+        result = solve(matrices)
+        value = np.linalg.solve(matrix, rhs)
+        zeros, fallback = np.zeros_like(value), np.full_like(value, -7)
+        expected = (
+            np.stack((fallback, zeros, zeros))
+            if false_arm or unrelated_predicate
+            else np.stack((value, fallback, fallback))
+        )
+        np.testing.assert_allclose(result[0], expected, rtol=2e-12, atol=2e-12)
+        np.testing.assert_array_equal(result[-1], [True, False, False])
+        if expose_raw:
+            np.testing.assert_allclose(
+                result[1], np.stack((value, zeros, zeros)), rtol=2e-12, atol=2e-12
+            )
+
     def test_native_adjoint_keeps_the_primal_validity(self):
         source = MATRIX_SOURCE.replace("0x7FF0000000000000", "0x7F800000").replace(
             "f64", "f32"
