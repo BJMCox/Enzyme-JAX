@@ -2968,6 +2968,28 @@ static bool isSolveFactorCache(CustomCallOp op) {
   return true;
 }
 
+struct SolveFactorBatch
+    : BatchOpInterface::ExternalModel<SolveFactorBatch, CustomCallOp> {
+  LogicalResult createBatch(Operation *src, OpBuilder &builder,
+                            IRMapping &mapper,
+                            ArrayRef<int64_t> batchSizes) const {
+    if (!isSolveFactorCache(cast<CustomCallOp>(src)))
+      return genericCreateBatch(src, builder, mapper, batchSizes);
+
+    OperationState state(src->getLoc(), CustomCallOp::getOperationName());
+    state.addOperands(mapper.lookup(src->getOperand(0)));
+    for (Type type : src->getResultTypes())
+      state.addTypes(enzyme::batchutils::applyBatchSizes(type, batchSizes));
+    state.addAttribute("call_target_name", src->getAttr("call_target_name"));
+    state.addAttribute("has_side_effect", builder.getBoolAttr(false));
+    Operation *factor = builder.create(state);
+    for (auto [oldValue, newValue] :
+         llvm::zip_equal(src->getResults(), factor->getResults()))
+      mapper.map(oldValue, newValue);
+    return success();
+  }
+};
+
 // Integer caches are implementation data. All matrix derivatives pass through
 // the explicit matrix operand of the cached solve below.
 struct SolveFactorActivity
@@ -7021,8 +7043,7 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
         SHLODynamicSliceOpBatchInterface>(*context);
     stablehlo::DynamicUpdateSliceOp::attachInterface<
         SHLODynamicUpdateSliceOpBatchInterface>(*context);
-    CustomCallOp::attachInterface<SHLOGenericBatchOpInterface<CustomCallOp>>(
-        *context);
+    CustomCallOp::attachInterface<SolveFactorBatch>(*context);
     CustomCallOp::attachInterface<SolveFactorActivity>(*context);
     CustomCallOp::attachInterface<AutoDiffSolveFactorFwd>(*context);
     CustomCallOp::attachInterface<AutoDiffSolveFactorRev>(*context);

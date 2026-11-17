@@ -14,7 +14,7 @@ from ._hlo_linearize import (
     _tensor,
     _walk,
 )
-from ._hlo_solve import pure_function, pure_operation
+from ._hlo_solve import is_solve_factor_cache, pure_function, pure_operation
 
 
 @lru_cache(maxsize=128)
@@ -82,6 +82,8 @@ def _batchable(op, functions):
         return False
     if not all(_tensor(v.type) for v in (*op.operands, *op.results)):
         return False
+    if op.name == "stablehlo.custom_call":
+        return is_solve_factor_cache(op)
     # AD rules can leave their literal multipliers in the CHLO dialect.
     if op.name == "chlo.constant":
         return True
