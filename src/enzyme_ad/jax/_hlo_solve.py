@@ -15,6 +15,7 @@ from ._hlo_linearize import _pure, _tensor, _walk
 
 _PREFIX = "__enzyme_linalg_solve_v1_"
 _LOGABSDET_PREFIX = "__enzyme_linalg_logabsdet_v1_"
+_DET_PREFIX = "__enzyme_linalg_det_v1_"
 _NAME = "enzyme.linalg.solve"
 _FACTOR = "__enzyme_linalg_factor_v1"
 _CACHED_PREFIX = "__enzyme_linalg_cached_solve_v2_"
@@ -246,7 +247,7 @@ def _check_solve(call, name, functions):
         raise ValueError("invalid reserved solve tensor signature")
 
 
-def _check_logabsdet(call, name, functions):
+def _check_determinant(call, name, functions):
     function = functions.get(name)
     if (
         function is None
@@ -277,7 +278,9 @@ def _check_logabsdet(call, name, functions):
 
 
 def recognize_linalg(source):
-    if _PREFIX not in source and _LOGABSDET_PREFIX not in source:
+    if not any(
+        prefix in source for prefix in (_PREFIX, _LOGABSDET_PREFIX, _DET_PREFIX)
+    ):
         return source
     with mlir.make_ir_context(), ir.Location.unknown():
         module = ir.Module.parse(source)
@@ -291,13 +294,14 @@ def recognize_linalg(source):
             for op in _walk(module.operation)
             if op.name == "func.call"
             and ir.FlatSymbolRefAttr(op.attributes["callee"]).value.startswith(
-                (_PREFIX, _LOGABSDET_PREFIX)
+                (_PREFIX, _LOGABSDET_PREFIX, _DET_PREFIX)
             )
         ]
         for call in calls:
             name = ir.FlatSymbolRefAttr(call.attributes["callee"]).value
             logarithm = name.startswith(_LOGABSDET_PREFIX)
-            (_check_logabsdet if logarithm else _check_solve)(call, name, functions)
+            determinant = name.startswith((_LOGABSDET_PREFIX, _DET_PREFIX))
+            (_check_determinant if determinant else _check_solve)(call, name, functions)
             with ir.InsertionPoint(call):
                 composite = ir.Operation.create(
                     "stablehlo.composite",
@@ -305,7 +309,13 @@ def recognize_linalg(source):
                     results=[v.type for v in call.results],
                     attributes={
                         "name": ir.StringAttr.get(
-                            "enzyme.linalg.logabsdet" if logarithm else _NAME
+                            (
+                                "enzyme.linalg.logabsdet"
+                                if logarithm
+                                else "enzyme.linalg.det"
+                            )
+                            if determinant
+                            else _NAME
                         ),
                         "decomposition": ir.FlatSymbolRefAttr.get(name),
                         "composite_attributes": ir.DictAttr.get({}),

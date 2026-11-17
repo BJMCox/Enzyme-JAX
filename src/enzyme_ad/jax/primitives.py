@@ -234,7 +234,7 @@ def optimization_passes(
 
     func_passes = ",".join(
         [
-            "func.func(stablehlo-legalize-composite-to-call{except=enzyme.linalg.solve,enzyme.linalg.logabsdet})",
+            "func.func(stablehlo-legalize-composite-to-call{except=enzyme.linalg.solve,enzyme.linalg.logabsdet,enzyme.linalg.det})",
             "canonicalize",
             "cse",
             "canonicalize",
@@ -1237,7 +1237,13 @@ def to_jax_type(mlir_type):
 
 def _lower_native_linalg(ctx, module):
     """Use JAX's target lowering after differentiating portable matrix ops."""
-    from ._hlo_solve import _CACHED_PREFIX, _FACTOR, _LOGABSDET_PREFIX, _check_logabsdet
+    from ._hlo_solve import (
+        _CACHED_PREFIX,
+        _FACTOR,
+        _LOGABSDET_PREFIX,
+        _DET_PREFIX,
+        _check_determinant,
+    )
 
     operations = []
     solve_prefix = "__enzyme_linalg_solve_v1_"
@@ -1258,7 +1264,7 @@ def _lower_native_linalg(ctx, module):
                 op.name == "func.call"
                 and "callee" in op.attributes
                 and ir.FlatSymbolRefAttr(op.attributes["callee"]).value.startswith(
-                    (solve_prefix, _CACHED_PREFIX, _LOGABSDET_PREFIX)
+                    (solve_prefix, _CACHED_PREFIX, _LOGABSDET_PREFIX, _DET_PREFIX)
                 )
             )
             or (
@@ -1416,22 +1422,33 @@ def _lower_native_linalg(ctx, module):
             multiple_results = True
         elif op.name == "func.call" and ir.FlatSymbolRefAttr(
             op.attributes["callee"]
-        ).value.startswith(_LOGABSDET_PREFIX):
+        ).value.startswith((_LOGABSDET_PREFIX, _DET_PREFIX)):
             name = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
-            _check_logabsdet(op, name, functions)
+            _check_determinant(op, name, functions)
+            logarithm = name.startswith(_LOGABSDET_PREFIX)
 
-            def function(a):
-                factors, _, permutation = lax.linalg.lu(a)
+            def function(a, logarithm=logarithm):
+                factors, pivots, permutation = lax.linalg.lu(a)
                 diagonal = jnp.diagonal(factors, axis1=-2, axis2=-1)
                 singular = jnp.any(diagonal == 0, axis=-1)
                 valid = jnp.all(jnp.isfinite(diagonal) & (diagonal != 0), axis=-1)
                 value = jnp.where(
                     singular, -jnp.inf, jnp.sum(jnp.log(jnp.abs(diagonal)), axis=-1)
                 )
+                if not logarithm:
+                    parity = jnp.sum(
+                        pivots != jnp.arange(a.shape[-1], dtype=pivots.dtype), axis=-1
+                    )
+                    parity += jnp.sum(diagonal < 0, axis=-1)
+                    sign = (1 - 2 * (parity % 2)).astype(a.dtype)
+                    value = jnp.where(singular, 0, sign * jnp.exp(value))
+                    valid &= jnp.isfinite(value) & (value != 0)
                 identity = jnp.broadcast_to(
                     jnp.eye(a.shape[-1], dtype=a.dtype), a.shape
                 )
                 inverse = _lu_solve(factors, permutation, identity, trans=0)
+                if not logarithm:
+                    inverse = jnp.where(valid[..., None, None], inverse, 0)
                 return value, inverse, valid
 
             multiple_results = True
