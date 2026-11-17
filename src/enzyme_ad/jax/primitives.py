@@ -30,7 +30,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from . import enzyme_call
 from ._hlo_linearize import _walk, linearize_hlo
 from ._hlo_batch import batch_hlo, has_conditionals
-from ._hlo_solve import recognize_linalg
+from ._hlo_solve import is_solve_factor_cache, recognize_linalg
 
 from .utils import default_nowheel_resource, default_linux_cflags
 
@@ -466,7 +466,9 @@ def _check_local_hlo(module):
     pending = [module.operation]
     while pending:
         op = pending.pop()
-        if op.name.removeprefix("stablehlo.") in nonlocal_ops:
+        if op.name.removeprefix(
+            "stablehlo."
+        ) in nonlocal_ops and not is_solve_factor_cache(op):
             raise NotImplementedError(
                 f"Imported HLO under shard_map requires local operations, got {op.name}. "
                 "Express device operations and collectives in the surrounding JAX function."
@@ -1445,32 +1447,7 @@ def _lower_native_linalg(ctx, module):
             continue
         multiple_results = False
         if factor_cache:
-            if (
-                len(types) != 1
-                or len(op.results) != 3
-                or (
-                    "has_side_effect" in op.attributes
-                    and ir.BoolAttr(op.attributes["has_side_effect"]).value
-                )
-            ):
-                raise ValueError("invalid internal solve factor cache")
-            a = types[0]
-            n = a.shape[-1] if len(a.shape) >= 2 else 0
-            bits = "i32" if str(a.element_type) == "f32" else "i64"
-            results = [ir.RankedTensorType(v.type) for v in op.results]
-            if (
-                len(types) != 1
-                or n == 0
-                or a.shape[-2] != n
-                or str(a.element_type) not in ("f32", "f64")
-                or len(results) != 3
-                or tuple(results[0].shape) != tuple(a.shape)
-                or str(results[0].element_type) != bits
-                or tuple(results[1].shape) != tuple(a.shape[:-1])
-                or str(results[1].element_type) != "i32"
-                or tuple(results[2].shape) != tuple(a.shape[:-2])
-                or str(results[2].element_type) != "i1"
-            ):
+            if not is_solve_factor_cache(op):
                 raise ValueError("invalid internal solve factor cache")
 
             def function(a):

@@ -18,6 +18,40 @@ SCAN_SOURCE = Path(__file__).with_name("solve_scan.mlir").read_text()
 
 
 class SolveCompositeTest(parameterized.TestCase):
+    def test_vmap_value_and_grad_batches_native_factorization(self):
+        if jax.default_backend() not in ("cpu", "gpu"):
+            self.skipTest("requires native LU")
+
+        a = np.array([[0.0, 2.0], [1.0, 3.0]])
+        b = np.array([[1.0, 2.0], [-2.0, 3.0]])
+        matrices = np.stack((a, np.zeros_like(a), 2 * a))
+
+        def loss(a, b):
+            x, valid = hlo_call(a, b, source=MATRIX_SOURCE)
+            return x.sum(), valid
+
+        compiled = (
+            jax.jit(jax.vmap(jax.value_and_grad(loss, has_aux=True), in_axes=(0, None)))
+            .lower(matrices, b)
+            .compile()
+        )
+        (values, valid), grads = compiled(matrices, b)
+        x = np.linalg.solve(a, b)
+        adjoint = np.linalg.solve(a.T, np.ones_like(b))
+        expected = -adjoint @ x.T
+        np.testing.assert_array_equal(valid, [True, False, True])
+        np.testing.assert_allclose(values, [x.sum(), 0, x.sum() / 2], atol=2e-12)
+        np.testing.assert_allclose(
+            grads, [expected, np.zeros_like(expected), expected / 4], atol=2e-12
+        )
+        factor_calls = [
+            line
+            for line in compiled.as_text().splitlines()
+            if re.search(r'custom_call_target="[^"]*getrf_ffi"', line)
+        ]
+        self.assertLen(factor_calls, 1)
+        self.assertIn("f64[3,2,2]", factor_calls[0])
+
     def test_checkpoint_preserves_primal_gradient_and_hvp(self):
         a = jnp.array([[0.3, 2.0], [1.0, 3.0]], dtype=jnp.float64)
         b = jnp.array([[1.0, 2.0], [-2.0, 3.0]], dtype=jnp.float64)

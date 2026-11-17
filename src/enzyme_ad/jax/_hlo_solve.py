@@ -21,6 +21,36 @@ _FACTOR = "__enzyme_linalg_factor_v1"
 _CACHED_PREFIX = "__enzyme_linalg_cached_solve_v2_"
 
 
+def is_solve_factor_cache(op):
+    if (
+        op.name != "stablehlo.custom_call"
+        or ir.StringAttr(op.attributes["call_target_name"]).value != _FACTOR
+        or len(op.operands) != 1
+        or len(op.results) != 3
+        or (
+            "has_side_effect" in op.attributes
+            and ir.BoolAttr(op.attributes["has_side_effect"]).value
+        )
+        or not all(_tensor(v.type) for v in (*op.operands, *op.results))
+    ):
+        return False
+    a = ir.RankedTensorType(op.operands[0].type)
+    factors, permutation, valid = (ir.RankedTensorType(v.type) for v in op.results)
+    bits = {"f32": "i32", "f64": "i64"}.get(str(a.element_type))
+    return (
+        bits is not None
+        and len(a.shape) >= 2
+        and a.shape[-1] != 0
+        and a.shape[-2] == a.shape[-1]
+        and factors.shape == a.shape
+        and str(factors.element_type) == bits
+        and permutation.shape == a.shape[:-1]
+        and str(permutation.element_type) == "i32"
+        and valid.shape == a.shape[:-2]
+        and str(valid.element_type) == "i1"
+    )
+
+
 def cache_solve_factors(module, function):
     """Expose integer implementation caches before AD partitions the solve.
 

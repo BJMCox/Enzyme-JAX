@@ -69,6 +69,39 @@ class HloSharding(absltest.TestCase):
         np.testing.assert_allclose(ga, expected, rtol=3e-6, atol=3e-6)
         np.testing.assert_allclose(gb, (len(matrices) - 1) * adjoint, rtol=3e-6)
 
+    def test_vmapped_solve_gradient_on_manual_shards(self):
+        source = Path(__file__).with_name("solve_composite_2x2.mlir").read_text()
+        source = source.replace("0x7FF0000000000000", "0x7F800000").replace(
+            "f64", "f32"
+        )
+        a = np.array([[0, 2], [1, 3]], np.float32)
+        b = np.array([[1, 2], [-2, 3]], np.float32)
+        matrices = np.tile(np.stack((a, np.zeros_like(a))), (jax.device_count(), 1, 1))
+
+        def loss(a, b):
+            x, valid = hlo_call(a, b, source=source)
+            return x.sum(), valid
+
+        solve = jax.shard_map(
+            jax.vmap(jax.value_and_grad(loss, has_aux=True), in_axes=(0, None)),
+            mesh=self.mesh,
+            in_specs=(P("devices"), P()),
+            out_specs=((P("devices"), P("devices")), P("devices")),
+        )
+        (values, valid), gradients = jax.jit(solve)(matrices, b)
+        x = np.linalg.solve(a.astype(np.float64), b)
+        adjoint = np.linalg.solve(a.T.astype(np.float64), np.ones_like(b))
+        np.testing.assert_array_equal(valid, np.tile([True, False], jax.device_count()))
+        np.testing.assert_allclose(values[::2], x.sum(), rtol=3e-6)
+        np.testing.assert_array_equal(values[1::2], 0)
+        np.testing.assert_allclose(
+            gradients[::2],
+            np.broadcast_to(-adjoint @ x.T, gradients[::2].shape),
+            rtol=3e-6,
+            atol=3e-6,
+        )
+        np.testing.assert_array_equal(gradients[1::2], 0)
+
     def test_shared_parameter_gradient_sums_across_devices(self):
         mapped = self.mapped(imported)
         value, (gx, gs) = jax.jit(
