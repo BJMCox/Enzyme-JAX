@@ -127,6 +127,13 @@ py_test(
 )
 
 py_test(
+    name = "test_logabsdet_composite",
+    srcs = ["test_logabsdet_composite.py"],
+    data = ["logabsdet_composite.mlir"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_solve_composite",
     srcs = ["test_solve_composite.py"],
     data = ["solve_composite.mlir", "solve_composite_2x2.mlir", "solve_scan.mlir"],

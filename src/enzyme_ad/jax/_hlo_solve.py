@@ -1,8 +1,10 @@
-"""Preserve versioned portable solve calls for implicit differentiation.
+"""Preserve versioned portable linear algebra for implicit differentiation.
 
 Reserved private functions return (solve(A, B), valid), with zero output on
 invalid cells. Their bodies guard invalid operations. The name asserts this
 contract; signature and purity checks alone cannot prove it.
+Logabsdet functions return (logabsdet(A), inverse(A), valid); their inverse is
+undefined on invalid cells, as is the log determinant's derivative there.
 """
 
 from jax.interpreters import mlir
@@ -12,6 +14,7 @@ from jaxlib.mlir.dialects import func
 from ._hlo_linearize import _pure, _tensor, _walk
 
 _PREFIX = "__enzyme_linalg_solve_v1_"
+_LOGABSDET_PREFIX = "__enzyme_linalg_logabsdet_v1_"
 _NAME = "enzyme.linalg.solve"
 _FACTOR = "__enzyme_linalg_factor_v1"
 _CACHED_PREFIX = "__enzyme_linalg_cached_solve_v2_"
@@ -239,8 +242,38 @@ def _check_solve(call, name, functions):
         raise ValueError("invalid reserved solve tensor signature")
 
 
-def recognize_solve(source):
-    if _PREFIX not in source:
+def _check_logabsdet(call, name, functions):
+    function = functions.get(name)
+    if (
+        function is None
+        or "sym_visibility" not in function.attributes
+        or ir.StringAttr(function.attributes["sym_visibility"]).value != "private"
+        or len(call.operands) != 1
+        or len(call.results) != 3
+        or list(function.type.inputs) != [v.type for v in call.operands]
+        or list(function.type.results) != [v.type for v in call.results]
+        or not pure_function(function, functions)
+        or not all(_tensor(v.type) for v in (*call.operands, *call.results))
+    ):
+        raise ValueError("invalid reserved logabsdet function contract")
+    a = ir.RankedTensorType(call.operands[0].type)
+    value, inverse, valid = (ir.RankedTensorType(v.type) for v in call.results)
+    if (
+        len(a.shape) < 2
+        or a.shape[-1] == 0
+        or a.shape[-1] != a.shape[-2]
+        or str(a.element_type) not in ("f32", "f64")
+        or inverse != a
+        or tuple(value.shape) != tuple(a.shape[:-2])
+        or value.element_type != a.element_type
+        or tuple(valid.shape) != tuple(a.shape[:-2])
+        or str(valid.element_type) != "i1"
+    ):
+        raise ValueError("invalid reserved logabsdet tensor signature")
+
+
+def recognize_linalg(source):
+    if _PREFIX not in source and _LOGABSDET_PREFIX not in source:
         return source
     with mlir.make_ir_context(), ir.Location.unknown():
         module = ir.Module.parse(source)
@@ -253,18 +286,23 @@ def recognize_solve(source):
             op
             for op in _walk(module.operation)
             if op.name == "func.call"
-            and ir.FlatSymbolRefAttr(op.attributes["callee"]).value.startswith(_PREFIX)
+            and ir.FlatSymbolRefAttr(op.attributes["callee"]).value.startswith(
+                (_PREFIX, _LOGABSDET_PREFIX)
+            )
         ]
         for call in calls:
             name = ir.FlatSymbolRefAttr(call.attributes["callee"]).value
-            _check_solve(call, name, functions)
+            logarithm = name.startswith(_LOGABSDET_PREFIX)
+            (_check_logabsdet if logarithm else _check_solve)(call, name, functions)
             with ir.InsertionPoint(call):
                 composite = ir.Operation.create(
                     "stablehlo.composite",
                     operands=list(call.operands),
                     results=[v.type for v in call.results],
                     attributes={
-                        "name": ir.StringAttr.get(_NAME),
+                        "name": ir.StringAttr.get(
+                            "enzyme.linalg.logabsdet" if logarithm else _NAME
+                        ),
                         "decomposition": ir.FlatSymbolRefAttr.get(name),
                         "composite_attributes": ir.DictAttr.get({}),
                         "version": ir.IntegerAttr.get(
