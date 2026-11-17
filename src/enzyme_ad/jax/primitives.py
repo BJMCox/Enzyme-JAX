@@ -819,6 +819,7 @@ def _enzyme_primal_lowering(
             nmod = ir.Module.parse(nmod)
             if pass_pipeline:
                 _lower_native_linalg(ctx, nmod)
+                _lower_small_cpu_products(ctx, nmod)
             fn = None
             pushtop = []
             for f in nmod.body:
@@ -1233,6 +1234,61 @@ def to_jax_type(mlir_type):
         if mtype == et:
             return jax.core.ShapedArray(mlir_type.shape, jtype)
     assert False
+
+
+def _lower_small_cpu_products(ctx, module):
+    """Avoid native dot setup for tiny, static f32 CPU matrix products."""
+    if tuple(ctx.module_context.platforms) != ("cpu",):
+        return
+    products = [
+        op for op in _walk(module.operation) if op.name == "stablehlo.dot_general"
+    ]
+    for op in products:
+        types = [ir.RankedTensorType(v.type) for v in (*op.operands, *op.results)]
+        # Bound code growth and register pressure; larger products favor native kernels.
+        if (
+            "algorithm" in op.attributes
+            or any(not t.has_static_shape or len(t.shape) != 2 for t in types)
+            or str(types[0].element_type) != "f32"
+            or any(t.element_type != types[0].element_type for t in types)
+            or any(d < 1 or d > 16 for t in types for d in t.shape)
+        ):
+            continue
+        dims = stablehlo.DotDimensionNumbers(op.attributes["dot_dimension_numbers"])
+        left, right = (
+            list(dims.lhs_contracting_dimensions),
+            list(dims.rhs_contracting_dimensions),
+        )
+        if (
+            dims.lhs_batching_dimensions
+            or dims.rhs_batching_dimensions
+            or len(left) != 1
+            or len(right) != 1
+        ):
+            continue
+        count = types[0].shape[left[0]]
+        if count < 2:
+            continue
+
+        def multiply(a, b, left=left[0], right=right[0], count=count):
+            a = a.T if left == 0 else a
+            b = b.T if right == 1 else b
+            result = a[:, :1] * b[:1, :]
+            for i in range(1, count):
+                result = result + a[:, i : i + 1] * b[i : i + 1, :]
+            return result
+
+        operation_ctx = ctx.replace(
+            avals_in=[to_jax_type(t) for t in types[:2]],
+            avals_out=[to_jax_type(types[2])],
+            primitive=None,
+        )
+        with ir.InsertionPoint(op), op.location:
+            value = jax_mlir.lower_fun(multiply, multiple_results=False)(
+                operation_ctx, *op.operands
+            )[0]
+        op.results[0].replace_all_uses_with(value)
+        op.erase()
 
 
 def _lower_native_linalg(ctx, module):
