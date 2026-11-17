@@ -44,11 +44,23 @@ def _batchable(op, functions):
     if op.name == "func.return" or name == "return":
         return True
     if op.name == "stablehlo.composite":
-        if ir.StringAttr(op.attributes["name"]).value != "enzyme.linalg.solve":
+        if ir.StringAttr(op.attributes["name"]).value not in (
+            "enzyme.linalg.solve",
+            "enzyme.linalg.logabsdet",
+        ):
             return False
         symbol = ir.FlatSymbolRefAttr(op.attributes["decomposition"]).value
         function = functions.get(symbol)
-        return function is not None and pure_function(function, functions)
+        if function is None or not pure_function(function, functions):
+            return False
+        # A portable logdet decomposition may contain a target-specific case.
+        # Keep unsupported control flow pointwise instead of batching its index.
+        return ir.StringAttr(
+            op.attributes["name"]
+        ).value != "enzyme.linalg.logabsdet" or all(
+            _batchable(child.operation, functions)
+            for child in function.entry_block.operations
+        )
     if not _pure(op):
         return False
     if not all(_tensor(v.type) for v in (*op.operands, *op.results)):

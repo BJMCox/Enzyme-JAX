@@ -552,7 +552,8 @@ public:
           resultPositionsToShadow);
     }
 
-    // Product reductions are a ReduceOp rule; reduce_window keeps the generic path.
+    // Product reductions are a ReduceOp rule; reduce_window keeps the generic
+    // path.
     if constexpr (std::is_same_v<OpTy, ReduceOp>) {
       if (isa<MulOp>(innerOp) &&
           ((red.getDimensions().empty() &&
@@ -2505,7 +2506,8 @@ public:
       if (hasStaticIdentityProduct(op) && gutils->isConstantValue(init)) {
         if (!gutils->isConstantValue(value)) {
           ProductReductionTree tree(op, cachedValue, builder);
-          gutils->addToDiffe(value, tree.reverse(inDiffe, gutils->width), builder);
+          gutils->addToDiffe(value, tree.reverse(inDiffe, gutils->width),
+                             builder);
         }
         return success();
       }
@@ -3138,11 +3140,130 @@ public:
   }
 };
 
+// Both floating results depend on A. Keeping the inverse as a differentiable
+// result preserves higher derivatives without differentiating LU pivots.
+class CompositeLogabsdetDerivative {
+  CompositeOp op;
+  OpBuilder &builder;
+  Location loc;
+
+public:
+  CompositeLogabsdetDerivative(CompositeOp op, OpBuilder &builder)
+      : op(op), builder(builder), loc(op.getLoc()) {}
+
+  static LogicalResult check(CompositeOp op, int64_t width) {
+    if (op.getName() != "enzyme.linalg.logabsdet" || op.getVersion() != 1 ||
+        !op.getCompositeAttributes().empty() || !op->getRegions().empty() ||
+        op->getNumOperands() != 1 || op->getNumResults() != 3 || width != 1)
+      return op.emitOpError("unsupported logabsdet composite contract");
+    auto a = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    auto value = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+    auto valid = dyn_cast<RankedTensorType>(op->getResult(2).getType());
+    if (!a || !value || !valid || !a.hasStaticShape() || a.getRank() < 2 ||
+        a.getDimSize(a.getRank() - 1) == 0 ||
+        a.getDimSize(a.getRank() - 1) != a.getDimSize(a.getRank() - 2) ||
+        !(a.getElementType().isF32() || a.getElementType().isF64()) ||
+        op->getResult(1).getType() != a ||
+        value.getShape() != a.getShape().drop_back(2) ||
+        valid.getShape() != value.getShape() ||
+        value.getElementType() != a.getElementType() ||
+        !valid.getElementType().isInteger(1))
+      return op.emitOpError("expected logabsdet, inverse and batch validity");
+    return success();
+  }
+
+  Value expand(Value scalar) {
+    auto type = cast<RankedTensorType>(op->getResult(1).getType());
+    SmallVector<int64_t> axes;
+    for (int64_t i = 0; i < type.getRank() - 2; ++i)
+      axes.push_back(i);
+    return BroadcastInDimOp::create(builder, loc, type, scalar,
+                                    builder.getDenseI64ArrayAttr(axes));
+  }
+
+  Value sum(Value matrix) {
+    auto type = cast<RankedTensorType>(matrix.getType());
+    auto scalar = RankedTensorType::get({}, type.getElementType());
+    Value zero = makeZero(builder, loc, scalar);
+    SmallVector<int64_t> axes{type.getRank() - 2, type.getRank() - 1};
+    auto reduce =
+        ReduceOp::create(builder, loc, TypeRange{op->getResult(0).getType()},
+                         ValueRange{matrix}, ValueRange{zero}, axes);
+    Block *body = new Block();
+    reduce.getBody().push_back(body);
+    body->addArguments({scalar, scalar}, {loc, loc});
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToEnd(body);
+    Value value =
+        AddOp::create(builder, loc, body->getArgument(0), body->getArgument(1));
+    ReturnOp::create(builder, loc, value);
+    return reduce->getResult(0);
+  }
+
+  LogicalResult forward(MGradientUtils *gutils) {
+    if (failed(check(op, gutils->width)))
+      return failure();
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfter(gutils->getNewFromOriginal(op));
+    if (!gutils->isConstantValue(op->getResult(2)))
+      gutils->setDiffe(op->getResult(2),
+                       makeZero(builder, loc, op->getResult(2).getType()),
+                       builder);
+    if (gutils->isConstantValue(op->getOperand(0)))
+      return success();
+    CompositeSolveDerivative algebra(op, builder);
+    Value inverse = gutils->getNewFromOriginal(op->getResult(1));
+    Value da = gutils->invertPointerM(op->getOperand(0), builder);
+    if (!gutils->isConstantValue(op->getResult(0))) {
+      Value product =
+          MulOp::create(builder, loc, algebra.transpose(inverse), da);
+      gutils->setDiffe(op->getResult(0), sum(product), builder);
+    }
+    if (!gutils->isConstantValue(op->getResult(1))) {
+      Value tangent = algebra.multiply(inverse, da, inverse.getType());
+      tangent = algebra.multiply(tangent, inverse, inverse.getType());
+      tangent = NegOp::create(builder, loc, tangent);
+      gutils->setDiffe(op->getResult(1), tangent, builder);
+    }
+    return success();
+  }
+
+  LogicalResult reverse(MGradientUtilsReverse *gutils,
+                        SmallVector<Value> caches) {
+    if (failed(check(op, gutils->width)))
+      return failure();
+    if (gutils->isConstantValue(op->getOperand(0)))
+      return success();
+    CompositeSolveDerivative algebra(op, builder);
+    Value inverse = algebra.transpose(gutils->popCache(caches[0], builder));
+    Value gradient = makeZero(builder, loc, inverse.getType());
+    if (!gutils->isConstantValue(op->getResult(0))) {
+      Value seed = gutils->diffe(op->getResult(0), builder);
+      gutils->zeroDiffe(op->getResult(0), builder);
+      gradient = MulOp::create(builder, loc, expand(seed), inverse);
+    }
+    if (!gutils->isConstantValue(op->getResult(1))) {
+      Value seed = gutils->diffe(op->getResult(1), builder);
+      gutils->zeroDiffe(op->getResult(1), builder);
+      Value product = algebra.multiply(inverse, seed, inverse.getType());
+      product = algebra.multiply(product, inverse, inverse.getType());
+      gradient = SubtractOp::create(builder, loc, gradient, product);
+    }
+    gutils->addToDiffe(op->getOperand(0), gradient, builder);
+    return success();
+  }
+};
+
 struct SolveDataFlow
     : ADDataFlowOpInterface::ExternalModel<SolveDataFlow, CompositeOp> {
   SmallVector<Value> getPotentialIncomingValuesRes(Operation *orig,
                                                    OpResult result) const {
     auto op = cast<CompositeOp>(orig);
+    if (op.getName() == "enzyme.linalg.logabsdet" && op->getNumResults() == 3 &&
+        op->getNumOperands() == 1)
+      return result.getResultNumber() == 2
+                 ? SmallVector<Value>{}
+                 : SmallVector<Value>{op->getOperand(0)};
     if (op.getName() == "enzyme.linalg.solve" &&
         (op.getVersion() == 1 || op.getVersion() == 2) &&
         op.getCompositeAttributes().empty() && op->getNumResults() == 2 &&
@@ -3170,6 +3291,8 @@ struct AutoDiffCompositeSolveFwd
   LogicalResult createForwardModeTangent(Operation *orig, OpBuilder &builder,
                                          MGradientUtils *gutils) const {
     auto op = cast<CompositeOp>(orig);
+    if (op.getName() == "enzyme.linalg.logabsdet")
+      return CompositeLogabsdetDerivative(op, builder).forward(gutils);
     if (failed(CompositeSolveDerivative::check(op, gutils->width)))
       return failure();
     OpBuilder::InsertionGuard guard(builder);
@@ -3211,6 +3334,8 @@ struct AutoDiffCompositeSolveRev
                                          MGradientUtilsReverse *gutils,
                                          SmallVector<Value> caches) const {
     auto op = cast<CompositeOp>(orig);
+    if (op.getName() == "enzyme.linalg.logabsdet")
+      return CompositeLogabsdetDerivative(op, builder).reverse(gutils, caches);
     if (failed(CompositeSolveDerivative::check(op, gutils->width)))
       return failure();
     if (gutils->isConstantValue(op->getResult(0)))
@@ -3243,6 +3368,15 @@ struct AutoDiffCompositeSolveRev
   SmallVector<Value> cacheValues(Operation *orig,
                                  MGradientUtilsReverse *gutils) const {
     auto op = cast<CompositeOp>(orig);
+    if (op.getName() == "enzyme.linalg.logabsdet") {
+      if (gutils->isConstantValue(op->getOperand(0)))
+        return {};
+      Operation *newOp = gutils->getNewFromOriginal(orig);
+      OpBuilder builder(newOp);
+      builder.setInsertionPointAfter(newOp);
+      return {gutils->initAndPushCache(
+          gutils->getNewFromOriginal(op->getResult(1)), builder)};
+    }
     if (gutils->isConstantValue(op->getResult(0)))
       return {};
     Operation *newOp = gutils->getNewFromOriginal(orig);
@@ -3274,9 +3408,12 @@ struct SHLOCompositeSolveBatch
                             IRMapping &mapper,
                             ArrayRef<int64_t> batchSizes) const {
     auto op = cast<CompositeOp>(src);
-    if (op.getName() != "enzyme.linalg.solve")
+    if (op.getName() != "enzyme.linalg.solve" &&
+        op.getName() != "enzyme.linalg.logabsdet")
       return failure();
-    if (failed(CompositeSolveDerivative::check(op, 1)))
+    if (failed(op.getName() == "enzyme.linalg.solve"
+                   ? CompositeSolveDerivative::check(op, 1)
+                   : CompositeLogabsdetDerivative::check(op, 1)))
       return failure();
     auto function = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
         op, op.getDecompositionAttr());

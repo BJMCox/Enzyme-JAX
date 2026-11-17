@@ -28,7 +28,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from . import enzyme_call
 from ._hlo_linearize import _walk, linearize_hlo
 from ._hlo_batch import batch_hlo
-from ._hlo_solve import recognize_solve
+from ._hlo_solve import recognize_linalg
 
 from .utils import default_nowheel_resource, default_linux_cflags
 
@@ -234,7 +234,7 @@ def optimization_passes(
 
     func_passes = ",".join(
         [
-            "func.func(stablehlo-legalize-composite-to-call{except=enzyme.linalg.solve})",
+            "func.func(stablehlo-legalize-composite-to-call{except=enzyme.linalg.solve,enzyme.linalg.logabsdet})",
             "canonicalize",
             "cse",
             "canonicalize",
@@ -1237,7 +1237,7 @@ def to_jax_type(mlir_type):
 
 def _lower_native_linalg(ctx, module):
     """Use JAX's target lowering after differentiating portable matrix ops."""
-    from ._hlo_solve import _CACHED_PREFIX, _FACTOR
+    from ._hlo_solve import _CACHED_PREFIX, _FACTOR, _LOGABSDET_PREFIX, _check_logabsdet
 
     operations = []
     solve_prefix = "__enzyme_linalg_solve_v1_"
@@ -1258,7 +1258,7 @@ def _lower_native_linalg(ctx, module):
                 op.name == "func.call"
                 and "callee" in op.attributes
                 and ir.FlatSymbolRefAttr(op.attributes["callee"]).value.startswith(
-                    (solve_prefix, _CACHED_PREFIX)
+                    (solve_prefix, _CACHED_PREFIX, _LOGABSDET_PREFIX)
                 )
             )
             or (
@@ -1414,6 +1414,27 @@ def _lower_native_linalg(ctx, module):
                 return jnp.where(valid[..., None, None], x, 0), valid
 
             multiple_results = True
+        elif op.name == "func.call" and ir.FlatSymbolRefAttr(
+            op.attributes["callee"]
+        ).value.startswith(_LOGABSDET_PREFIX):
+            name = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
+            _check_logabsdet(op, name, functions)
+
+            def function(a):
+                factors, _, permutation = lax.linalg.lu(a)
+                diagonal = jnp.diagonal(factors, axis1=-2, axis2=-1)
+                singular = jnp.any(diagonal == 0, axis=-1)
+                valid = jnp.all(jnp.isfinite(diagonal) & (diagonal != 0), axis=-1)
+                value = jnp.where(
+                    singular, -jnp.inf, jnp.sum(jnp.log(jnp.abs(diagonal)), axis=-1)
+                )
+                identity = jnp.broadcast_to(
+                    jnp.eye(a.shape[-1], dtype=a.dtype), a.shape
+                )
+                inverse = _lu_solve(factors, permutation, identity, trans=0)
+                return value, inverse, valid
+
+            multiple_results = True
         elif op.name == "func.call":
             name = ir.FlatSymbolRefAttr(op.attributes["callee"]).value
             if (
@@ -1526,7 +1547,7 @@ def hlo_call(
 ):
     from ._hlo_solve import _CACHED_PREFIX, _FACTOR
 
-    source = recognize_solve(source)
+    source = recognize_linalg(source)
     fn = "main"
     with jax_mlir.make_ir_context():
         nmod = ir.Module.parse(source)
