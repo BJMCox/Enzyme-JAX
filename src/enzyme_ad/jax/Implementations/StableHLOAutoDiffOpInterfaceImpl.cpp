@@ -3142,19 +3142,21 @@ public:
 
 // Both floating results depend on A. Keeping the inverse as a differentiable
 // result preserves higher derivatives without differentiating LU pivots.
-class CompositeLogabsdetDerivative {
+class CompositeDeterminantDerivative {
   CompositeOp op;
   OpBuilder &builder;
   Location loc;
 
 public:
-  CompositeLogabsdetDerivative(CompositeOp op, OpBuilder &builder)
+  CompositeDeterminantDerivative(CompositeOp op, OpBuilder &builder)
       : op(op), builder(builder), loc(op.getLoc()) {}
 
   static LogicalResult check(CompositeOp op, int64_t width) {
-    if (op.getName() != "enzyme.linalg.logabsdet" || op.getVersion() != 1 ||
-        !op.getCompositeAttributes().empty() || !op->getRegions().empty() ||
-        op->getNumOperands() != 1 || op->getNumResults() != 3 || width != 1)
+    if ((op.getName() != "enzyme.linalg.logabsdet" &&
+         op.getName() != "enzyme.linalg.det") ||
+        op.getVersion() != 1 || !op.getCompositeAttributes().empty() ||
+        !op->getRegions().empty() || op->getNumOperands() != 1 ||
+        op->getNumResults() != 3 || width != 1)
       return op.emitOpError("unsupported logabsdet composite contract");
     auto a = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
     auto value = dyn_cast<RankedTensorType>(op->getResult(0).getType());
@@ -3214,10 +3216,22 @@ public:
     CompositeSolveDerivative algebra(op, builder);
     Value inverse = gutils->getNewFromOriginal(op->getResult(1));
     Value da = gutils->invertPointerM(op->getOperand(0), builder);
+    Value valid;
+    if (op.getName() == "enzyme.linalg.det") {
+      valid = gutils->getNewFromOriginal(op->getResult(2));
+      da = algebra.mask(da, valid);
+    }
     if (!gutils->isConstantValue(op->getResult(0))) {
       Value product =
           MulOp::create(builder, loc, algebra.transpose(inverse), da);
-      gutils->setDiffe(op->getResult(0), sum(product), builder);
+      Value tangent = sum(product);
+      if (valid) {
+        Value value = gutils->getNewFromOriginal(op->getResult(0));
+        value = SelectOp::create(builder, loc, valid, value,
+                                 makeZero(builder, loc, value.getType()));
+        tangent = MulOp::create(builder, loc, tangent, value);
+      }
+      gutils->setDiffe(op->getResult(0), tangent, builder);
     }
     if (!gutils->isConstantValue(op->getResult(1))) {
       Value tangent = algebra.multiply(inverse, da, inverse.getType());
@@ -3236,15 +3250,29 @@ public:
       return success();
     CompositeSolveDerivative algebra(op, builder);
     Value inverse = algebra.transpose(gutils->popCache(caches[0], builder));
+    Value valid, value;
+    if (op.getName() == "enzyme.linalg.det") {
+      value = gutils->popCache(caches[1], builder);
+      valid = gutils->popCache(caches[2], builder);
+      value = SelectOp::create(builder, loc, valid, value,
+                               makeZero(builder, loc, value.getType()));
+    }
     Value gradient = makeZero(builder, loc, inverse.getType());
     if (!gutils->isConstantValue(op->getResult(0))) {
       Value seed = gutils->diffe(op->getResult(0), builder);
       gutils->zeroDiffe(op->getResult(0), builder);
+      if (valid) {
+        seed = SelectOp::create(builder, loc, valid, seed,
+                                makeZero(builder, loc, seed.getType()));
+        seed = MulOp::create(builder, loc, seed, value);
+      }
       gradient = MulOp::create(builder, loc, expand(seed), inverse);
     }
     if (!gutils->isConstantValue(op->getResult(1))) {
       Value seed = gutils->diffe(op->getResult(1), builder);
       gutils->zeroDiffe(op->getResult(1), builder);
+      if (valid)
+        seed = algebra.mask(seed, valid);
       Value product = algebra.multiply(inverse, seed, inverse.getType());
       product = algebra.multiply(product, inverse, inverse.getType());
       gradient = SubtractOp::create(builder, loc, gradient, product);
@@ -3259,8 +3287,9 @@ struct SolveDataFlow
   SmallVector<Value> getPotentialIncomingValuesRes(Operation *orig,
                                                    OpResult result) const {
     auto op = cast<CompositeOp>(orig);
-    if (op.getName() == "enzyme.linalg.logabsdet" && op->getNumResults() == 3 &&
-        op->getNumOperands() == 1)
+    if ((op.getName() == "enzyme.linalg.logabsdet" ||
+         op.getName() == "enzyme.linalg.det") &&
+        op->getNumResults() == 3 && op->getNumOperands() == 1)
       return result.getResultNumber() == 2
                  ? SmallVector<Value>{}
                  : SmallVector<Value>{op->getOperand(0)};
@@ -3291,8 +3320,9 @@ struct AutoDiffCompositeSolveFwd
   LogicalResult createForwardModeTangent(Operation *orig, OpBuilder &builder,
                                          MGradientUtils *gutils) const {
     auto op = cast<CompositeOp>(orig);
-    if (op.getName() == "enzyme.linalg.logabsdet")
-      return CompositeLogabsdetDerivative(op, builder).forward(gutils);
+    if (op.getName() == "enzyme.linalg.logabsdet" ||
+        op.getName() == "enzyme.linalg.det")
+      return CompositeDeterminantDerivative(op, builder).forward(gutils);
     if (failed(CompositeSolveDerivative::check(op, gutils->width)))
       return failure();
     OpBuilder::InsertionGuard guard(builder);
@@ -3334,8 +3364,10 @@ struct AutoDiffCompositeSolveRev
                                          MGradientUtilsReverse *gutils,
                                          SmallVector<Value> caches) const {
     auto op = cast<CompositeOp>(orig);
-    if (op.getName() == "enzyme.linalg.logabsdet")
-      return CompositeLogabsdetDerivative(op, builder).reverse(gutils, caches);
+    if (op.getName() == "enzyme.linalg.logabsdet" ||
+        op.getName() == "enzyme.linalg.det")
+      return CompositeDeterminantDerivative(op, builder)
+          .reverse(gutils, caches);
     if (failed(CompositeSolveDerivative::check(op, gutils->width)))
       return failure();
     if (gutils->isConstantValue(op->getResult(0)))
@@ -3368,14 +3400,20 @@ struct AutoDiffCompositeSolveRev
   SmallVector<Value> cacheValues(Operation *orig,
                                  MGradientUtilsReverse *gutils) const {
     auto op = cast<CompositeOp>(orig);
-    if (op.getName() == "enzyme.linalg.logabsdet") {
+    if (op.getName() == "enzyme.linalg.logabsdet" ||
+        op.getName() == "enzyme.linalg.det") {
       if (gutils->isConstantValue(op->getOperand(0)))
         return {};
       Operation *newOp = gutils->getNewFromOriginal(orig);
       OpBuilder builder(newOp);
       builder.setInsertionPointAfter(newOp);
-      return {gutils->initAndPushCache(
+      SmallVector<Value> caches{gutils->initAndPushCache(
           gutils->getNewFromOriginal(op->getResult(1)), builder)};
+      if (op.getName() == "enzyme.linalg.det")
+        for (unsigned i : {0u, 2u})
+          caches.push_back(gutils->initAndPushCache(
+              gutils->getNewFromOriginal(op->getResult(i)), builder));
+      return caches;
     }
     if (gutils->isConstantValue(op->getResult(0)))
       return {};
@@ -3409,11 +3447,12 @@ struct SHLOCompositeSolveBatch
                             ArrayRef<int64_t> batchSizes) const {
     auto op = cast<CompositeOp>(src);
     if (op.getName() != "enzyme.linalg.solve" &&
-        op.getName() != "enzyme.linalg.logabsdet")
+        op.getName() != "enzyme.linalg.logabsdet" &&
+        op.getName() != "enzyme.linalg.det")
       return failure();
     if (failed(op.getName() == "enzyme.linalg.solve"
                    ? CompositeSolveDerivative::check(op, 1)
-                   : CompositeLogabsdetDerivative::check(op, 1)))
+                   : CompositeDeterminantDerivative::check(op, 1)))
       return failure();
     auto function = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
         op, op.getDecompositionAttr());

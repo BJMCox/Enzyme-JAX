@@ -64,6 +64,7 @@ def _batchable(op, functions):
         if ir.StringAttr(op.attributes["name"]).value not in (
             "enzyme.linalg.solve",
             "enzyme.linalg.logabsdet",
+            "enzyme.linalg.det",
         ):
             return False
         symbol = ir.FlatSymbolRefAttr(op.attributes["decomposition"]).value

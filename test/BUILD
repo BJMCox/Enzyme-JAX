@@ -74,6 +74,13 @@ py_test(
 )
 
 py_test(
+    name = "test_det_composite",
+    srcs = ["test_det_composite.py"],
+    data = ["logabsdet_composite.mlir"],
+    deps = TEST_DEPS,
+)
+
+py_test(
     name = "test_hlo_barrier",
     srcs = ["test_hlo_barrier.py"],
     deps = TEST_DEPS,
