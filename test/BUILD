@@ -69,6 +69,7 @@ py_test(
 py_test(
     name = "test_hlo_batching",
     srcs = ["test_hlo_batching.py"],
+    data = ["logabsdet_composite.mlir"],
     deps = TEST_DEPS,
 )
 

@@ -10,12 +10,29 @@ from . import enzyme_call
 from ._hlo_linearize import (
     _external_values,
     _extract,
-    _pure,
     _referenced_functions,
     _tensor,
     _walk,
 )
-from ._hlo_solve import pure_function
+from ._hlo_solve import pure_function, pure_operation
+
+
+@lru_cache(maxsize=128)
+def has_conditionals(source):
+    """Inspect the batched entry, excluding opaque composite decompositions."""
+    with mlir.make_ir_context() as context:
+        context.allow_unregistered_dialects = True
+        module = ir.Module.parse(source)
+        entry = next(
+            f
+            for f in module.body.operations
+            if ir.StringAttr(f.attributes["sym_name"]).value == "main"
+        )
+        return any(
+            op.name in ("stablehlo.case", "stablehlo.if")
+            for op in _walk(entry.operation)
+        )
+
 
 # Unknown operations retain pointwise execution. In particular, batching an RNG
 # state is not equivalent to asking one RNG state for a larger output tensor.
@@ -53,15 +70,14 @@ def _batchable(op, functions):
         function = functions.get(symbol)
         if function is None or not pure_function(function, functions):
             return False
-        # A portable logdet decomposition may contain a target-specific case.
-        # Keep unsupported control flow pointwise instead of batching its index.
+        # Check control flow inside the portable decomposition as well.
         return ir.StringAttr(
             op.attributes["name"]
         ).value != "enzyme.linalg.logabsdet" or all(
             _batchable(child.operation, functions)
             for child in function.entry_block.operations
         )
-    if not _pure(op):
+    if not pure_operation(op, functions):
         return False
     if not all(_tensor(v.type) for v in (*op.operands, *op.results)):
         return False
@@ -90,7 +106,7 @@ def _batchable(op, functions):
                     if not _external_values(child.operation) <= local:
                         return False
                     local.update(child.results)
-    elif name != "while":
+    elif name not in ("while", "case", "if"):
         return False
     return all(
         _batchable(child.operation, functions)

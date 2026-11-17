@@ -242,6 +242,29 @@ class SolveCompositeTest(parameterized.TestCase):
         grad = jax.jit(jax.grad(lambda aa: mapped(aa, b).sum()))(a)
         np.testing.assert_allclose(grad, -np.sum(np.asarray(b)) / 4, rtol=2e-12)
 
+    def test_shared_batch_ignores_conditionals_in_opaque_solve_decomposition(self):
+        source = SOURCE.replace(
+            "%v = stablehlo.divide %safeb, %safea : tensor<f64>",
+            """%positive = stablehlo.compare GT, %safea, %zero, FLOAT
+                : (tensor<f64>, tensor<f64>) -> tensor<i1>
+            %v = "stablehlo.if"(%positive) ({
+              %value = stablehlo.divide %safeb, %safea : tensor<f64>
+              stablehlo.return %value : tensor<f64>
+            }, {
+              %reciprocal = stablehlo.divide %one, %safea : tensor<f64>
+              %value = stablehlo.multiply %safeb, %reciprocal : tensor<f64>
+              stablehlo.return %value : tensor<f64>
+            }) : (tensor<i1>) -> tensor<f64>""",
+        )
+
+        def solve(a, b):
+            return hlo_call(a.reshape(1, 1), b.reshape(1, 1), source=source)[0]
+
+        a, b = jnp.float64(2), jnp.array([1.0, 3.0, 5.0])
+        compiled = jax.jit(jax.vmap(solve, in_axes=(None, 0))).lower(a, b).compile()
+        np.testing.assert_allclose(compiled(a, b).reshape(-1), b / a, rtol=2e-12)
+        self.assertNotRegex(compiled.as_text().split("ENTRY", 1)[1], r"\bwhile\(")
+
     def test_nonsymmetric_matrix_rhs_derivatives_and_mixed_invalid(self):
         a = np.array([[0.0, 2.0], [1.0, 3.0]])
         b = np.array([[1.0, 2.0], [-2.0, 3.0]])
