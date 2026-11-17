@@ -199,15 +199,19 @@ def pure_function(function, functions, active=None):
         return False
     active = active | {name}
 
-    def check(op):
-        if op.name in ("func.call", "stablehlo.composite"):
-            key = "callee" if op.name == "func.call" else "decomposition"
-            callee = ir.FlatSymbolRefAttr(op.attributes[key]).value
-            target = functions.get(callee)
-            return target is not None and pure_function(target, functions, active)
-        return _pure(op, check)
+    return all(
+        pure_operation(view.operation, functions, active)
+        for view in function.entry_block.operations
+    )
 
-    return all(check(view.operation) for view in function.entry_block.operations)
+
+def pure_operation(op, functions, active=None):
+    if op.name in ("func.call", "stablehlo.composite"):
+        key = "callee" if op.name == "func.call" else "decomposition"
+        callee = ir.FlatSymbolRefAttr(op.attributes[key]).value
+        target = functions.get(callee)
+        return target is not None and pure_function(target, functions, active)
+    return _pure(op, lambda child: pure_operation(child, functions, active))
 
 
 def _check_solve(call, name, functions):

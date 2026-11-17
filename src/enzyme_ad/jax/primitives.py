@@ -27,7 +27,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 from . import enzyme_call
 from ._hlo_linearize import _walk, linearize_hlo
-from ._hlo_batch import batch_hlo
+from ._hlo_batch import batch_hlo, has_conditionals
 from ._hlo_solve import recognize_linalg
 
 from .utils import default_nowheel_resource, default_linux_cflags
@@ -1676,6 +1676,17 @@ def _enzyme_batch(primitive, args, axes, **params):
     values = tuple(jnp.moveaxis(args[i], axes[i], 0) for i in mapped)
     size = values[0].shape[0]
 
+    def pointwise(*arguments):
+        items = tuple(jnp.moveaxis(arguments[i], axes[i], 0) for i in mapped)
+
+        def call(lane):
+            operands = list(arguments)
+            for i, item in zip(mapped, lane):
+                operands[i] = item
+            return primitive.bind(*operands, **params)
+
+        return lax.map(call, items)
+
     def result(outputs):
         if not _jvp_primals_unmapped(primitive, axes, params):
             return outputs, (0,) * len(outputs)
@@ -1724,42 +1735,46 @@ def _enzyme_batch(primitive, args, axes, **params):
             mapped=None if pending_ad else tuple(axis is not None for axis in axes),
         )
         if source is not None:
-            operands = tuple(
-                (
-                    jnp.moveaxis(value, axis, 0)
-                    if axis is not None
-                    else (
-                        jnp.broadcast_to(value, (size, *value.shape))
-                        if pending_ad
-                        else value
-                    )
-                )
-                for value, axis in zip(args, axes)
-            )
-            if pending_ad:
-                in_tree, in_map, out_map, _, options = params["source"]
-                batched_params = dict(
-                    params,
-                    source=(in_tree, in_map, out_map, source, options),
-                    out_shapes=tuple(
-                        aval.update(shape=(size, *aval.shape))
-                        for aval in params["out_shapes"]
-                    ),
-                )
-                outputs = primitive.bind(*operands, **batched_params)
-            else:
-                outputs = hlo_call(*operands, source=source)
-            return result(outputs)
 
-    def call(items):
-        operands = list(args)
-        for i, item in zip(mapped, items):
-            operands[i] = item
-        return primitive.bind(*operands, **params)
+            def tensorized(*arguments):
+                operands = tuple(
+                    (
+                        jnp.moveaxis(value, axis, 0)
+                        if axis is not None
+                        else (
+                            jnp.broadcast_to(value, (size, *value.shape))
+                            if pending_ad
+                            else value
+                        )
+                    )
+                    for value, axis in zip(arguments, axes)
+                )
+                if pending_ad:
+                    in_tree, in_map, out_map, _, options = params["source"]
+                    batched_params = dict(
+                        params,
+                        source=(in_tree, in_map, out_map, source, options),
+                        out_shapes=tuple(
+                            aval.update(shape=(size, *aval.shape))
+                            for aval in params["out_shapes"]
+                        ),
+                    )
+                    return primitive.bind(*operands, **batched_params)
+                return hlo_call(*operands, source=source)
+
+            if has_conditionals(source):
+                # CPU branch overhead exceeds its batching gains. Resolve the
+                # strategy at lowering, including explicitly selected devices.
+                outputs = lax.platform_dependent(
+                    *args, cpu=pointwise, default=tensorized
+                )
+            else:
+                outputs = tensorized(*args)
+            return result(outputs)
 
     # Keep arbitrary imported HLO and custom calls pointwise, including RNG
     # state and lane-dependent loops. lax.map stays on the selected device.
-    outputs = lax.map(call, values)
+    outputs = pointwise(*args)
     return result(outputs)
 
 

@@ -6967,6 +6967,8 @@ void mlir::enzyme::registerStableHLODialectAutoDiffInterface(
         *context);
     stablehlo::IfOp::attachInterface<
         SHLOGenericBatchOpInterface<stablehlo::IfOp>>(*context);
+    stablehlo::CaseOp::attachInterface<
+        SHLOGenericBatchOpInterface<stablehlo::CaseOp>>(*context);
     WhileOp::attachInterface<SHLOGenericBatchOpInterface<WhileOp>>(*context);
     ReduceOp::attachInterface<SHLOReduceOpBatchInterface>(*context);
     ReduceWindowOp::attachInterface<SHLOReduceWindowOpBatchInterface>(*context);

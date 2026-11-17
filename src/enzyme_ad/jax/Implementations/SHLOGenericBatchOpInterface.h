@@ -10,13 +10,13 @@
 #include "src/enzyme_ad/jax/Implementations/WhileLoopInfo.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
-#include "llvm/ADT/DenseMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/DenseMap.h"
 
 using namespace mlir;
 using namespace mlir::enzyme;
@@ -134,9 +134,104 @@ inline void batchCloneBlock(Block *srcBlock, Block *destBlock,
                                       batchedFunctionCache, false);
 }
 
+inline LogicalResult pointwiseCreateBatch(Operation *src, OpBuilder &builder,
+                                          IRMapping &mapper,
+                                          ArrayRef<int64_t> batchSizes);
+
 inline LogicalResult tryToBatchInner(Operation *src, OpBuilder &builder,
                                      IRMapping &mapper,
                                      ArrayRef<int64_t> batchSizes) {
+  auto ifOp = dyn_cast<stablehlo::IfOp>(src);
+  bool constantIf = ifOp && (matchPattern(ifOp.getPred(), m_Zero()) ||
+                             matchPattern(ifOp.getPred(), m_One()));
+  if (isa<stablehlo::CaseOp>(src) || (ifOp && !constantIf)) {
+    if (llvm::is_contained(batchSizes, 0))
+      return failure();
+    auto loc = src->getLoc();
+    auto indexType = cast<RankedTensorType>(src->getOperand(0).getType());
+    Value indices = mapper.lookup(src->getOperand(0));
+    Value index =
+        getFirstBatchElement(builder, loc, indices, indexType, batchSizes);
+    SmallVector<Type> results;
+    for (Type type : src->getResultTypes())
+      results.push_back(applyBatchSizes(type, batchSizes));
+
+    auto cloneConditional = [&](OpBuilder &b) {
+      OperationState state(loc, src->getName());
+      state.addOperands(ValueRange{index});
+      state.addTypes(results);
+      state.addAttributes(src->getAttrs());
+      for (unsigned i = 0; i < src->getNumRegions(); ++i)
+        state.addRegion();
+      Operation *result = b.create(state);
+      for (auto [oldRegion, newRegion] :
+           llvm::zip(src->getRegions(), result->getRegions())) {
+        newRegion.push_back(new Block());
+        IRMapping branchMapper = mapper;
+        batchCloneBlock(&oldRegion.front(), &newRegion.front(), branchMapper,
+                        batchSizes);
+      }
+      return result;
+    };
+
+    if (isBatchInvariant(indices, batchSizes)) {
+      auto result = cloneConditional(builder);
+      for (auto [oldValue, newValue] :
+           llvm::zip(src->getResults(), result->getResults()))
+        mapper.map(oldValue, newValue);
+      return success();
+    }
+
+    Value broadcast =
+        BroadcastInDimOp::create(builder, loc, indices.getType(), index,
+                                 builder.getDenseI64ArrayAttr({}));
+    Value equal = CompareOp::create(builder, loc, indices, broadcast,
+                                    ComparisonDirection::EQ);
+    Value one =
+        details::makeIntegerConstant(loc, builder, builder.getI1Type(), 1);
+    SmallVector<int64_t> axes(batchSizes.size());
+    std::iota(axes.begin(), axes.end(), 0);
+    auto all = ReduceOp::create(builder, loc, TypeRange{one.getType()},
+                                ValueRange{equal}, ValueRange{one}, axes);
+    auto body = new Block();
+    all.getBody().push_back(body);
+    body->addArguments({one.getType(), one.getType()}, {loc, loc});
+    {
+      OpBuilder b(body, body->end());
+      Value value =
+          AndOp::create(b, loc, body->getArgument(0), body->getArgument(1));
+      ReturnOp::create(b, loc, value);
+    }
+
+    // Uniform selectors need one batched branch. Mixed selectors retain the
+    // exact pointwise control flow, including inactive branch domains.
+    auto result =
+        stablehlo::IfOp::create(builder, loc, results, all->getResult(0));
+    auto uniform = new Block();
+    auto mixed = new Block();
+    result.getTrueBranch().push_back(uniform);
+    result.getFalseBranch().push_back(mixed);
+    {
+      OpBuilder b(uniform, uniform->end());
+      auto batched = cloneConditional(b);
+      ReturnOp::create(b, loc, batched->getResults());
+    }
+    {
+      OpBuilder b(mixed, mixed->end());
+      IRMapping mixedMapper = mapper;
+      if (failed(pointwiseCreateBatch(src, b, mixedMapper, batchSizes)))
+        return failure();
+      SmallVector<Value> values;
+      for (Value value : src->getResults())
+        values.push_back(mixedMapper.lookup(value));
+      ReturnOp::create(b, loc, values);
+    }
+    for (auto [oldValue, newValue] :
+         llvm::zip(src->getResults(), result->getResults()))
+      mapper.map(oldValue, newValue);
+    return success();
+  }
+
   if (auto loop = dyn_cast<stablehlo::WhileOp>(src)) {
     // Fixed scans advance all lanes together. Keep the induction variable
     // scalar so body slices stay slices, rather than per-lane gathers.
@@ -257,42 +352,8 @@ inline LogicalResult tryToBatchInner(Operation *src, OpBuilder &builder,
     return success();
   }
 
-  if (auto ifOp = dyn_cast<stablehlo::IfOp>(src)) {
-    auto predBroadcast =
-        mapper.lookup(ifOp.getPred()).getDefiningOp<BroadcastInDimOp>();
-    if (predBroadcast && predBroadcast.isSimpleBroadcast() &&
-        predBroadcast.getBroadcastDimensions().size() == batchSizes.size()) {
-      // %pred = broadcast_in_dim %0
-      // if %0 {} {}
-      SmallVector<Type> results;
-      results.reserve(src->getNumResults());
-      for (auto resTy : src->getResultTypes()) {
-        results.push_back(applyBatchSizes(resTy, batchSizes));
-      }
-      auto newIf = stablehlo::IfOp::create(builder, src->getLoc(), results,
-                                           predBroadcast.getOperand());
-      newIf.getTrueBranch().push_back(new Block());
-      newIf.getFalseBranch().push_back(new Block());
-
-      batchCloneBlock(&ifOp.getTrueBranch().front(),
-                      &newIf.getTrueBranch().front(), mapper, batchSizes);
-      batchCloneBlock(&ifOp.getFalseBranch().front(),
-                      &newIf.getFalseBranch().front(), mapper, batchSizes);
-
-      for (auto &&[oldRes, newRes] :
-           llvm::zip(ifOp->getResults(), newIf->getResults())) {
-        mapper.map(oldRes, newRes);
-      }
-
-      return success();
-    }
-
-    auto iszero = matchPattern(ifOp.getPred(), m_Zero());
+  if (constantIf) {
     auto isone = matchPattern(ifOp.getPred(), m_One());
-
-    if (!iszero && !isone)
-      return failure();
-
     auto &reg = isone ? ifOp.getTrueBranch() : ifOp.getFalseBranch();
 
     assert(reg.hasOneBlock());  // stablehlo.if only allows 1 or 0 block in the
@@ -314,12 +375,9 @@ inline LogicalResult tryToBatchInner(Operation *src, OpBuilder &builder,
   return failure();
 }
 
-inline LogicalResult genericCreateBatch(Operation *src, OpBuilder &builder,
-                                        IRMapping &mapper,
-                                        ArrayRef<int64_t> batchSizes) {
-  if (tryToBatchInner(src, builder, mapper, batchSizes).succeeded())
-    return success();
-
+inline LogicalResult pointwiseCreateBatch(Operation *src, OpBuilder &builder,
+                                          IRMapping &mapper,
+                                          ArrayRef<int64_t> batchSizes) {
   SmallVector<Value> operands;
   operands.reserve(src->getNumOperands());
 
@@ -462,6 +520,14 @@ inline LogicalResult genericCreateBatch(Operation *src, OpBuilder &builder,
   }
 
   return success();
+}
+
+inline LogicalResult genericCreateBatch(Operation *src, OpBuilder &builder,
+                                        IRMapping &mapper,
+                                        ArrayRef<int64_t> batchSizes) {
+  if (tryToBatchInner(src, builder, mapper, batchSizes).succeeded())
+    return success();
+  return pointwiseCreateBatch(src, builder, mapper, batchSizes);
 }
 
 template <typename OpTy>

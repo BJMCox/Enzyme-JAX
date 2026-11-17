@@ -1,6 +1,7 @@
 from absl.testing import absltest
 import math
 import re
+from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -40,6 +41,162 @@ def weighted_polynomial(x, scale):
 
 
 class HloBatching(absltest.TestCase):
+    def test_case_batches_nested_portable_linear_algebra(self):
+        source = Path(__file__).with_name("logabsdet_composite.mlir").read_text()
+        source = source.replace("func.func @main(", "func.func private @cell(", 1)
+        source = (
+            source.replace("0x7FF0000000000000", "0x7F800000")
+            .replace("0x7FF8000000000000", "0x7FC00000")
+            .replace("f64", "f32")
+        )
+        source = (
+            source.rsplit("}", 1)[0]
+            + """
+          func.func @main(%index: tensor<i32>, %a: tensor<2x2xf32>) -> tensor<f32> {
+            %v = "stablehlo.case"(%index) ({
+              %value, %inverse, %valid = func.call @cell(%a)
+                : (tensor<2x2xf32>) -> (tensor<f32>, tensor<2x2xf32>, tensor<i1>)
+              stablehlo.return %value : tensor<f32>
+            }, {
+              %zero = stablehlo.constant dense<0.0> : tensor<f32>
+              %sum = stablehlo.reduce(%a init: %zero) applies stablehlo.add
+                across dimensions = [0, 1]
+                : (tensor<2x2xf32>, tensor<f32>) -> tensor<f32>
+              stablehlo.return %sum : tensor<f32>
+            }) : (tensor<i32>) -> tensor<f32>
+            return %v : tensor<f32>
+          }
+        }"""
+        )
+        function = lambda index, a: hlo_call(index, a, source=source)[0]
+        a = np.array([[0.3, 2], [1, 3]], dtype=np.float32)
+        matrices = jnp.asarray(np.stack([a] * 4))
+        index = jnp.zeros(4, dtype=jnp.int32)
+        compiled = jax.jit(jax.vmap(jax.value_and_grad(function, argnums=1)))
+        value, gradient = compiled(index, matrices)
+        np.testing.assert_allclose(value, np.linalg.slogdet(a)[1], rtol=2e-5)
+        np.testing.assert_allclose(
+            gradient, np.broadcast_to(np.linalg.inv(a).T, gradient.shape), rtol=2e-5
+        )
+        entry = compiled.lower(index, matrices).compile().as_text().split("ENTRY", 1)[1]
+        if jax.default_backend() != "cpu":
+            self.assertNotRegex(entry, r"\bwhile\(")
+
+    def test_uniform_and_mixed_cases_preserve_lazy_domains_and_derivatives(self):
+        regions = []
+        for expression in (
+            "%value = stablehlo.log %x : tensor<f32>",
+            "%negative = stablehlo.negate %x : tensor<f32>\n"
+            "%value = stablehlo.sqrt %negative : tensor<f32>",
+            "%value = stablehlo.multiply %x, %x : tensor<f32>",
+        ):
+            regions.append(
+                "{"
+                + expression
+                + """
+                %first = stablehlo.reshape %value : (tensor<f32>) -> tensor<1xf32>
+                %two = stablehlo.constant dense<2.0> : tensor<f32>
+                %twice = stablehlo.multiply %value, %two : tensor<f32>
+                %last = stablehlo.reshape %twice : (tensor<f32>) -> tensor<1xf32>
+                %vector = stablehlo.concatenate %first, %last, dim = 0
+                    : (tensor<1xf32>, tensor<1xf32>) -> tensor<2xf32>
+                stablehlo.return %value, %vector : tensor<f32>, tensor<2xf32>
+            }"""
+            )
+        source = (
+            """module {
+            func.func @main(%index: tensor<i32>, %x: tensor<f32>)
+                -> (tensor<f32>, tensor<2xf32>) {
+                %value:2 = "stablehlo.case"(%index) ("""
+            + ",".join(regions)
+            + """)
+                    : (tensor<i32>) -> (tensor<f32>, tensor<2xf32>)
+                return %value#0, %value#1 : tensor<f32>, tensor<2xf32>
+            }
+        }"""
+        )
+
+        def loss(index, x):
+            value, vector = hlo_call(index, x, source=source)
+            return value + vector.sum()
+
+        compiled = jax.jit(jax.vmap(jax.value_and_grad(loss, argnums=1)))
+        second = jax.jit(jax.vmap(jax.grad(jax.grad(loss, argnums=1), argnums=1)))
+        for indices, points in (
+            ([0, 0, 0, 0], [1, 2, 3, 4]),
+            ([1, 1, 1, 1], [-1, -4, -9, -16]),
+            ([2, 2, 2, 2], [-2, -1, 0, 3]),
+            ([-1, -1, -1, -1], [-2, -1, 0, 3]),
+            ([-1, 0, 1, 3], [-2, 2, -4, 0.5]),
+        ):
+            index = jnp.array(indices, dtype=jnp.int32)
+            x = jnp.array(points, dtype=jnp.float32)
+            expected = []
+            for i, p in zip(indices, points):
+                if i == 0:
+                    expected.append((math.log(p), 1 / p, -1 / p**2))
+                elif i == 1:
+                    expected.append(
+                        (math.sqrt(-p), -0.5 / math.sqrt(-p), -0.25 / (-p) ** 1.5)
+                    )
+                else:
+                    expected.append((p * p, 2 * p, 2))
+            values, gradients = compiled(index, x)
+            for actual, oracle in zip(
+                (values, gradients, second(index, x)),
+                4 * np.asarray(expected).T,
+            ):
+                np.testing.assert_allclose(actual, oracle, rtol=2e-5, atol=2e-5)
+        nested = jax.jit(jax.vmap(jax.vmap(jax.value_and_grad(loss, argnums=1))))
+        actual = nested(index.reshape(2, 2), x.reshape(2, 2))
+        for value, reference in zip(actual, (values, gradients)):
+            np.testing.assert_allclose(value.reshape(-1), reference, rtol=2e-5)
+        empty = compiled(index[:0], x[:0])
+        self.assertEqual(empty[0].size, 0)
+        shared = jax.jit(
+            jax.vmap(jax.value_and_grad(loss, argnums=1), in_axes=(None, 0))
+        )
+        positive = jnp.array([1, 2, 3, 4], dtype=jnp.float32)
+        actual = shared(jnp.int32(0), positive)
+        for value, reference in zip(actual, (4 * np.log(positive), 4 / positive)):
+            np.testing.assert_allclose(value, reference, rtol=2e-5, atol=2e-5)
+        # The common uniform path must not loop over whole imported calls.
+        entry = compiled.lower(index, x).compile().as_text().split("ENTRY", 1)[1]
+        if jax.default_backend() != "cpu":
+            self.assertNotRegex(entry, r"\bwhile\(")
+
+        if_source = (
+            source.replace(",".join(regions), ",".join(regions[:2]))
+            .replace('"stablehlo.case"', '"stablehlo.if"')
+            .replace("tensor<i32>", "tensor<i1>")
+        )
+
+        def if_loss(pred, x):
+            value, vector = hlo_call(pred, x, source=if_source)
+            return value + vector.sum()
+
+        for predicates, points in (
+            ([True] * 4, [1, 2, 3, 4]),
+            ([False] * 4, [-1, -4, -9, -16]),
+            ([True, False, True, False], [1, -4, 9, -16]),
+        ):
+            pred = jnp.array(predicates)
+            x = jnp.array(points, dtype=jnp.float32)
+            magnitude = np.abs(points)
+            expected = (
+                np.where(predicates, np.log(magnitude), np.sqrt(magnitude)),
+                np.where(predicates, 1 / np.asarray(points), -0.5 / np.sqrt(magnitude)),
+                np.where(predicates, -1 / magnitude**2, -0.25 / magnitude**1.5),
+            )
+            values, gradients = jax.jit(
+                jax.vmap(jax.value_and_grad(if_loss, argnums=1))
+            )(pred, x)
+            second = jax.jit(
+                jax.vmap(jax.grad(jax.grad(if_loss, argnums=1), argnums=1))
+            )(pred, x)
+            for actual, oracle in zip((values, gradients, second), expected):
+                np.testing.assert_allclose(actual, 4 * oracle, rtol=2e-5, atol=2e-5)
+
     def test_shared_graph_and_outputs_keep_unmapped_inputs(self):
         source = """
         module {
