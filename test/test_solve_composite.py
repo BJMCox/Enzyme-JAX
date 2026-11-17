@@ -1,4 +1,5 @@
 import re
+from functools import partial
 from pathlib import Path
 
 import jax
@@ -17,6 +18,49 @@ SCAN_SOURCE = Path(__file__).with_name("solve_scan.mlir").read_text()
 
 
 class SolveCompositeTest(parameterized.TestCase):
+    def test_checkpoint_preserves_primal_gradient_and_hvp(self):
+        a = jnp.array([[0.3, 2.0], [1.0, 3.0]], dtype=jnp.float64)
+        b = jnp.array([[1.0, 2.0], [-2.0, 3.0]], dtype=jnp.float64)
+        direction = jnp.array([[0.2, -0.1], [0.4, 0.3]], dtype=jnp.float64)
+        weight = jnp.array([[0.2, -0.3], [0.9, 0.5]], dtype=jnp.float64)
+        inverse = np.linalg.inv(np.asarray(a))
+        x = inverse @ b
+        adjoint = inverse.T @ weight
+        dx = -inverse @ direction @ x
+        dadjoint = -inverse.T @ direction.T @ adjoint
+        gradient = -adjoint @ x.T
+        hvp = -dadjoint @ x.T - adjoint @ dx.T
+
+        for policy in (
+            jax.checkpoint_policies.nothing_saveable,
+            jax.checkpoint_policies.everything_saveable,
+        ):
+
+            @partial(jax.checkpoint, policy=policy)
+            def solve(a):
+                result, valid = hlo_call(a, b, source=MATRIX_SOURCE)
+                return result, valid
+
+            # The primal also supplies a cotangent, so checkpoint must make
+            # it available on both sides of the partial-evaluation boundary.
+            def loss(a):
+                result, valid = solve(a)
+                return jnp.sum(result * weight) ** 2, valid
+
+            compiled = jax.jit(jax.value_and_grad(loss, has_aux=True))
+            (value, valid), actual_gradient = compiled(a)
+            scalar = np.sum(x * weight)
+            np.testing.assert_allclose(value, scalar**2, rtol=2e-11)
+            self.assertTrue(valid)
+            np.testing.assert_allclose(
+                actual_gradient, 2 * scalar * gradient, rtol=2e-11
+            )
+            actual_hvp = jax.jit(
+                lambda a: jax.jvp(jax.grad(lambda a: loss(a)[0]), (a,), (direction,))[1]
+            )(a)
+            expected_hvp = 2 * (np.sum(dx * weight) * gradient + scalar * hvp)
+            np.testing.assert_allclose(actual_hvp, expected_hvp, rtol=2e-11)
+
     @parameterized.named_parameters(("jax", False), ("stablehlo", True))
     def test_scan_reuses_factors_and_preserves_higher_derivatives(self, internal_scan):
         for precision in ("f32", "f64"):

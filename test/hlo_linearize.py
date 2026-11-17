@@ -29,6 +29,28 @@ def recurrence(parameter):
 
 
 class HLOLinearize(absltest.TestCase):
+    def test_checkpoint_policies_preserve_nested_and_batched_derivatives(self):
+        points = jnp.array([-0.4, 0.2, 0.7], dtype=jnp.float32)
+        function = lambda x, scale: jnp.sin(scale * x) + x * x
+        imported = import_hlo(function, points[0], jnp.float32(2))
+        for policy in (
+            jax.checkpoint_policies.nothing_saveable,
+            jax.checkpoint_policies.everything_saveable,
+            lambda primitive, *args, **params: primitive.name == "enzyme_primal",
+        ):
+            remat = jax.checkpoint(
+                lambda x: imported(x, jnp.float32(2))[0], policy=policy
+            )
+            loss = jax.checkpoint(lambda x, remat=remat: jnp.cos(remat(x)))
+            reference = lambda x: jnp.cos(function(x, jnp.float32(2)))
+            for transform in (jax.value_and_grad, lambda f: jax.grad(jax.grad(f))):
+                actual = jax.jit(jax.vmap(transform(loss)))(points)
+                expected = jax.vmap(transform(reference))(points)
+                for value, oracle in zip(
+                    jax.tree.leaves(actual), jax.tree.leaves(expected)
+                ):
+                    np.testing.assert_allclose(value, oracle, rtol=4e-6, atol=4e-6)
+
     @absltest.skipUnless(HAS_EFFECT_QUERIES, "requires MLIR memory effect queries")
     def test_broadcast_residuals_remain_compact(self):
         parameters = jnp.array([0.2, -0.4, 0.7], dtype=jnp.float32)

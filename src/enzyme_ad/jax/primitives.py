@@ -2082,6 +2082,93 @@ def primal_partial_eval(trace, *args, **kwargs):
 pe.custom_partial_eval_rules[_enzyme_primal_p] = primal_partial_eval
 
 
+# Policy-driven partial evaluation uses a separate registry from tracing. Keep
+# its expansion opaque to that registry, while retaining the ordinary rules.
+_enzyme_remat_primal_p = Primitive("enzyme_remat_primal")
+_enzyme_remat_primal_p.multiple_results = True
+_enzyme_remat_primal_p.def_impl(_enzyme_primal_impl)
+_enzyme_remat_primal_p.def_abstract_eval(_enzyme_primal_abstract_eval)
+jax_mlir.register_lowering(_enzyme_remat_primal_p, _enzyme_primal_lowering)
+ad.primitive_jvps[_enzyme_remat_primal_p] = enzyme_jvp
+pe.custom_partial_eval_rules[_enzyme_remat_primal_p] = primal_partial_eval
+batching.primitive_batchers[_enzyme_remat_primal_p] = partial(
+    _enzyme_batch, _enzyme_primal_p
+)
+
+
+def primal_partial_eval_custom(saveable, unknowns, instantiated, equation):
+    inputs = [core.Var(v.aval) for v in equation.invars]
+    outputs = [core.Var(v.aval) for v in equation.outvars]
+    program = core.Jaxpr(
+        [],
+        inputs,
+        outputs,
+        [equation.replace(invars=inputs, outvars=outputs)],
+        equation.effects,
+        debug_info=core.DebugInfo("checkpoint", equation.primitive.name, None, None),
+    )
+    known, staged, output_unknowns, residual_avals = pe.partial_eval_jaxpr_nounits(
+        program, unknowns, False
+    )
+    residuals = [core.Var(aval) for aval in residual_avals]
+
+    def call(program, arguments, results):
+        program = program.replace(
+            eqns=[
+                eqn.replace(primitive=_enzyme_remat_primal_p)
+                if eqn.primitive is _enzyme_primal_p
+                else eqn
+                for eqn in program.eqns
+            ]
+        )
+        return core.new_jaxpr_eqn(
+            arguments,
+            results,
+            core.closed_call_p,
+            {"call_jaxpr": program},
+            program.effects,
+            equation.source_info,
+            equation.ctx,
+        )
+
+    expanded = program.replace(
+        eqns=[
+            call(
+                known,
+                [v for v, u in zip(inputs, unknowns) if not u],
+                [v for v, u in zip(outputs, output_unknowns) if not u] + residuals,
+            ),
+            call(
+                staged,
+                residuals + [v for v, u in zip(inputs, unknowns) if u],
+                [v for v, u in zip(outputs, output_unknowns) if u],
+            ),
+        ]
+    )
+
+    def policy(primitive, *avals, **params):
+        if primitive is _enzyme_remat_primal_p:
+            primitive = _enzyme_primal_p
+        return saveable(primitive, *avals, **params)
+
+    # Let JAX place residuals according to the caller's save/recompute/offload
+    # policy. In particular, a primal used by a cotangent must be recomputable.
+    return pe.closed_call_partial_eval_custom_rule(
+        "call_jaxpr",
+        lambda *args: (args[-2], args[-1]),
+        policy,
+        unknowns,
+        instantiated,
+        equation.replace(
+            primitive=core.closed_call_p,
+            params={"call_jaxpr": expanded},
+        ),
+    )
+
+
+pe.partial_eval_jaxpr_custom_rules[_enzyme_primal_p] = primal_partial_eval_custom
+
+
 def enzyme_vjp(shadow_rets, *prim_args, **kwargs):
     linearization = kwargs.pop("linearization", None)
     if linearization is not None:
