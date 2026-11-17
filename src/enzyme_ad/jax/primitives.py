@@ -1,6 +1,7 @@
 """JAX primitives for Enzyme connection."""
 
 from functools import cache, partial
+from math import prod
 from collections.abc import Callable, Sequence
 from typing import Any
 import inspect
@@ -1237,7 +1238,7 @@ def to_jax_type(mlir_type):
 
 
 def _lower_small_cpu_products(ctx, module):
-    """Avoid native dot setup for tiny, static f32 CPU matrix products."""
+    """Avoid native dot setup for bounded, static f32 CPU products."""
     if tuple(ctx.module_context.platforms) != ("cpu",):
         return
     products = [
@@ -1245,38 +1246,72 @@ def _lower_small_cpu_products(ctx, module):
     ]
     for op in products:
         types = [ir.RankedTensorType(v.type) for v in (*op.operands, *op.results)]
-        # Bound code growth and register pressure; larger products favor native kernels.
         if (
             "algorithm" in op.attributes
-            or any(not t.has_static_shape or len(t.shape) != 2 for t in types)
+            or any(not t.has_static_shape for t in types)
             or str(types[0].element_type) != "f32"
             or any(t.element_type != types[0].element_type for t in types)
-            or any(d < 1 or d > 16 for t in types for d in t.shape)
+            or any(d < 1 for t in types for d in t.shape)
         ):
             continue
         dims = stablehlo.DotDimensionNumbers(op.attributes["dot_dimension_numbers"])
-        left, right = (
+        batches = [
+            list(dims.lhs_batching_dimensions),
+            list(dims.rhs_batching_dimensions),
+        ]
+        contracts = [
             list(dims.lhs_contracting_dimensions),
             list(dims.rhs_contracting_dimensions),
-        )
-        if (
-            dims.lhs_batching_dimensions
-            or dims.rhs_batching_dimensions
-            or len(left) != 1
-            or len(right) != 1
-        ):
+        ]
+        if not contracts[0] or len(contracts[0]) != len(contracts[1]):
             continue
-        count = types[0].shape[left[0]]
-        if count < 2:
+        matrix = max(len(t.shape) for t in types[:2]) <= 2
+        if matrix:
+            # Retain the existing matrix rule; larger matrix rewrites can regress.
+            if (
+                any(len(t.shape) != 2 or any(d > 16 for d in t.shape) for t in types)
+                or batches[0]
+                or batches[1]
+                or len(contracts[0]) != 1
+            ):
+                continue
+        elif prod(types[2].shape) > 256:
             continue
+        count = prod(types[0].shape[d] for d in contracts[0])
+        # At most 16 terms per output and 256 outputs, as in the matrix rule.
+        if not 2 <= count <= 16:
+            continue
+        free = [
+            [d for d in range(len(t.shape)) if d not in batch + contract]
+            for t, batch, contract in zip(types[:2], batches, contracts)
+        ]
+        batch_shape = tuple(types[0].shape[d] for d in batches[0])
+        m = prod(types[0].shape[d] for d in free[0])
+        n = prod(types[1].shape[d] for d in free[1])
+        # Native reductions already handle vector and scalar products efficiently.
+        if not matrix and (m == 1 or n == 1):
+            continue
+        left_order = tuple(batches[0] + free[0] + contracts[0])
+        right_order = tuple(batches[1] + contracts[1] + free[1])
+        output_shape = tuple(types[2].shape)
 
-        def multiply(a, b, left=left[0], right=right[0], count=count):
-            a = a.T if left == 0 else a
-            b = b.T if right == 1 else b
-            result = a[:, :1] * b[:1, :]
+        def multiply(
+            a,
+            b,
+            left_order=left_order,
+            right_order=right_order,
+            batch_shape=batch_shape,
+            m=m,
+            n=n,
+            count=count,
+            output_shape=output_shape,
+        ):
+            a = a.transpose(left_order).reshape((*batch_shape, m, count))
+            b = b.transpose(right_order).reshape((*batch_shape, count, n))
+            result = a[..., :, :1] * b[..., :1, :]
             for i in range(1, count):
-                result = result + a[:, i : i + 1] * b[i : i + 1, :]
-            return result
+                result = result + a[..., :, i : i + 1] * b[..., i : i + 1, :]
+            return result.reshape(output_shape)
 
         operation_ctx = ctx.replace(
             avals_in=[to_jax_type(t) for t in types[:2]],

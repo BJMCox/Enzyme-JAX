@@ -47,8 +47,9 @@ Symbolically inactive output cotangents also keep the activity-specific path.
 The optimization currently applies to raw StableHLO calls, not callable sources
 passed to `enzyme_jax_ir`.
 
-On CPU, small static float32 matrix products use bounded rank-one accumulation
-after differentiation. Larger matrices retain their native dot lowering.
+On CPU, small static float32 products use bounded rank-one accumulation after
+differentiation, including batches, shared operands and multiple contraction axes.
+Larger products and higher-rank vector reductions retain their native dot lowering.
 
 ## Small CUDA programs
 

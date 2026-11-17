@@ -25,17 +25,151 @@ def source_for(m, k, n, precision, left=1, right=0):
 
 
 class SmallProducts(parameterized.TestCase):
-    def test_explicit_algorithm_and_multiplatform_export(self):
+    @parameterized.named_parameters(
+        ("paired", (2, 3, 4), (2, 4, 5), (((2,), (1,)), ((0,), (0,))), "bmk,bkn->bmn"),
+        ("shared_left", (3, 4), (2, 4, 5), (((1,), (1,)), ((), ())), "mk,bkn->mbn"),
+        ("shared_right", (2, 3, 4), (4, 5), (((2,), (0,)), ((), ())), "bmk,kn->bmn"),
+        (
+            "multiple_free",
+            (2, 3, 4),
+            (4, 2, 3),
+            (((2,), (0,)), ((), ())),
+            "abk,kcd->abcd",
+        ),
+        (
+            "multiple_contract",
+            (2, 2, 3),
+            (3, 2, 4),
+            (((1, 2), (1, 0)), ((), ())),
+            "mij,jin->mn",
+        ),
+        (
+            "batch_free_contract",
+            (2, 2, 3, 2, 2),
+            (2, 2, 2, 2, 3),
+            (((3, 4), (2, 1)), ((0,), (0,))),
+            "bxyij,bjiuv->bxyuv",
+        ),
+        (
+            "permuted_batches",
+            (2, 3, 2, 4),
+            (3, 4, 2, 5),
+            (((3,), (1,)), ((1, 0), (0, 2))),
+            "abmk,bkan->bamn",
+        ),
+        (
+            "scalar",
+            (2, 2, 3),
+            (3, 2, 2),
+            (((0, 1, 2), (2, 1, 0)), ((), ())),
+            "ijk,kji->",
+        ),
+    )
+    def test_general_contractions_and_higher_derivatives(
+        self, a_shape, b_shape, dims, equation
+    ):
+        rng = np.random.default_rng(317)
+        a, b, da, db = [
+            rng.normal(size=s).astype(np.float32)
+            for s in (a_shape, b_shape, a_shape, b_shape)
+        ]
+        lhs, output = equation.split("->")
+        left, right = lhs.split(",")
+        dot = lambda a, b: np.einsum(equation, a, b)
+        a64, b64, da64, db64 = (x.astype(np.float64) for x in (a, b, da, db))
+        expected = dot(a64, b64)
+        weight = rng.normal(size=expected.shape).astype(np.float32)
+        w64 = weight.astype(np.float64)
+        value = np.sum(expected * w64)
+        tangent = np.sum((dot(da64, b64) + dot(a64, db64)) * w64)
+        ga = lambda b: np.einsum(f"{output},{right}->{left}", w64, b)
+        gb = lambda a: np.einsum(f"{left},{output}->{right}", a, w64)
+        gradient = (2 * value * ga(b64), 2 * value * gb(a64))
+        hvp = (
+            2 * tangent * ga(b64) + 2 * value * ga(db64),
+            2 * tangent * gb(a64) + 2 * value * gb(da64),
+        )
+        inputs = tuple(jnp.asarray(x) for x in (a, b))
+        directions = tuple(jnp.asarray(x) for x in (da, db))
+        reference = lambda a, b: jax.lax.dot_general(
+            a, b, dims, precision=jax.lax.Precision.HIGHEST
+        )
+        source = str(jax.jit(reference).lower(*inputs).compiler_ir())
+        product = lambda a, b: hlo_call(a, b, source=source)[0]
+        loss = lambda a, b: jnp.sum(product(a, b) * jnp.asarray(weight)) ** 2
+        grad = jax.grad(loss, argnums=(0, 1))
+        actual = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(*inputs)
+        forward_hvp = jax.jit(lambda a, b: jax.jvp(grad, (a, b), directions)[1])(
+            *inputs
+        )
+        reverse_hvp = jax.jit(
+            jax.grad(
+                lambda a, b: sum(
+                    jnp.sum(g * d) for g, d in zip(grad(a, b), directions)
+                ),
+                argnums=(0, 1),
+            )
+        )(*inputs)
+        # Small bilinear products and two AD levels accumulate f32 roundoff.
+        tolerance = 512 * np.finfo(np.float32).eps
+        for result, oracle in zip(
+            jax.tree.leaves(
+                (jax.jit(product)(*inputs), actual, forward_hvp, reverse_hvp)
+            ),
+            jax.tree.leaves((expected, (value**2, gradient), hvp, hvp)),
+        ):
+            np.testing.assert_allclose(result, oracle, rtol=tolerance, atol=tolerance)
+
+    @parameterized.named_parameters(
+        ("output_limit", 16, 16, 8, np.float32, False),
+        ("output_fallback", 17, 16, 8, np.float32, True),
+        ("contraction_fallback", 16, 17, 8, np.float32, True),
+        ("f64_fallback", 16, 16, 8, np.float64, True),
+        ("unit", 3, 1, 4, np.float32, None),
+        ("empty", 3, 0, 4, np.float32, None),
+        ("left_vector", 1, 8, 4, np.float32, True),
+        ("right_vector", 4, 8, 1, np.float32, True),
+    )
+    def test_general_size_and_precision_bounds(self, m, k, n, dtype, native):
+        a = jnp.arange(2 * m * k, dtype=dtype).reshape(2, m, k) / 11
+        b = jnp.arange(2 * k * n, dtype=dtype).reshape(2, k, n) / 13
+        dims = (((2,), (1,)), ((0,), (0,)))
+        source = str(
+            jax.jit(
+                lambda a, b: jax.lax.dot_general(
+                    a, b, dims, precision=jax.lax.Precision.HIGHEST
+                )
+            )
+            .lower(a, b)
+            .compiler_ir()
+        )
+        lowered = jax.jit(lambda a, b: hlo_call(a, b, source=source)[0]).lower(a, b)
+        tolerance = 32 * max(1, k) * np.finfo(dtype).eps
+        np.testing.assert_allclose(
+            lowered.compile()(a, b), np.asarray(a) @ np.asarray(b), rtol=tolerance
+        )
+        if native is not None:
+            self.assertEqual(
+                "stablehlo.dot_general" in str(lowered.compiler_ir()),
+                native or jax.default_backend() != "cpu",
+            )
+
+    @parameterized.named_parameters(("matrix", False), ("batched", True))
+    def test_explicit_algorithm_and_multiplatform_export(self, batched):
         from jax import export
 
         a = jnp.arange(12, dtype=jnp.float32).reshape(3, 4) / 7
         b = jnp.arange(20, dtype=jnp.float32).reshape(4, 5) / 11
+        dims = (((1,), (0,)), ((), ()))
+        if batched:
+            a, b = jnp.stack((a, a + 1)), jnp.stack((b, b + 1))
+            dims = (((2,), (1,)), ((0,), (0,)))
 
         def specified(a, b):
             return jax.lax.dot_general(
                 a,
                 b,
-                (((1,), (0,)), ((), ())),
+                dims,
                 precision=jax.lax.DotAlgorithmPreset.F32_F32_F32,
             )
 
@@ -47,12 +181,23 @@ class SmallProducts(parameterized.TestCase):
             lowered.compile()(a, b), np.asarray(a) @ np.asarray(b), rtol=3e-6
         )
 
-        portable = lambda a, b: hlo_call(a, b, source=source_for(3, 4, 5, "f32"))[0]
-        exported = export.export(jax.jit(portable), platforms=("cpu", "cuda"))(a, b)
-        self.assertIn("stablehlo.dot_general", exported.mlir_module())
-        np.testing.assert_allclose(
-            exported.call(a, b), np.asarray(a) @ np.asarray(b), rtol=3e-6
+        plain_source = str(
+            jax.jit(
+                lambda a, b: jax.lax.dot_general(
+                    a, b, dims, precision=jax.lax.Precision.HIGHEST
+                )
+            )
+            .lower(a, b)
+            .compiler_ir()
         )
+        portable = lambda a, b: hlo_call(a, b, source=plain_source)[0]
+        for platforms in (("cpu", "cuda"), ("cuda",)):
+            exported = export.export(jax.jit(portable), platforms=platforms)(a, b)
+            self.assertIn("stablehlo.dot_general", exported.mlir_module())
+            if jax.default_backend() in platforms:
+                np.testing.assert_allclose(
+                    exported.call(a, b), np.asarray(a) @ np.asarray(b), rtol=3e-6
+                )
 
     @parameterized.named_parameters(
         ("f32", "f32", np.float32, 4e-5), ("f64", "f64", np.float64, 3e-11)
