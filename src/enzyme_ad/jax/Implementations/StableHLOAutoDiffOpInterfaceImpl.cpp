@@ -2848,7 +2848,7 @@ public:
   CholeskyDerivative(OpBuilder &builder, CholeskyOp op, Value primal,
                      Type shadowType)
       : builder(builder), loc(op.getLoc()), lower(op.getLower()) {
-    factor = mask(orient(primal), ComparisonDirection::GE);
+    factor = orient(primal);
     if (factor.getType() != shadowType) {
       auto rank = cast<RankedTensorType>(factor.getType()).getRank();
       SmallVector<int64_t> axes;
@@ -2868,12 +2868,15 @@ public:
     Value normalized = solve(solve(symmetric, /*left=*/false,
                                    /*transposed=*/true),
                              /*left=*/true, /*transposed=*/false);
-    return orient(multiply(factor, phi(normalized)));
+    // Only the dense product reads the unspecified upper triangle.
+    Value lowerFactor = mask(factor, ComparisonDirection::GE);
+    return orient(multiply(lowerFactor, phi(normalized)));
   }
 
   Value reverse(Value cotangent) {
     cotangent = mask(orient(cotangent), ComparisonDirection::GE);
-    Value projected = phi(multiply(transpose(factor), cotangent));
+    Value lowerFactor = mask(factor, ComparisonDirection::GE);
+    Value projected = phi(multiply(transpose(lowerFactor), cotangent));
     Value symmetric =
         AddOp::create(builder, loc, projected, transpose(projected));
     Value gradient = solve(solve(symmetric, /*left=*/true,
