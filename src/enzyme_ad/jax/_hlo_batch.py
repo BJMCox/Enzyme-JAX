@@ -65,6 +65,7 @@ def _batchable(op, functions):
             "enzyme.linalg.solve",
             "enzyme.linalg.logabsdet",
             "enzyme.linalg.det",
+            "enzyme.math.log_ndtr",
         ):
             return False
         symbol = ir.FlatSymbolRefAttr(op.attributes["decomposition"]).value

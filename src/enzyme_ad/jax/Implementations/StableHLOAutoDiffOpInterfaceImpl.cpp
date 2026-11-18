@@ -3339,12 +3339,141 @@ struct SolveDataFlow
   }
 };
 
+// The decomposition returns log Phi(x) and its slope. Give the slope its own
+// derivative so nesting AD still differentiates the same function.
+class LogNdtrDerivative {
+  OpBuilder &builder;
+  Location loc;
+
+public:
+  LogNdtrDerivative(OpBuilder &builder, Location loc)
+      : builder(builder), loc(loc) {}
+
+  static LogicalResult check(CompositeOp op) {
+    if (op.getVersion() != 1 || !op.getCompositeAttributes().empty() ||
+        !op->getRegions().empty() || op->getNumOperands() != 1 ||
+        op->getNumResults() != 2)
+      return op.emitOpError("unsupported log_ndtr composite contract");
+    auto type = dyn_cast<RankedTensorType>(op->getOperand(0).getType());
+    if (!type || !type.hasStaticShape() ||
+        !(type.getElementType().isF32() || type.getElementType().isF64()) ||
+        op->getResult(0).getType() != type ||
+        op->getResult(1).getType() != type)
+      return op.emitOpError("log_ndtr requires matching float tensors");
+    return success();
+  }
+
+  Value times(Value slope, Value seed) {
+    if (slope.getType() != seed.getType()) {
+      auto rank = cast<RankedTensorType>(slope.getType()).getRank();
+      auto type = cast<RankedTensorType>(seed.getType());
+      SmallVector<int64_t> axes;
+      for (int64_t i = type.getRank() - rank; i < type.getRank(); ++i)
+        axes.push_back(i);
+      slope = BroadcastInDimOp::create(builder, loc, type, slope,
+                                       builder.getDenseI64ArrayAttr(axes));
+    }
+    return MulOp::create(builder, loc, slope, seed);
+  }
+
+  Value curvature(Value x, Value slope) {
+    // The portable body assigns zero slope at unbounded endpoints.
+    Value finite = IsFiniteOp::create(builder, loc, x);
+    x = SelectOp::create(builder, loc, finite, x,
+                         makeZero(builder, loc, x.getType()));
+    auto constant = [&](double value) -> Value {
+      return ConstantOp::create(
+          builder, loc, cast<ElementsAttr>(makeAttr(x.getType(), value)));
+    };
+    auto dtype = getElementTypeOrSelf(x.getType());
+    Value cutoff = constant(dtype.isF32() ? -8.0 : -32.0);
+    Value far =
+        CompareOp::create(builder, loc, x, cutoff, ComparisonDirection::LT);
+
+    // -R(x) * (x + R(x)) loses its small second factor in the left tail.
+    // Differentiate the reciprocal Mills expansion in t = 1/x^2 there.
+    Value safe = SelectOp::create(builder, loc, far, x, cutoff);
+    Value inverse = DivOp::create(builder, loc, constant(1), safe);
+    Value t = MulOp::create(builder, loc, inverse, inverse);
+    Value tail = constant(-89782);
+    for (double coefficient : {6354.0, -518.0, 50.0, -6.0, 1.0, -1.0}) {
+      tail = AddOp::create(builder, loc, MulOp::create(builder, loc, tail, t),
+                           constant(coefficient));
+    }
+    Value nearX = SelectOp::create(builder, loc, far, cutoff, x);
+    Value nearSlope = SelectOp::create(builder, loc, far, constant(0), slope);
+    Value sum = AddOp::create(builder, loc, nearX, nearSlope);
+    Value near = MulOp::create(builder, loc,
+                               NegOp::create(builder, loc, nearSlope), sum);
+    return SelectOp::create(builder, loc, far, tail, near);
+  }
+
+  LogicalResult forward(CompositeOp op, MGradientUtils *gutils) {
+    if (failed(check(op)))
+      return failure();
+    Value input = op->getOperand(0);
+    if (gutils->isConstantValue(input))
+      return success();
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfter(gutils->getNewFromOriginal(op));
+    Value seed = gutils->invertPointerM(input, builder);
+    Value slope = gutils->getNewFromOriginal(op->getResult(1));
+    if (!gutils->isConstantValue(op->getResult(0)))
+      gutils->setDiffe(op->getResult(0), times(slope, seed), builder);
+    if (!gutils->isConstantValue(op->getResult(1))) {
+      Value x = gutils->getNewFromOriginal(input);
+      gutils->setDiffe(op->getResult(1), times(curvature(x, slope), seed),
+                       builder);
+    }
+    return success();
+  }
+
+  LogicalResult reverse(CompositeOp op, MGradientUtilsReverse *gutils,
+                        SmallVector<Value> caches) {
+    if (failed(check(op)))
+      return failure();
+    Value input = op->getOperand(0);
+    if (gutils->isConstantValue(input))
+      return success();
+    Value slope = gutils->popCache(caches[0], builder);
+    for (OpResult result : op->getOpResults()) {
+      if (gutils->isConstantValue(result))
+        continue;
+      Value derivative = slope;
+      if (result.getResultNumber() == 1)
+        derivative = curvature(gutils->popCache(caches[1], builder), slope);
+      Value seed = gutils->diffe(result, builder);
+      gutils->zeroDiffe(result, builder);
+      gutils->addToDiffe(input, times(derivative, seed), builder);
+    }
+    return success();
+  }
+
+  static SmallVector<Value> cache(CompositeOp op,
+                                  MGradientUtilsReverse *gutils) {
+    if (op->getNumOperands() != 1 || op->getNumResults() != 2 ||
+        gutils->isConstantValue(op->getOperand(0)))
+      return {};
+    Operation *primal = gutils->getNewFromOriginal(op);
+    OpBuilder builder(primal);
+    builder.setInsertionPointAfter(primal);
+    SmallVector<Value> caches{
+        gutils->initAndPushCache(primal->getResult(1), builder)};
+    if (!gutils->isConstantValue(op->getResult(1)))
+      caches.push_back(
+          gutils->initAndPushCache(primal->getOperand(0), builder));
+    return caches;
+  }
+};
+
 struct AutoDiffCompositeSolveFwd
     : AutoDiffOpInterface::ExternalModel<AutoDiffCompositeSolveFwd,
                                          CompositeOp> {
   LogicalResult createForwardModeTangent(Operation *orig, OpBuilder &builder,
                                          MGradientUtils *gutils) const {
     auto op = cast<CompositeOp>(orig);
+    if (op.getName() == "enzyme.math.log_ndtr")
+      return LogNdtrDerivative(builder, op.getLoc()).forward(op, gutils);
     if (op.getName() == "enzyme.linalg.logabsdet" ||
         op.getName() == "enzyme.linalg.det")
       return CompositeDeterminantDerivative(op, builder).forward(gutils);
@@ -3389,6 +3518,9 @@ struct AutoDiffCompositeSolveRev
                                          MGradientUtilsReverse *gutils,
                                          SmallVector<Value> caches) const {
     auto op = cast<CompositeOp>(orig);
+    if (op.getName() == "enzyme.math.log_ndtr")
+      return LogNdtrDerivative(builder, op.getLoc())
+          .reverse(op, gutils, caches);
     if (op.getName() == "enzyme.linalg.logabsdet" ||
         op.getName() == "enzyme.linalg.det")
       return CompositeDeterminantDerivative(op, builder)
@@ -3425,6 +3557,8 @@ struct AutoDiffCompositeSolveRev
   SmallVector<Value> cacheValues(Operation *orig,
                                  MGradientUtilsReverse *gutils) const {
     auto op = cast<CompositeOp>(orig);
+    if (op.getName() == "enzyme.math.log_ndtr")
+      return LogNdtrDerivative::cache(op, gutils);
     if (op.getName() == "enzyme.linalg.logabsdet" ||
         op.getName() == "enzyme.linalg.det") {
       if (gutils->isConstantValue(op->getOperand(0)))
@@ -3473,16 +3607,19 @@ struct SHLOCompositeSolveBatch
     auto op = cast<CompositeOp>(src);
     if (op.getName() != "enzyme.linalg.solve" &&
         op.getName() != "enzyme.linalg.logabsdet" &&
-        op.getName() != "enzyme.linalg.det")
+        op.getName() != "enzyme.linalg.det" &&
+        op.getName() != "enzyme.math.log_ndtr")
       return failure();
     if (failed(op.getName() == "enzyme.linalg.solve"
                    ? CompositeSolveDerivative::check(op, 1)
+               : op.getName() == "enzyme.math.log_ndtr"
+                   ? LogNdtrDerivative::check(op)
                    : CompositeDeterminantDerivative::check(op, 1)))
       return failure();
     auto function = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
         op, op.getDecompositionAttr());
     if (!function)
-      return op.emitOpError("solve decomposition is missing");
+      return op.emitOpError("composite decomposition is missing");
     std::map<enzyme::batchutils::BatchCacheKey, FunctionOpInterface> cache;
     auto batched = enzyme::batchutils::batchCloneFunction(
         builder, cast<FunctionOpInterface>(function.getOperation()),
