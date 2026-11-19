@@ -462,27 +462,34 @@ struct DynamicSliceConversion : public OpConversionPattern<OpTy> {
   }
 };
 
-struct WhileOpConversion : public OpConversionPattern<stablehlo::WhileOp> {
-  using OpConversionPattern::OpConversionPattern;
+template <typename OpTy>
+struct ControlFlowOpConversion : public OpConversionPattern<OpTy> {
+  using OpConversionPattern<OpTy>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(stablehlo::WhileOp op, OpAdaptor adaptor,
+  matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto loop = stablehlo::WhileOp::create(rewriter, op.getLoc(),
-                                           adaptor.getOperands());
-    loop->setAttrs(op->getAttrs());
+    const TypeConverter &converter = *this->getTypeConverter();
+    SmallVector<Type> resultTypes;
+    if (failed(converter.convertTypes(op->getResultTypes(), resultTypes)))
+      return failure();
+    Operation *replacement = rewriter.insert(Operation::create(
+        op.getLoc(), op->getName(), resultTypes, adaptor.getOperands(),
+        op->getDiscardableAttrDictionary(), op->getPropertiesStorage(), {},
+        op->getNumRegions()));
     for (auto [oldRegion, newRegion] :
-         llvm::zip(op->getRegions(), loop->getRegions())) {
+         llvm::zip(op->getRegions(), replacement->getRegions())) {
       rewriter.inlineRegionBefore(oldRegion, newRegion, newRegion.end());
-      if (failed(rewriter.convertRegionTypes(&newRegion, *getTypeConverter())))
+      if (failed(rewriter.convertRegionTypes(&newRegion, converter)))
         return failure();
     }
-    rewriter.replaceOp(op, loop.getResults());
+    rewriter.replaceOp(op, replacement->getResults());
     return success();
   }
 };
 
-struct WhileReturnConversion : public OpConversionPattern<stablehlo::ReturnOp> {
+struct ControlFlowReturnConversion
+    : public OpConversionPattern<stablehlo::ReturnOp> {
   using OpConversionPattern::OpConversionPattern;
 
   LogicalResult
@@ -583,12 +590,14 @@ struct LowerComplexOperationsPass
     target.addDynamicallyLegalOp<stablehlo::ComplexOp>(isLegalOp);
     target.addDynamicallyLegalOp<stablehlo::SliceOp>(isLegalOp);
     target.addDynamicallyLegalOp<stablehlo::TransposeOp>(isLegalOp);
-    target.addDynamicallyLegalOp<stablehlo::DynamicSliceOp,
-                                 stablehlo::DynamicUpdateSliceOp,
-                                 stablehlo::WhileOp>(isLegalOp);
+    target.addDynamicallyLegalOp<
+        stablehlo::DynamicSliceOp, stablehlo::DynamicUpdateSliceOp,
+        stablehlo::WhileOp, stablehlo::IfOp, stablehlo::CaseOp>(isLegalOp);
     target.addDynamicallyLegalOp<stablehlo::ReturnOp>(
         [&](stablehlo::ReturnOp ret) {
-          return !isa<stablehlo::WhileOp>(ret->getParentOp()) || isLegalOp(ret);
+          return !isa<stablehlo::WhileOp, stablehlo::IfOp, stablehlo::CaseOp>(
+                     ret->getParentOp()) ||
+                 isLegalOp(ret);
         });
 
     RewritePatternSet patterns(context);
@@ -605,8 +614,10 @@ struct LowerComplexOperationsPass
     patterns.add<DynamicSliceConversion<stablehlo::DynamicSliceOp>,
                  DynamicSliceConversion<stablehlo::DynamicUpdateSliceOp>>(
         typeConverter, context, concatDimension);
-    patterns.add<WhileOpConversion, WhileReturnConversion>(typeConverter,
-                                                           context);
+    patterns.add<ControlFlowOpConversion<stablehlo::WhileOp>,
+                 ControlFlowOpConversion<stablehlo::IfOp>,
+                 ControlFlowOpConversion<stablehlo::CaseOp>,
+                 ControlFlowReturnConversion>(typeConverter, context);
 
     SmallVector<func::FuncOp> funcsToConvert;
     op->walk([&](func::FuncOp func) { funcsToConvert.push_back(func); });
