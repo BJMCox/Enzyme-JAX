@@ -25,6 +25,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include <optional>
+#include <type_traits>
 
 #define DEBUG_TYPE "lower-complex-operations"
 
@@ -50,10 +51,10 @@ bool isComplexType(Type ty) {
 bool operatesOnOriginalArgument(Operation *op) {
   for (auto operand : op->getOperands()) {
     if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
-      if (blockArg.getOwner()->isEntryBlock()) {
-        if (isa<func::FuncOp>(blockArg.getOwner()->getParentOp()))
-          return true;
-      }
+      Block *block = blockArg.getOwner();
+      if (isa_and_present<func::FuncOp>(block->getParentOp()) &&
+          block->isEntryBlock())
+        return true;
     }
   }
   return false;
@@ -438,6 +439,71 @@ struct TransposeOpConversion
   }
 };
 
+// A dynamic slice or update always spans both components of a complex value.
+template <typename OpTy>
+struct DynamicSliceConversion : public OpConversionPattern<OpTy> {
+  bool componentFirst;
+
+  DynamicSliceConversion(TypeConverter &converter, MLIRContext *context,
+                         StringRef concatDimension)
+      : OpConversionPattern<OpTy>(converter, context),
+        componentFirst(concatDimension == "first") {}
+
+  LogicalResult
+  matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto indices = llvm::to_vector(adaptor.getStartIndices());
+    Type indexType = indices.empty()
+                         ? RankedTensorType::get({}, rewriter.getI32Type())
+                         : indices.front().getType();
+    Value zero = stablehlo::ConstantOp::create(rewriter, op.getLoc(),
+                                               rewriter.getZeroAttr(indexType));
+    indices.insert(componentFirst ? indices.begin() : indices.end(), zero);
+
+    if constexpr (std::is_same_v<OpTy, stablehlo::DynamicSliceOp>) {
+      auto sizes = llvm::to_vector(op.getSliceSizes());
+      sizes.insert(componentFirst ? sizes.begin() : sizes.end(), 2);
+      rewriter.replaceOpWithNewOp<OpTy>(op, adaptor.getOperand(), indices,
+                                        rewriter.getDenseI64ArrayAttr(sizes));
+    } else {
+      rewriter.replaceOpWithNewOp<OpTy>(op, adaptor.getOperand(),
+                                        adaptor.getUpdate(), indices);
+    }
+    return success();
+  }
+};
+
+struct WhileOpConversion : public OpConversionPattern<stablehlo::WhileOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(stablehlo::WhileOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loop = stablehlo::WhileOp::create(rewriter, op.getLoc(),
+                                           adaptor.getOperands());
+    loop->setAttrs(op->getAttrs());
+    for (auto [oldRegion, newRegion] :
+         llvm::zip(op->getRegions(), loop->getRegions())) {
+      rewriter.inlineRegionBefore(oldRegion, newRegion, newRegion.end());
+      if (failed(rewriter.convertRegionTypes(&newRegion, *getTypeConverter())))
+        return failure();
+    }
+    rewriter.replaceOp(op, loop.getResults());
+    return success();
+  }
+};
+
+struct WhileReturnConversion : public OpConversionPattern<stablehlo::ReturnOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(stablehlo::ReturnOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<stablehlo::ReturnOp>(op, adaptor.getOperands());
+    return success();
+  }
+};
+
 struct LowerComplexOperationsPass
     : public enzyme::impl::LowerComplexOperationsPassBase<
           LowerComplexOperationsPass> {
@@ -505,20 +571,8 @@ struct LowerComplexOperationsPass
       if (!involvesComplex)
         return true;
 
-      if (auto realOp = dyn_cast<stablehlo::RealOp>(op)) {
-        if (auto blockArg = dyn_cast<BlockArgument>(realOp.getOperand())) {
-          if (blockArg.getOwner()->isEntryBlock() &&
-              isa<func::FuncOp>(blockArg.getOwner()->getParentOp()))
-            return true;
-        }
-      }
-      if (auto imagOp = dyn_cast<stablehlo::ImagOp>(op)) {
-        if (auto blockArg = dyn_cast<BlockArgument>(imagOp.getOperand())) {
-          if (blockArg.getOwner()->isEntryBlock() &&
-              isa<func::FuncOp>(blockArg.getOwner()->getParentOp()))
-            return true;
-        }
-      }
+      if (isa<stablehlo::RealOp, stablehlo::ImagOp>(op))
+        return operatesOnOriginalArgument(op);
       if (auto complexOp = dyn_cast<stablehlo::ComplexOp>(op)) {
         for (auto result : complexOp->getResults()) {
           for (auto &use : result.getUses()) {
@@ -540,6 +594,13 @@ struct LowerComplexOperationsPass
     target.addDynamicallyLegalOp<stablehlo::ComplexOp>(isLegalOp);
     target.addDynamicallyLegalOp<stablehlo::SliceOp>(isLegalOp);
     target.addDynamicallyLegalOp<stablehlo::TransposeOp>(isLegalOp);
+    target.addDynamicallyLegalOp<stablehlo::DynamicSliceOp,
+                                 stablehlo::DynamicUpdateSliceOp,
+                                 stablehlo::WhileOp>(isLegalOp);
+    target.addDynamicallyLegalOp<stablehlo::ReturnOp>(
+        [&](stablehlo::ReturnOp ret) {
+          return !isa<stablehlo::WhileOp>(ret->getParentOp()) || isLegalOp(ret);
+        });
 
     RewritePatternSet patterns(context);
     patterns.add<RealOpConversion>(typeConverter, context, concatDimension);
@@ -552,6 +613,11 @@ struct LowerComplexOperationsPass
     patterns.add<SliceOpConversion>(typeConverter, context, concatDimension);
     patterns.add<TransposeOpConversion>(typeConverter, context,
                                         concatDimension);
+    patterns.add<DynamicSliceConversion<stablehlo::DynamicSliceOp>,
+                 DynamicSliceConversion<stablehlo::DynamicUpdateSliceOp>>(
+        typeConverter, context, concatDimension);
+    patterns.add<WhileOpConversion, WhileReturnConversion>(typeConverter,
+                                                           context);
 
     SmallVector<func::FuncOp> funcsToConvert;
     op->walk([&](func::FuncOp func) { funcsToConvert.push_back(func); });
