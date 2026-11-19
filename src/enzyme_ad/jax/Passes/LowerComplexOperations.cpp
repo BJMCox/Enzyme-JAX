@@ -175,6 +175,18 @@ struct ImagOpConversion : public OpConversionPattern<stablehlo::ImagOp> {
   }
 };
 
+// Real and imaginary tensors from StableHLO have no component axis yet.
+Value packComplexComponents(Value real, Value imag, OpBuilder &builder,
+                            Location loc, StringRef concatDimension) {
+  auto type = cast<RankedTensorType>(real.getType());
+  SmallVector<int64_t> shape(type.getShape());
+  shape.insert(concatDimension == "first" ? shape.begin() : shape.end(), 1);
+  auto expandedType = RankedTensorType::get(shape, type.getElementType());
+  Value re = stablehlo::ReshapeOp::create(builder, loc, expandedType, real);
+  Value im = stablehlo::ReshapeOp::create(builder, loc, expandedType, imag);
+  return packLimbs(re, im, builder, loc, concatDimension);
+}
+
 struct ComplexOpConversion : public OpConversionPattern<stablehlo::ComplexOp> {
   StringRef concatDimension;
 
@@ -186,32 +198,9 @@ struct ComplexOpConversion : public OpConversionPattern<stablehlo::ComplexOp> {
   LogicalResult
   matchAndRewrite(stablehlo::ComplexOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    Value real = adaptor.getOperands()[0];
-    Value imag = adaptor.getOperands()[1];
-
-    auto type = cast<RankedTensorType>(real.getType());
-    bool isFirst = concatDimension == "first";
-    SmallVector<int64_t> expandedShape;
-    if (isFirst) {
-      expandedShape.push_back(1);
-      for (auto dim : type.getShape())
-        expandedShape.push_back(dim);
-    } else {
-      for (auto dim : type.getShape())
-        expandedShape.push_back(dim);
-      expandedShape.push_back(1);
-    }
-
-    auto expandedType =
-        RankedTensorType::get(expandedShape, type.getElementType());
-    Value expandedReal =
-        stablehlo::ReshapeOp::create(rewriter, loc, expandedType, real);
-    Value expandedImag =
-        stablehlo::ReshapeOp::create(rewriter, loc, expandedType, imag);
-
     Value packed =
-        packLimbs({expandedReal, expandedImag}, rewriter, loc, concatDimension);
+        packComplexComponents(adaptor.getLhs(), adaptor.getRhs(), rewriter,
+                              op.getLoc(), concatDimension);
     rewriter.replaceOp(op, packed);
     return success();
   }
@@ -651,7 +640,8 @@ struct LowerComplexOperationsPass
 
           Value real = stablehlo::RealOp::create(b, loc, arg);
           Value imag = stablehlo::ImagOp::create(b, loc, arg);
-          Value converted = packLimbs(real, imag, b, loc, concatDimension);
+          Value converted =
+              packComplexComponents(real, imag, b, loc, concatDimension);
 
           SmallVector<Operation *> users(arg.getUsers().begin(),
                                          arg.getUsers().end());
