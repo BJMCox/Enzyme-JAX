@@ -13,6 +13,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/DialectResourceBlobManager.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -202,6 +203,58 @@ struct ComplexOpConversion : public OpConversionPattern<stablehlo::ComplexOp> {
         packComplexComponents(adaptor.getLhs(), adaptor.getRhs(), rewriter,
                               op.getLoc(), concatDimension);
     rewriter.replaceOp(op, packed);
+    return success();
+  }
+};
+
+struct ConstantOpConversion
+    : public OpConversionPattern<stablehlo::ConstantOp> {
+  bool componentFirst;
+
+  ConstantOpConversion(TypeConverter &converter, MLIRContext *context,
+                       StringRef concatDimension)
+      : OpConversionPattern(converter, context),
+        componentFirst(concatDimension == "first") {}
+
+  LogicalResult
+  matchAndRewrite(stablehlo::ConstantOp op, OpAdaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto dense = dyn_cast<DenseElementsAttr>(op.getValue());
+    auto type = cast<RankedTensorType>(op.getType());
+    auto element = cast<ComplexType>(type.getElementType()).getElementType();
+    bool splat = dense && dense.isSplat();
+    // Dense complex storage interleaves real and imaginary components.
+    // A splat stores only one such pair, even for a large tensor.
+    SmallVector<int64_t> shape;
+    if (!splat)
+      llvm::append_range(shape, type.getShape());
+    shape.push_back(2);
+    auto interleaved = RankedTensorType::get(shape, element);
+    ElementsAttr packed;
+    if (dense)
+      packed =
+          DenseElementsAttr::getFromRawBuffer(interleaved, dense.getRawData());
+    else if (auto resource = dyn_cast<DenseResourceElementsAttr>(op.getValue()))
+      packed =
+          DenseResourceElementsAttr::get(interleaved, resource.getRawHandle());
+    else
+      return failure();
+    Value value = stablehlo::ConstantOp::create(rewriter, op.getLoc(), packed);
+
+    int64_t rank = type.getRank();
+    auto resultType = getTypeConverter()->convertType(type);
+    if (splat && rank > 0) {
+      int64_t axis = componentFirst ? 0 : rank;
+      rewriter.replaceOpWithNewOp<stablehlo::BroadcastInDimOp>(
+          op, resultType, value, rewriter.getDenseI64ArrayAttr({axis}));
+    } else if (componentFirst && rank > 0) {
+      SmallVector<int64_t> permutation{rank};
+      llvm::append_range(permutation, llvm::seq<int64_t>(rank));
+      rewriter.replaceOpWithNewOp<stablehlo::TransposeOp>(
+          op, resultType, value, rewriter.getDenseI64ArrayAttr(permutation));
+    } else {
+      rewriter.replaceOp(op, value);
+    }
     return success();
   }
 };
@@ -581,6 +634,12 @@ struct LowerComplexOperationsPass
       return false;
     };
 
+    target.addDynamicallyLegalOp<stablehlo::ConstantOp>(
+        [&](stablehlo::ConstantOp c) {
+          return !isa<DenseElementsAttr, DenseResourceElementsAttr>(
+                     c.getValue()) ||
+                 isLegalOp(c);
+        });
     target.addDynamicallyLegalOp<stablehlo::AddOp>(isLegalOp);
     target.addDynamicallyLegalOp<stablehlo::SubtractOp>(isLegalOp);
     target.addDynamicallyLegalOp<stablehlo::MulOp>(isLegalOp);
@@ -601,6 +660,7 @@ struct LowerComplexOperationsPass
         });
 
     RewritePatternSet patterns(context);
+    patterns.add<ConstantOpConversion>(typeConverter, context, concatDimension);
     patterns.add<RealOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ImagOpConversion>(typeConverter, context, concatDimension);
     patterns.add<ComplexOpConversion>(typeConverter, context, concatDimension);
